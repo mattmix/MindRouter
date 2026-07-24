@@ -4782,6 +4782,7 @@ async def admin_branding_post(
         tagline = (form.get("tagline") or "").strip()
         primary_light = (form.get("primary_light") or "").strip()
         primary_dark = (form.get("primary_dark") or "").strip()
+        headline_color = (form.get("headline_color") or "").strip()
         if app_name and len(app_name) > 80:
             return RedirectResponse(url="/admin/branding?error=Name+too+long+(max+80)", status_code=302)
         if len(tagline) > 160:
@@ -4790,6 +4791,8 @@ async def admin_branding_post(
             return RedirectResponse(url="/admin/branding?error=Invalid+light+color", status_code=302)
         if primary_dark and not branding_service.is_valid_hex(primary_dark):
             return RedirectResponse(url="/admin/branding?error=Invalid+dark+color", status_code=302)
+        if headline_color and not branding_service.is_valid_hex(headline_color):
+            return RedirectResponse(url="/admin/branding?error=Invalid+headline+color", status_code=302)
 
         await crud.set_config(db, branding_service.KEY_APP_NAME, app_name,
                               description="Branding: application/organization name")
@@ -4799,6 +4802,8 @@ async def admin_branding_post(
                               description="Branding: accent color (light theme)")
         await crud.set_config(db, branding_service.KEY_PRIMARY_DARK, primary_dark,
                               description="Branding: accent color (dark theme)")
+        await crud.set_config(db, branding_service.KEY_HEADLINE_COLOR, headline_color,
+                              description="Branding: headline/heading text color")
         return await _finish(f"app_name={app_name}", "/admin/branding?success=identity_updated")
 
     elif action in ("upload_logo_light", "upload_logo_dark", "upload_favicon", "upload_email_logo"):
@@ -4856,6 +4861,7 @@ async def admin_branding_post(
                 branding_service.delete_asset(old)
         for key in (branding_service.KEY_APP_NAME, branding_service.KEY_TAGLINE,
                     branding_service.KEY_PRIMARY_LIGHT, branding_service.KEY_PRIMARY_DARK,
+                    branding_service.KEY_HEADLINE_COLOR,
                     branding_service.KEY_LOGO_LIGHT, branding_service.KEY_LOGO_DARK,
                     branding_service.KEY_FAVICON, branding_service.KEY_EMAIL_LOGO):
             await crud.set_config(db, key, "", description="Branding: reset to default")

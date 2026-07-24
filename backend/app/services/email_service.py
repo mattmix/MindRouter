@@ -300,9 +300,9 @@ def _render_blog_email(
     brand = _branding.get_branding()
     accent = brand["primary_light"]          # fill (button background)
     accent_on = brand["primary_light_on"]    # legible text on the accent fill
+    headline = brand.get("headline_color") or _EMAIL_HEADING_COLOR  # admin-configurable; neutral by default
     body = (
-        # Neutral near-black headline (not the gold accent — see _EMAIL_HEADING_COLOR).
-        f'<h2 style="margin:0 0 16px 0;color:{_EMAIL_HEADING_COLOR};">{title}</h2>'
+        f'<h2 style="margin:0 0 16px 0;color:{headline};">{title}</h2>'
         f'{content_html}'
         f'<p style="margin-top:24px;">'
         f'<a href="{post_url}" style="display:inline-block;padding:10px 24px;'

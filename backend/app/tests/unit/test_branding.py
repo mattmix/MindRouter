@@ -99,6 +99,18 @@ def test_build_view_invalid_color_falls_back_to_default():
     assert v["primary_dark"] == branding.DEFAULTS["primary_dark"]
 
 
+def test_headline_color_defaults_neutral_and_is_configurable():
+    # Default = neutral near-black (admin-configurable knob).
+    assert branding.DEFAULTS["headline_color"] == "#231f20"
+    assert branding._build_view({})["headline_color"] == "#231f20"
+    # Custom value is normalized and marks the brand customized.
+    v = branding._build_view({"headline_color": "#008080"})
+    assert v["headline_color"] == "#008080"
+    assert v["is_customized"] is True
+    # Invalid falls back to the neutral default.
+    assert branding._build_view({"headline_color": "teal"})["headline_color"] == "#231f20"
+
+
 def test_get_branding_never_empty():
     branding._CACHE = {}
     v = branding.get_branding()

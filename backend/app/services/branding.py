@@ -44,6 +44,7 @@ KEY_LOGO_LIGHT = "branding.logo_light"      # stored filename (in branding_stora
 KEY_LOGO_DARK = "branding.logo_dark"        # stored filename
 KEY_FAVICON = "branding.favicon"            # stored filename
 KEY_EMAIL_LOGO = "branding.email_logo"      # stored filename — RASTER (email clients can't render SVG)
+KEY_HEADLINE_COLOR = "branding.headline_color"  # headline/heading text color (e.g. email blog title)
 
 # Product defaults (used when a value is unset or invalid). These mirror the
 # stock MindRouter look so an un-branded install is unchanged.
@@ -56,6 +57,9 @@ DEFAULTS: dict[str, Any] = {
     "logo_dark": None,
     "favicon": None,
     "email_logo": None,
+    # Neutral near-black by default: headlines shouldn't use a light brand-accent
+    # shade (per U of I brand guidance). Admin-configurable.
+    "headline_color": "#231f20",
 }
 
 _HEX_RE = re.compile(r"^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$")
@@ -214,6 +218,7 @@ def _build_view(raw: dict[str, Any]) -> dict[str, Any]:
         tagline = DEFAULTS["tagline"]
     primary_light = _normalize_hex(raw.get("primary_light"), DEFAULTS["primary_light"])
     primary_dark = _normalize_hex(raw.get("primary_dark"), DEFAULTS["primary_dark"])
+    headline_color = _normalize_hex(raw.get("headline_color"), DEFAULTS["headline_color"])
     logo_light = raw.get("logo_light") or None
     logo_dark = raw.get("logo_dark") or None
     favicon = raw.get("favicon") or None
@@ -222,6 +227,7 @@ def _build_view(raw: dict[str, Any]) -> dict[str, Any]:
     view: dict[str, Any] = {
         "app_name": app_name,
         "tagline": tagline,
+        "headline_color": headline_color,
         # Raw stored filenames (used by the admin form / removal).
         "logo_light_file": logo_light,
         "logo_dark_file": logo_dark,
@@ -239,6 +245,7 @@ def _build_view(raw: dict[str, Any]) -> dict[str, Any]:
             or raw.get("tagline") not in (None, DEFAULTS["tagline"])
             or primary_light != DEFAULTS["primary_light"]
             or primary_dark != DEFAULTS["primary_dark"]
+            or headline_color != DEFAULTS["headline_color"]
             or logo_light or logo_dark or favicon or email_logo
         ),
     }
@@ -253,6 +260,7 @@ async def load_branding(db) -> dict[str, Any]:
         "tagline": await crud.get_config_json(db, KEY_TAGLINE, None),
         "primary_light": await crud.get_config_json(db, KEY_PRIMARY_LIGHT, None),
         "primary_dark": await crud.get_config_json(db, KEY_PRIMARY_DARK, None),
+        "headline_color": await crud.get_config_json(db, KEY_HEADLINE_COLOR, None),
         "logo_light": await crud.get_config_json(db, KEY_LOGO_LIGHT, None),
         "logo_dark": await crud.get_config_json(db, KEY_LOGO_DARK, None),
         "favicon": await crud.get_config_json(db, KEY_FAVICON, None),

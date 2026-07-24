@@ -21,6 +21,7 @@ audit log (`branding.*` actions).
 | Tagline | Footer, beside the name |
 | Accent color — light theme | Buttons, links, focus rings, stat-card accents (light mode) |
 | Accent color — dark theme | Same, in dark mode |
+| Headline color | Headlines such as the email blog/notification title; defaults to a neutral near-black (light accents read poorly as headline text). Buttons/links keep the accent. |
 | Logo — dark theme | Top navbar (always a dark background), plus footer and login card in dark mode |
 | Logo — light theme | Footer and login card in light mode |
 | Favicon | Browser tab icon |

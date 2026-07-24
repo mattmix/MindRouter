@@ -84,6 +84,18 @@
                                         </div>
                                     </div>
                                 </div>
+                                <div class="mb-3">
+                                    <label class="form-label" for="headline_color_text">Headline color</label>
+                                    <div class="input-group">
+                                        <input type="color" class="form-control form-control-color" id="headline_color"
+                                               value="{{ brand.headline_color }}" {% if is_read_only %}disabled{% endif %}
+                                               aria-label="Headline / heading text color">
+                                        <input type="text" class="form-control" id="headline_color_text" name="headline_color"
+                                               value="{{ brand.headline_color }}" pattern="#([0-9a-fA-F]{3}|[0-9a-fA-F]{6})"
+                                               {% if is_read_only %}disabled{% endif %}>
+                                    </div>
+                                    <div class="form-text">Used for headlines such as the title in blog/notification emails. Defaults to a neutral near-black &mdash; a light accent (e.g. Pride Gold) reads poorly as headline text, and its muted shades are brand-reserved. Buttons and links keep the accent color.</div>
+                                </div>
                                 {% if not is_read_only %}
                                 <button type="submit" class="btn btn-primary btn-sm"><i class="bi bi-check-lg"></i> Save identity &amp; colors</button>
                                 {% endif %}
@@ -218,6 +230,9 @@
 
     wire('primary_light', 'primary_light_text', 'previewLight');
     wire('primary_dark', 'primary_dark_text', 'previewDark');
+    // Headline color: sync picker <-> hex only (no preview swatch — apply() no-ops
+    // when the preview id is absent).
+    wire('headline_color', 'headline_color_text', 'previewHeadline');
 })();
 </script>
 {% endblock %}

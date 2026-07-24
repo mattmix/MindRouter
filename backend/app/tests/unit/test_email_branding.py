@@ -70,15 +70,25 @@ def test_content_with_braces_is_not_reformatted(gold_brand_with_logo):
     assert '{"json": true}' in html
 
 
-def test_blog_email_title_is_neutral_not_gold(gold_brand_with_logo):
-    # Headline uses a neutral near-black (not the gold accent shade), per brand
-    # feedback: light-accent shades read as reserved metallic and shouldn't be
-    # headline text. Button + links keep the gold accent.
+def test_blog_email_title_uses_headline_color_default_neutral(gold_brand_with_logo):
+    # Headline uses the configurable headline_color, which defaults to neutral
+    # near-black (not the gold accent shade). Button + links keep the gold accent.
     html = es._render_blog_email("Post", "# Hi\n\ntext", "post", "Luke", "https://x")
     assert "003da5" not in html.lower()
-    assert "margin:0 0 16px 0;color:#231f20;" in html      # headline = neutral near-black
+    assert "margin:0 0 16px 0;color:#231f20;" in html      # headline = neutral default
     assert "background:#f1b300;color:#000000" in html      # gold button, black (legible) text
     assert "color:#906900" in html                         # footer link keeps the gold accent
+
+
+def test_blog_email_headline_color_is_configurable(monkeypatch):
+    # An admin-set headline color flows through to the email title.
+    branding._CACHE = branding._build_view(
+        {"app_name": "MindRouter", "primary_light": GOLD, "primary_dark": GOLD, "headline_color": "#008080"}
+    )
+    html = es._render_blog_email("Post", "# Hi\n\ntext", "post", "Luke", "https://x")
+    h2 = html[html.find("<h2"):html.find("</h2>")]
+    assert "color:#008080" in h2                            # Clearwater teal headline
+    assert "#231f20" not in h2                              # neutral default no longer used in the headline
 
 
 def test_default_branding_has_no_blue():
