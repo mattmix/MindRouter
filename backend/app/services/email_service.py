@@ -232,16 +232,22 @@ def _wrap_html(content_html: str, footer_html: str = "", base_url: str = "") -> 
     accent_ink = brand["primary_light_ink"]
     app_name = brand["app_name"]
 
+    name_esc = _html.escape(app_name)
+    logo_alt = _html.escape(brand.get("tagline") or app_name)
+    name_html = f'<span style="font-size:26px;font-weight:700;color:#231f20;">{name_esc}</span>'
     if brand.get("email_logo_file"):
+        # Logo left, org/app name right-justified on the same row (email-safe
+        # two-cell table — float/flex are unreliable in mail clients).
         header_inner = (
-            f'<img src="cid:brandlogo" alt="{_html.escape(app_name)}" height="44" '
-            f'style="display:block;height:44px;width:auto;border:0;">'
+            '<table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr>'
+            '<td align="left" valign="middle">'
+            f'<img src="cid:brandlogo" alt="{logo_alt}" height="44" '
+            'style="display:block;height:44px;width:auto;border:0;"></td>'
+            f'<td align="right" valign="middle">{name_html}</td>'
+            '</tr></table>'
         )
     else:
-        header_inner = (
-            f'<span style="font-size:20px;font-weight:600;color:#231f20;">'
-            f'{_html.escape(app_name)}</span>'
-        )
+        header_inner = name_html
 
     footer_tmpl = footer_html or _DEFAULT_FOOTER
     footer = footer_tmpl.format(base_url=base_url, link_color=accent_ink, app_name=_html.escape(app_name))
