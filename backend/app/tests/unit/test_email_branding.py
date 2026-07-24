@@ -70,11 +70,15 @@ def test_content_with_braces_is_not_reformatted(gold_brand_with_logo):
     assert '{"json": true}' in html
 
 
-def test_blog_email_title_and_button_colors(gold_brand_with_logo):
+def test_blog_email_title_is_neutral_not_gold(gold_brand_with_logo):
+    # Headline uses a neutral near-black (not the gold accent shade), per brand
+    # feedback: light-accent shades read as reserved metallic and shouldn't be
+    # headline text. Button + links keep the gold accent.
     html = es._render_blog_email("Post", "# Hi\n\ntext", "post", "Luke", "https://x")
     assert "003da5" not in html.lower()
-    assert "color:#906900" in html                        # heading uses ink
+    assert "margin:0 0 16px 0;color:#231f20;" in html      # headline = neutral near-black
     assert "background:#f1b300;color:#000000" in html      # gold button, black (legible) text
+    assert "color:#906900" in html                         # footer link keeps the gold accent
 
 
 def test_default_branding_has_no_blue():

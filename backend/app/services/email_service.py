@@ -69,6 +69,11 @@ _EMAIL_FOOT = """\
 </body>
 </html>"""
 
+# Email headings use a neutral near-black, NOT the brand accent: a light accent
+# (e.g. University of Idaho Pride Gold) reads poorly as headline text and its
+# muted shades are brand-reserved. Buttons/links keep the accent.
+_EMAIL_HEADING_COLOR = "#231f20"
+
 # Footer templates use {base_url} and {link_color} placeholders, filled in
 # _wrap_html (link_color = the brand's accessible accent "ink").
 _DEFAULT_FOOTER = (
@@ -295,9 +300,9 @@ def _render_blog_email(
     brand = _branding.get_branding()
     accent = brand["primary_light"]          # fill (button background)
     accent_on = brand["primary_light_on"]    # legible text on the accent fill
-    accent_ink = brand["primary_light_ink"]  # accent as readable text/heading
     body = (
-        f'<h2 style="margin:0 0 16px 0;color:{accent_ink};">{title}</h2>'
+        # Neutral near-black headline (not the gold accent — see _EMAIL_HEADING_COLOR).
+        f'<h2 style="margin:0 0 16px 0;color:{_EMAIL_HEADING_COLOR};">{title}</h2>'
         f'{content_html}'
         f'<p style="margin-top:24px;">'
         f'<a href="{post_url}" style="display:inline-block;padding:10px 24px;'
