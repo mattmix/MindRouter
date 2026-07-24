@@ -18,6 +18,8 @@
                 {% elif success == 'logo_light_updated' %}Light-theme logo uploaded.
                 {% elif success == 'logo_dark_updated' %}Dark-theme logo uploaded.
                 {% elif success == 'favicon_updated' %}Favicon uploaded.
+                {% elif success == 'email_logo_updated' %}Email logo uploaded.
+                {% elif success == 'email_logo_removed' %}Email logo removed.
                 {% elif success == 'logo_light_removed' %}Light-theme logo removed.
                 {% elif success == 'logo_dark_removed' %}Dark-theme logo removed.
                 {% elif success == 'favicon_removed' %}Favicon removed.
@@ -107,14 +109,15 @@
                 <!-- Logos + favicon -->
                 <div class="col-12">
                     <div class="card">
-                        <div class="card-header"><h5 class="mb-0">Logos &amp; Favicon</h5></div>
+                        <div class="card-header"><h5 class="mb-0">Logos, Favicon &amp; Email</h5></div>
                         <div class="card-body">
-                            <p class="text-muted small">PNG, SVG, JPG, WebP, or GIF up to {{ max_logo_mb }} MB (favicon: ICO/PNG/SVG). The top bar uses the dark-theme logo (it always has a dark background); the light-theme logo is used on light backgrounds such as the login page.</p>
+                            <p class="text-muted small">PNG, SVG, JPG, WebP, or GIF up to {{ max_logo_mb }} MB (favicon: ICO/PNG/SVG). The top bar uses the dark-theme logo (it always has a dark background); the light-theme logo is used on light backgrounds such as the login page and footer. The <strong>email logo</strong> is used in outgoing emails (blog posts, notifications) &mdash; it must be a raster image (<strong>PNG/JPG/GIF</strong>), since email clients don't render SVG. A horizontal logo on a transparent or white background works best.</p>
                             <div class="row g-4">
                                 {% set slots = [
                                     ('logo_dark', 'Logo — dark theme', brand.logo_dark_url, '#212529'),
                                     ('logo_light', 'Logo — light theme', brand.logo_light_url, '#ffffff'),
-                                    ('favicon', 'Favicon', brand.favicon_url, 'transparent')
+                                    ('favicon', 'Favicon', brand.favicon_url, 'transparent'),
+                                    ('email_logo', 'Email logo (PNG/JPG)', brand.email_logo_url, '#ffffff')
                                 ] %}
                                 {% for slot, label, url, bg in slots %}
                                 <div class="col-md-4">
@@ -132,7 +135,7 @@
                                         <input type="hidden" name="action" value="upload_{{ slot }}">
                                         <div class="input-group input-group-sm">
                                             <input type="file" class="form-control" name="{{ slot }}"
-                                                   accept="{% if slot == 'favicon' %}.ico,.png,.svg,image/x-icon,image/png,image/svg+xml{% else %}image/png,image/jpeg,image/webp,image/svg+xml,image/gif{% endif %}" required>
+                                                   accept="{% if slot == 'favicon' %}.ico,.png,.svg,image/x-icon,image/png,image/svg+xml{% elif slot == 'email_logo' %}.png,.jpg,.jpeg,.gif,image/png,image/jpeg,image/gif{% else %}image/png,image/jpeg,image/webp,image/svg+xml,image/gif{% endif %}" required>
                                             <button type="submit" class="btn btn-outline-primary"><i class="bi bi-upload"></i></button>
                                         </div>
                                     </form>

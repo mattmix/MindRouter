@@ -43,6 +43,7 @@ KEY_PRIMARY_DARK = "branding.primary_dark"
 KEY_LOGO_LIGHT = "branding.logo_light"      # stored filename (in branding_storage_path)
 KEY_LOGO_DARK = "branding.logo_dark"        # stored filename
 KEY_FAVICON = "branding.favicon"            # stored filename
+KEY_EMAIL_LOGO = "branding.email_logo"      # stored filename — RASTER (email clients can't render SVG)
 
 # Product defaults (used when a value is unset or invalid). These mirror the
 # stock MindRouter look so an un-branded install is unchanged.
@@ -54,6 +55,7 @@ DEFAULTS: dict[str, Any] = {
     "logo_light": None,
     "logo_dark": None,
     "favicon": None,
+    "email_logo": None,
 }
 
 _HEX_RE = re.compile(r"^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$")
@@ -71,6 +73,13 @@ ALLOWED_FAVICON_EXT: dict[str, str] = {
     ".ico": "image/x-icon",
     ".png": "image/png",
     ".svg": "image/svg+xml",
+}
+# Email logos must be raster — SVG/WebP are not reliably rendered by email clients.
+ALLOWED_EMAIL_LOGO_EXT: dict[str, str] = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
 }
 
 _REFRESH_INTERVAL = 15  # seconds; how quickly a save propagates across workers
@@ -208,6 +217,7 @@ def _build_view(raw: dict[str, Any]) -> dict[str, Any]:
     logo_light = raw.get("logo_light") or None
     logo_dark = raw.get("logo_dark") or None
     favicon = raw.get("favicon") or None
+    email_logo = raw.get("email_logo") or None
 
     view: dict[str, Any] = {
         "app_name": app_name,
@@ -216,10 +226,12 @@ def _build_view(raw: dict[str, Any]) -> dict[str, Any]:
         "logo_light_file": logo_light,
         "logo_dark_file": logo_dark,
         "favicon_file": favicon,
+        "email_logo_file": email_logo,
         # Public URLs (None when unset).
         "logo_light_url": _asset_url(logo_light),
         "logo_dark_url": _asset_url(logo_dark),
         "favicon_url": _asset_url(favicon),
+        "email_logo_url": _asset_url(email_logo),
         "has_custom_logo": bool(logo_light or logo_dark),
         # True when anything differs from stock defaults.
         "is_customized": bool(
@@ -227,7 +239,7 @@ def _build_view(raw: dict[str, Any]) -> dict[str, Any]:
             or raw.get("tagline") not in (None, DEFAULTS["tagline"])
             or primary_light != DEFAULTS["primary_light"]
             or primary_dark != DEFAULTS["primary_dark"]
-            or logo_light or logo_dark or favicon
+            or logo_light or logo_dark or favicon or email_logo
         ),
     }
     view.update(_derive_colors(primary_light, primary_dark))
@@ -244,8 +256,32 @@ async def load_branding(db) -> dict[str, Any]:
         "logo_light": await crud.get_config_json(db, KEY_LOGO_LIGHT, None),
         "logo_dark": await crud.get_config_json(db, KEY_LOGO_DARK, None),
         "favicon": await crud.get_config_json(db, KEY_FAVICON, None),
+        "email_logo": await crud.get_config_json(db, KEY_EMAIL_LOGO, None),
     }
     return _build_view(raw)
+
+
+def read_email_logo() -> Optional[tuple[bytes, str]]:
+    """Return (bytes, subtype) for the configured email logo, or None.
+
+    ``subtype`` is the MIME image subtype (e.g. ``png``) for CID embedding.
+    Reads from the in-memory cache + disk; safe to call synchronously from the
+    email service. Returns None when no email logo is set or the file is missing.
+    """
+    filename = get_branding().get("email_logo_file")
+    if not filename:
+        return None
+    full = asset_path(filename)
+    if not full:
+        return None
+    try:
+        with open(full, "rb") as f:
+            data = f.read()
+    except OSError:  # pragma: no cover
+        return None
+    ext = os.path.splitext(filename)[1].lower()
+    subtype = {".png": "png", ".jpg": "jpeg", ".jpeg": "jpeg", ".gif": "gif"}.get(ext, "png")
+    return data, subtype
 
 
 async def refresh_branding_cache(db=None) -> dict[str, Any]:
@@ -325,7 +361,12 @@ def save_asset(slot: str, original_filename: str, data: bytes) -> str:
     of the filename; a random token cache-busts the public URL on replacement.
     """
     ext = os.path.splitext(original_filename or "")[1].lower()
-    allowed = ALLOWED_FAVICON_EXT if slot == "favicon" else ALLOWED_IMAGE_EXT
+    if slot == "favicon":
+        allowed = ALLOWED_FAVICON_EXT
+    elif slot == "email_logo":
+        allowed = ALLOWED_EMAIL_LOGO_EXT
+    else:
+        allowed = ALLOWED_IMAGE_EXT
     if ext not in allowed:
         raise ValueError(
             f"Unsupported file type '{ext or '(none)'}'. Allowed: {', '.join(sorted(allowed))}"

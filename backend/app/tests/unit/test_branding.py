@@ -163,6 +163,41 @@ def test_content_type_for():
     assert branding.content_type_for("x.unknown") == "application/octet-stream"
 
 
+# ── Email logo slot (raster-only, CID reads) ─────────────────────
+
+def test_build_view_exposes_email_logo():
+    v = branding._build_view({"email_logo": "email_logo-abc.png"})
+    assert v["email_logo_file"] == "email_logo-abc.png"
+    assert v["email_logo_url"] == "/branding/asset/email_logo-abc.png"
+    assert v["is_customized"] is True
+    # Absent by default.
+    assert branding._build_view({})["email_logo_url"] is None
+
+
+def test_email_logo_rejects_svg_and_webp(tmp_storage):
+    # Email clients can't render SVG/WebP — the slot must reject them.
+    for bad in ("logo.svg", "logo.webp"):
+        with pytest.raises(ValueError):
+            branding.save_asset("email_logo", bad, b"data")
+    # PNG/JPG/GIF are accepted.
+    for good in ("logo.png", "logo.jpg", "logo.gif"):
+        stored = branding.save_asset("email_logo", good, b"data")
+        assert stored.startswith("email_logo-")
+
+
+def test_read_email_logo_returns_bytes_and_subtype(tmp_storage):
+    png = b"\x89PNG\r\n\x1a\n" + b"x" * 32
+    stored = branding.save_asset("email_logo", "logo.png", png)
+    branding._CACHE = branding._build_view({"email_logo": stored})
+    result = branding.read_email_logo()
+    assert result is not None
+    data, subtype = result
+    assert data == png and subtype == "png"
+    # Unset → None.
+    branding._CACHE = branding._build_view({})
+    assert branding.read_email_logo() is None
+
+
 # ── Accessible foreground / ink derivation ───────────────────────
 
 def test_contrast_bounds():

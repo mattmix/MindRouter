@@ -58,6 +58,29 @@ derivation only intervenes when the accent would otherwise be unreadable. The
 math lives in `_best_fg` / `_accessible_ink` in
 `backend/app/services/branding.py`.
 
+## Emails
+
+Outgoing emails (blog-post notifications, admin/bulk notifications, the test
+email) follow the same brand — the blue default header is gone. Because email is
+a constrained medium, the treatment differs from the web UI:
+
+- **No CSS variables or SVG.** Email clients strip `<style>` and don't render
+  SVG, so all styling is inline and the logo must be a **raster** image. Upload a
+  PNG/JPG/GIF to the **Email logo** slot on the branding page (separate from the
+  navbar SVG logos). A horizontal logo on a transparent/white background works
+  best.
+- **The logo is embedded, not linked.** It's attached inline via `cid:` (the
+  message becomes `multipart/related`), so it displays even when the client
+  blocks remote images. If no email logo is set, the header shows the
+  organization name as text.
+- **Accent colors are contrast-safe.** The header carries a thin accent rule, the
+  blog-post button uses the accent as its fill with the accessible foreground
+  (black text on gold), and links/headings use the darkened `ink` — so a light
+  brand accent stays legible on the white email background.
+
+Email templates live in `backend/app/services/email_service.py` (`_wrap_html`
+builds the branded shell; `_send_one` performs the CID embed).
+
 ## How it works
 
 - **Text/color values** are stored as `branding.*` rows in the `app_config`

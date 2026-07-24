@@ -15,9 +15,11 @@
 """Async email sending service for MindRouter."""
 
 import asyncio
+import html as _html
 import logging
 import re
 from datetime import datetime, timezone
+from email.mime.image import MIMEImage
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from typing import Any, Dict, List, Optional
@@ -27,6 +29,7 @@ import markdown
 
 from backend.app.db import crud
 from backend.app.db.session import get_async_db_context
+from backend.app.services import branding as _branding
 
 from backend.app.settings import get_settings
 
@@ -46,7 +49,10 @@ async def get_base_url(db=None) -> str:
 # HTML email wrapper template (inline CSS for email client compatibility)
 # ---------------------------------------------------------------------------
 
-_EMAIL_WRAPPER = """\
+# Opening and closing of the email shell. The header row and content/footer are
+# assembled in _wrap_html() so branding (logo, accent color) can be injected and
+# so user content is never passed through str.format() (it may contain braces).
+_EMAIL_HEAD = """\
 <!DOCTYPE html>
 <html lang="en">
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"></head>
@@ -54,31 +60,27 @@ _EMAIL_WRAPPER = """\
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f4f4f7;">
 <tr><td align="center" style="padding:24px 0;">
 <table role="presentation" width="600" cellpadding="0" cellspacing="0" style="background:#ffffff;border-radius:8px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.08);">
-  <tr><td style="background:#003DA5;padding:20px 32px;">
-    <h1 style="margin:0;color:#ffffff;font-size:20px;font-weight:600;">MindRouter</h1>
-  </td></tr>
-  <tr><td style="padding:32px;color:#333333;font-size:15px;line-height:1.6;">
-    {content}
-  </td></tr>
-  <tr><td style="padding:16px 32px;background:#f8f9fa;border-top:1px solid #e9ecef;color:#999999;font-size:12px;">
-    {footer}
-  </td></tr>
+"""
+
+_EMAIL_FOOT = """\
 </table>
 </td></tr>
 </table>
 </body>
 </html>"""
 
+# Footer templates use {base_url} and {link_color} placeholders, filled in
+# _wrap_html (link_color = the brand's accessible accent "ink").
 _DEFAULT_FOOTER = (
-    "You received this email because you are a registered MindRouter user. "
+    "You received this email because you are a registered {app_name} user. "
     "To manage your email preferences, visit your "
-    '<a href="{base_url}/dashboard" style="color:#003DA5;">dashboard settings</a>.'
+    '<a href="{base_url}/dashboard" style="color:{link_color};">dashboard settings</a>.'
 )
 
 _BLOG_FOOTER = (
-    "You received this email because you are subscribed to MindRouter blog notifications. "
+    "You received this email because you are subscribed to {app_name} blog notifications. "
     "To opt out, visit your "
-    '<a href="{base_url}/dashboard" style="color:#003DA5;">dashboard settings</a> '
+    '<a href="{base_url}/dashboard" style="color:{link_color};">dashboard settings</a> '
     "and toggle the email preference."
 )
 
@@ -212,11 +214,51 @@ def _style_tables(html: str) -> str:
 
 
 def _wrap_html(content_html: str, footer_html: str = "", base_url: str = "") -> str:
-    """Wrap content in the email base template."""
+    """Wrap content in the branded email base template.
+
+    Branding (organization name, logo, accent color) is pulled from the shared
+    branding config so emails match the web UI. The header shows the email logo
+    (referenced as ``cid:brandlogo`` and embedded by ``_send_one`` — email
+    clients don't render SVG, so a raster ``email_logo`` is used) when set,
+    otherwise the organization name. Accent colors are contrast-adjusted: the
+    footer/title link color uses the accessible "ink" so a light brand accent
+    (e.g. Pride Gold) stays legible on white.
+    """
     content_html = _style_code_blocks(content_html)
     content_html = _style_tables(content_html)
-    footer = footer_html or _DEFAULT_FOOTER.format(base_url=base_url)
-    return _EMAIL_WRAPPER.format(content=content_html, footer=footer)
+
+    brand = _branding.get_branding()
+    accent = brand["primary_light"]
+    accent_ink = brand["primary_light_ink"]
+    app_name = brand["app_name"]
+
+    if brand.get("email_logo_file"):
+        header_inner = (
+            f'<img src="cid:brandlogo" alt="{_html.escape(app_name)}" height="44" '
+            f'style="display:block;height:44px;width:auto;border:0;">'
+        )
+    else:
+        header_inner = (
+            f'<span style="font-size:20px;font-weight:600;color:#231f20;">'
+            f'{_html.escape(app_name)}</span>'
+        )
+
+    footer_tmpl = footer_html or _DEFAULT_FOOTER
+    footer = footer_tmpl.format(base_url=base_url, link_color=accent_ink, app_name=_html.escape(app_name))
+
+    header_row = (
+        f'  <tr><td style="background:#ffffff;padding:20px 32px;'
+        f'border-bottom:3px solid {accent};">{header_inner}</td></tr>\n'
+    )
+    content_row = (
+        '  <tr><td style="padding:32px;color:#333333;font-size:15px;line-height:1.6;">\n'
+        f'{content_html}\n  </td></tr>\n'
+    )
+    footer_row = (
+        '  <tr><td style="padding:16px 32px;background:#f8f9fa;border-top:1px solid #e9ecef;'
+        f'color:#999999;font-size:12px;">{footer}</td></tr>\n'
+    )
+    return _EMAIL_HEAD + header_row + content_row + footer_row + _EMAIL_FOOT
 
 
 def _render_blog_email(
@@ -244,17 +286,21 @@ def _render_blog_email(
         extensions=["fenced_code", "tables"],
     )
     post_url = f"{base_url}/blog/{slug}"
+    brand = _branding.get_branding()
+    accent = brand["primary_light"]          # fill (button background)
+    accent_on = brand["primary_light_on"]    # legible text on the accent fill
+    accent_ink = brand["primary_light_ink"]  # accent as readable text/heading
     body = (
-        f'<h2 style="margin:0 0 16px 0;color:#003DA5;">{title}</h2>'
+        f'<h2 style="margin:0 0 16px 0;color:{accent_ink};">{title}</h2>'
         f'{content_html}'
         f'<p style="margin-top:24px;">'
         f'<a href="{post_url}" style="display:inline-block;padding:10px 24px;'
-        f'background:#003DA5;color:#ffffff;text-decoration:none;border-radius:4px;'
+        f'background:{accent};color:{accent_on};text-decoration:none;border-radius:4px;'
         f'font-weight:600;">Read on the Web</a></p>'
         f'<p style="color:#999999;font-size:13px;margin-top:16px;">Posted by {author_name}</p>'
     )
-    footer = _BLOG_FOOTER.format(base_url=base_url)
-    return _wrap_html(body, footer, base_url)
+    # Pass the raw footer template — _wrap_html fills base_url/link_color/app_name.
+    return _wrap_html(body, _BLOG_FOOTER, base_url)
 
 
 # ---------------------------------------------------------------------------
@@ -269,17 +315,37 @@ async def _send_one(
     subject: str,
     html_body: str,
 ) -> None:
-    """Send a single HTML email via an open SMTP connection."""
-    msg = MIMEMultipart("alternative")
+    """Send a single HTML email via an open SMTP connection.
+
+    When the body references the branding email logo (``cid:brandlogo``), the
+    logo is embedded as an inline (CID) attachment so it renders even when the
+    client blocks remote images — the structure becomes ``multipart/related``
+    wrapping the ``multipart/alternative`` text+html parts.
+    """
+    # Plain text fallback (strip tags crudely)
+    plain = re.sub(r"<[^>]+>", "", html_body)
+    plain = re.sub(r"\n{3,}", "\n\n", plain).strip()
+
+    logo = _branding.read_email_logo() if "cid:brandlogo" in html_body else None
+    if logo:
+        data, subtype = logo
+        msg = MIMEMultipart("related")
+        alt = MIMEMultipart("alternative")
+        alt.attach(MIMEText(plain, "plain", "utf-8"))
+        alt.attach(MIMEText(html_body, "html", "utf-8"))
+        msg.attach(alt)
+        img = MIMEImage(data, _subtype=subtype)
+        img.add_header("Content-ID", "<brandlogo>")
+        img.add_header("Content-Disposition", "inline", filename=f"logo.{subtype}")
+        msg.attach(img)
+    else:
+        msg = MIMEMultipart("alternative")
+        msg.attach(MIMEText(plain, "plain", "utf-8"))
+        msg.attach(MIMEText(html_body, "html", "utf-8"))
+
     msg["From"] = sender
     msg["To"] = recipient
     msg["Subject"] = subject
-    # Plain text fallback (strip tags crudely)
-    import re
-    plain = re.sub(r"<[^>]+>", "", html_body)
-    plain = re.sub(r"\n{3,}", "\n\n", plain).strip()
-    msg.attach(MIMEText(plain, "plain", "utf-8"))
-    msg.attach(MIMEText(html_body, "html", "utf-8"))
     await smtp.send_message(msg)
 
 
@@ -315,12 +381,13 @@ async def send_test_email(config: Dict[str, Any], recipient: str, base_url: str 
     try:
         smtp = await _open_smtp(config)
         try:
+            app_name = _html.escape(_branding.get_branding()["app_name"])
             body = _wrap_html(
-                "<p>This is a test email from <strong>MindRouter</strong>.</p>"
+                f"<p>This is a test email from <strong>{app_name}</strong>.</p>"
                 "<p>If you can read this, your SMTP configuration is working correctly.</p>",
                 base_url=base_url,
             )
-            await _send_one(smtp, config["default_sender"], recipient, "MindRouter Test Email", body)
+            await _send_one(smtp, config["default_sender"], recipient, f"{app_name} Test Email", body)
         finally:
             await smtp.quit()
         return ""
@@ -407,5 +474,5 @@ async def send_blog_email(
 ) -> None:
     """Send a blog post as email to opted-in recipients (fire-and-forget)."""
     html_body = _render_blog_email(post_title, post_content, post_slug, author_name, base_url)
-    subject = f"MindRouter Blog: {post_title}"
+    subject = f"{_branding.get_branding()['app_name']} Blog: {post_title}"
     await send_bulk_email(email_log_id, subject, html_body, recipients, sender, config)

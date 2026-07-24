@@ -79,7 +79,8 @@
 
 | `backend/app/tests/unit/test_runner_lease.py` | 4 | Video-runner leader lease (Redis CAS, fake redis): acquire is exclusive; only the token owner can renew; only the owner can release (then re-acquirable); unavailable Redis is a safe no-op — so only ONE runner is active across uvicorn workers/containers |
 
-| `backend/app/tests/unit/test_branding.py` | 15 | UI branding service: hex validation/normalization (#abc→#aabbcc, invalid→default), color shade math (clamped), template-view builder (defaults, custom values, asset URL derivation, is_customized), and traversal-safe on-disk asset save/resolve/delete (slot-prefixed filenames, extension allow-lists per slot, favicon rejects webp, blocks ../ and absolute paths) |
+| `backend/app/tests/unit/test_branding.py` | 23 | UI branding service: hex validation/normalization (#abc→#aabbcc, invalid→default), color shade math (clamped), accessible-accent derivation (`_best_fg` white-unless-<3.0→black, `_accessible_ink` darken/lighten to ≥4.5:1), template-view builder (defaults, custom values, asset URL derivation, is_customized), traversal-safe on-disk asset save/resolve/delete (extension allow-lists per slot, favicon rejects webp), and the email-logo slot (raster-only: rejects svg/webp; `read_email_logo` returns bytes+subtype for CID embed) |
+| `backend/app/tests/unit/test_email_branding.py` | 9 | Branding applied to outgoing emails (aiosmtplib stubbed): the wrapper drops the old blue `#003DA5`, uses the gold accent rule + contrast-safe footer/link ink, embeds the raster email logo via `cid:brandlogo` (`multipart/related`) with app-name text fallback when unset; blog email title/button use ink + gold-fill-with-black-text; content with literal braces no longer crashes (old `.format()` bug); `_send_one` MIME structure verified for logo and no-logo paths |
 
 **Shared fixtures:** `backend/app/tests/conftest.py`
 

@@ -1472,6 +1472,7 @@ client.conversations.delete(conv.id)               # delete state anytime</code>
                         <tr><td>Logo &mdash; dark theme</td><td>Top navbar (always a dark background), plus the footer and login card in dark mode</td></tr>
                         <tr><td>Logo &mdash; light theme</td><td>Footer and login card in light mode</td></tr>
                         <tr><td>Favicon</td><td>Browser tab icon</td></tr>
+                        <tr><td>Email logo (raster)</td><td>Outgoing emails (blog posts, notifications) &mdash; PNG/JPG/GIF, since email clients don't render SVG</td></tr>
                     </tbody>
                 </table>
                 <p>Logos appear in the <strong>navbar (header)</strong>, the <strong>footer</strong>, and the <strong>login card</strong>. The navbar always has a dark background, so it uses the dark-theme logo (falling back to the light one). The footer and login card follow the active theme and swap between the two logo variants automatically. Uploads are capped at <code>BRANDING_MAX_LOGO_MB</code> (default 4&nbsp;MB); allowed logo types are PNG, JPG, WebP, SVG, GIF (favicon: ICO, PNG, SVG).</p>
@@ -1490,6 +1491,9 @@ client.conversations.delete(conv.id)               # delete state anytime</code>
                     <li><strong>Uploaded logos/favicon</strong> are written to <code>BRANDING_STORAGE_PATH</code> (default <code>/data/branding</code>, a persistent <code>branding_data</code> volume) and served, with a long immutable cache, from the public route <code>GET /branding/asset/{filename}</code> &mdash; public so logos also render on the login page. Filenames are server-generated with a random token, so replacing an asset cache-busts automatically.</li>
                     <li><strong>Applied on every page</strong> via a small in-memory cache (<code>backend/app/services/branding.py</code>) loaded at startup and refreshed every ~15&nbsp;seconds, exposed to templates as a Jinja global. A save propagates to all uvicorn workers within a few seconds <em>without a restart</em> (the saving worker refreshes immediately).</li>
                 </ul>
+                <h3>Emails</h3>
+                <p>Outgoing emails (blog-post notifications, admin/bulk notifications, and the SMTP test email) follow the same brand. Email is a constrained medium, so the treatment differs from the web UI: styling is inline (clients strip <code>&lt;style&gt;</code>), and the logo must be a <strong>raster</strong> image because email clients don't render SVG &mdash; hence the separate <strong>Email logo</strong> slot. The logo is embedded inline via <code>cid:</code> (the message becomes <code>multipart/related</code>) so it renders even when the client blocks remote images; if unset, the header shows the organization name as text. Accent colors are contrast-safe (a thin accent rule, gold button fill with black text, darkened accent for links) so a light brand color stays legible on the white email background.</p>
+
                 <p><strong>Deployment note:</strong> <code>BRANDING_STORAGE_PATH</code> and <code>BRANDING_MAX_LOGO_MB</code> must be present in both <code>settings.py</code> and <code>docker-compose.yml</code>, and the <code>branding_data</code> named volume must be mounted, so uploaded assets survive container rebuilds. See the <a href="https://github.com/ui-insight/MindRouter/blob/main/docs/branding.md">branding guide</a> for details.</p>
             </section>
 

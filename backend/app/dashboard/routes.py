@@ -4801,13 +4801,15 @@ async def admin_branding_post(
                               description="Branding: accent color (dark theme)")
         return await _finish(f"app_name={app_name}", "/admin/branding?success=identity_updated")
 
-    elif action in ("upload_logo_light", "upload_logo_dark", "upload_favicon"):
+    elif action in ("upload_logo_light", "upload_logo_dark", "upload_favicon", "upload_email_logo"):
         slot = {"upload_logo_light": "logo_light",
                 "upload_logo_dark": "logo_dark",
-                "upload_favicon": "favicon"}[action]
+                "upload_favicon": "favicon",
+                "upload_email_logo": "email_logo"}[action]
         key = {"logo_light": branding_service.KEY_LOGO_LIGHT,
                "logo_dark": branding_service.KEY_LOGO_DARK,
-               "favicon": branding_service.KEY_FAVICON}[slot]
+               "favicon": branding_service.KEY_FAVICON,
+               "email_logo": branding_service.KEY_EMAIL_LOGO}[slot]
         upload = form.get(slot)
         if not upload or not hasattr(upload, "read"):
             return RedirectResponse(url="/admin/branding?error=No+file+uploaded", status_code=302)
@@ -4830,13 +4832,15 @@ async def admin_branding_post(
         await crud.set_config(db, key, stored, description=f"Branding: {slot} asset filename")
         return await _finish(f"{slot}={stored}", f"/admin/branding?success={slot}_updated")
 
-    elif action in ("remove_logo_light", "remove_logo_dark", "remove_favicon"):
+    elif action in ("remove_logo_light", "remove_logo_dark", "remove_favicon", "remove_email_logo"):
         slot = {"remove_logo_light": "logo_light",
                 "remove_logo_dark": "logo_dark",
-                "remove_favicon": "favicon"}[action]
+                "remove_favicon": "favicon",
+                "remove_email_logo": "email_logo"}[action]
         key = {"logo_light": branding_service.KEY_LOGO_LIGHT,
                "logo_dark": branding_service.KEY_LOGO_DARK,
-               "favicon": branding_service.KEY_FAVICON}[slot]
+               "favicon": branding_service.KEY_FAVICON,
+               "email_logo": branding_service.KEY_EMAIL_LOGO}[slot]
         old = await crud.get_config_json(db, key, None)
         if old:
             branding_service.delete_asset(old)
@@ -4846,14 +4850,14 @@ async def admin_branding_post(
     elif action == "reset_all":
         # Delete uploaded files, then clear every branding.* key.
         for key in (branding_service.KEY_LOGO_LIGHT, branding_service.KEY_LOGO_DARK,
-                    branding_service.KEY_FAVICON):
+                    branding_service.KEY_FAVICON, branding_service.KEY_EMAIL_LOGO):
             old = await crud.get_config_json(db, key, None)
             if old:
                 branding_service.delete_asset(old)
         for key in (branding_service.KEY_APP_NAME, branding_service.KEY_TAGLINE,
                     branding_service.KEY_PRIMARY_LIGHT, branding_service.KEY_PRIMARY_DARK,
                     branding_service.KEY_LOGO_LIGHT, branding_service.KEY_LOGO_DARK,
-                    branding_service.KEY_FAVICON):
+                    branding_service.KEY_FAVICON, branding_service.KEY_EMAIL_LOGO):
             await crud.set_config(db, key, "", description="Branding: reset to default")
         return await _finish("reset all branding", "/admin/branding?success=reset")
 
