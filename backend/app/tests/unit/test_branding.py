@@ -243,3 +243,23 @@ def test_default_look_unchanged():
     d = branding._build_view({})
     assert d["primary_light_on"] == "#ffffff"
     assert d["primary_light_ink"] == "#0d6efd"
+
+
+def test_every_dashboard_template_env_registers_branding_global():
+    """base.html calls branding() on line 1, so EVERY Jinja2Templates env that
+    renders it must register the global — otherwise authenticated pages (chat,
+    images, video) 500 with "'branding' is undefined". Regression guard for the
+    bug where chat/images/video had their own env without the global.
+    """
+    import pathlib
+
+    dash = pathlib.Path(__file__).resolve().parents[2] / "dashboard"
+    offenders = []
+    for py in sorted(dash.glob("*.py")):
+        src = py.read_text(encoding="utf-8")
+        if "Jinja2Templates(" in src and 'globals["branding"]' not in src:
+            offenders.append(py.name)
+    assert not offenders, (
+        "These create a Jinja2Templates env but never register the branding() "
+        f"global that base.html requires: {offenders}"
+    )

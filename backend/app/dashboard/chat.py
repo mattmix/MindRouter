@@ -49,6 +49,11 @@ chat_router = APIRouter(tags=["chat"])
 # Setup templates
 templates_path = os.path.join(os.path.dirname(__file__), "templates")
 templates = Jinja2Templates(directory=templates_path)
+templates.env.globals["version"] = get_settings().app_version
+# base.html calls branding() on every page — this env needs the global too, or
+# authenticated pages (chat) 500 with "'branding' is undefined".
+from backend.app.services import branding as _branding  # noqa: E402
+templates.env.globals["branding"] = _branding.get_branding
 
 
 # ---------------------------------------------------------------------------
