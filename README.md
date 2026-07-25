@@ -2,6 +2,10 @@
 
 MindRouter is a production-ready, self-hosted **AI inference gateway** that fronts a heterogeneous cluster of **vLLM** and **Ollama** GPU nodes and load-balances requests across them. It exposes a single API that speaks the **OpenAI**, **Anthropic**, and **Ollama** dialects, translating between them so existing client code works unchanged.
 
+![MindRouter cluster status dashboard: live token-flow throughput, backend health, and usage at a glance](docs/images/cluster-status.jpg)
+
+*The public Cluster Status page (shown here with University of Idaho branding): real-time token-flow throughput across the backend cluster, healthy-backend and active-user counts, queue depth, and total tokens served.*
+
 The platform is multi-modal, spanning chat and text completion, embeddings, vision, **image and video generation**, **speech (TTS/STT)**, and document OCR. It also provides the governance and operations layers a shared deployment needs: **fair-share scheduling** across users and groups, **per-user token and request quotas**, **role-based access with optional SSO (Azure AD / OAuth)**, **full audit logging**, and real-time **GPU, health, and energy monitoring**.
 
 Because all inference runs on hardware the operator owns, MindRouter is built to support **institutional and organizational AI sovereignty**: scalable on-premises hosting that keeps prompts, documents, and generated media on local infrastructure instead of third-party clouds.
