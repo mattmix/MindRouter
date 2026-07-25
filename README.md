@@ -6,6 +6,10 @@ The platform is multi-modal, spanning chat and text completion, embeddings, visi
 
 Because all inference runs on hardware the operator owns, MindRouter is built to support **institutional and organizational AI sovereignty**: scalable on-premises hosting that keeps prompts, documents, and generated media on local infrastructure instead of third-party clouds.
 
+> **Citation.** If you use MindRouter in your work, please cite:
+>
+> Sheneman, L. (2026). MindRouter: Open-source LLM inference gateway for institutional AI sovereignty. In *Proceedings of the Practice and Experience in Advanced Research Computing Conference 2026 (PEARC '26)*. Association for Computing Machinery. [https://doi.org/10.1145/3785462.3815861](https://doi.org/10.1145/3785462.3815861)
+
 ## Documentation
 
 For comprehensive documentation covering the full application, API reference, configuration, and more, see **[docs/index.md](docs/index.md)**.
