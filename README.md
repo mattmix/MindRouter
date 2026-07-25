@@ -1,6 +1,10 @@
 # MindRouter
 
-A production-ready **LLM inference load balancer** that fronts a heterogeneous backend cluster of **Ollama** and **vLLM** inference nodes, providing a unified OpenAI-compatible API surface with native Ollama compatibility.
+MindRouter is a production-ready, self-hosted **AI inference gateway** that fronts a heterogeneous cluster of **vLLM** and **Ollama** GPU nodes and load-balances requests across them. It exposes a single API that speaks the **OpenAI**, **Anthropic**, and **Ollama** dialects, translating between them so existing client code works unchanged.
+
+The platform is multi-modal — chat and text completion, embeddings, vision, **image and video generation**, **speech (TTS/STT)**, and document OCR — and adds the governance and operations layers a shared deployment needs: **fair-share scheduling** across users and groups, **per-user token and request quotas**, **role-based access with optional SSO (Azure AD / OAuth)**, **full audit logging**, and real-time **GPU, health, and energy monitoring**.
+
+Because all inference runs on hardware the operator owns, MindRouter is built to support **institutional and organizational AI sovereignty** — scalable on-premises hosting that keeps prompts, documents, and generated media on local infrastructure instead of third-party clouds.
 
 ## Documentation
 
@@ -14,11 +18,15 @@ Interactive API docs are also available at `/docs` (Swagger UI) and `/redoc` (Re
 - **API Dialect Translation**: Automatic translation between Ollama and vLLM formats
 - **Fair-Share Scheduling**: Weighted Deficit Round Robin with burst credits
 - **Multi-Modal Support**: Text, embeddings, and vision-language models
+- **Image Generation**: Text-to-image and image-to-image / reference edit via `/v1/images/generations` and `/v1/images/edits` (diffusion backends; per-account enablement)
+- **Video Generation**: Asynchronous text-to-video with keyframe conditioning via `/v1/videos` (per-account enablement, per-user storage quota)
+- **Document OCR**: Text extraction from PDFs and images via `/v1/ocr`
 - **Structured Outputs**: JSON schema validation across all backends
 - **Quota Management**: Per-user token budgets with role-based weights
 - **Node/Backend Architecture**: Separate physical GPU nodes from inference endpoints — one sidecar poll per node, GPU-to-backend assignment
 - **GPU Sidecar Agent**: Lightweight per-node agent for real-time GPU metrics (utilization, memory, temperature, power)
 - **Real-Time Telemetry**: GPU/memory/utilization monitoring per node and per backend
+- **Energy Monitoring**: Per-node power draw and per-request energy accounting, surfaced in the admin dashboard
 - **Drain Mode**: Gracefully take backends offline — stop new requests while in-flight requests finish, then auto-disable
 - **Health Alerts**: Admin dashboard shows a prominent warning banner when any backend is unhealthy or any node is offline
 - **Tool Calling**: Function calling support across all API surfaces with cross-engine translation
