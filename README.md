@@ -16,6 +16,10 @@ For comprehensive documentation covering the full application, API reference, co
 
 Interactive API docs are also available at `/docs` (Swagger UI) and `/redoc` (ReDoc) when the application is running.
 
+## Related Projects
+
+- **[dgx-stack](https://github.com/ui-insight/dgx-stack)**: Running MindRouter and vLLM on NVIDIA DGX Spark systems.
+
 ## Features
 
 - **Unified API Gateway**: OpenAI-compatible `/v1/*` (including the Responses API `/v1/responses`), Ollama `/api/*`, and Anthropic `/anthropic/v1/*` endpoints
