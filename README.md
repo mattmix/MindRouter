@@ -656,6 +656,12 @@ Apache License 2.0 - See [LICENSE](LICENSE) for details.
 
 Please follow conventional commit messages.
 
+## Citing
+
+If you use MindRouter in your work, please cite:
+
+> Sheneman, L. (2026). MindRouter: Open-source LLM inference gateway for institutional AI sovereignty. In *Proceedings of the Practice and Experience in Advanced Research Computing Conference 2026 (PEARC '26)*. Association for Computing Machinery. [https://doi.org/10.1145/3785462.3815861](https://doi.org/10.1145/3785462.3815861)
+
 ## Acknowledgments
 
 <img src="https://github.com/user-attachments/assets/d2b43c22-84f6-4912-91dc-8b081d9e2c6f" alt="NSF Logo" width="157">
