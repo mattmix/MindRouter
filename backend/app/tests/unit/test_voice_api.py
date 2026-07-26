@@ -203,6 +203,7 @@ class TestCheckQuota:
         user = _make_mock_user(tokens_used=500, token_budget=1000000)
         quota = MagicMock()
         quota.tokens_used = 500
+        quota.rpm_limit = 0  # real column is an int; bare MagicMock breaks `> 0`
 
         with patch.object(_crud, "reset_quota_if_needed", new_callable=AsyncMock), \
              patch.object(_crud, "get_user_quota", new_callable=AsyncMock, return_value=quota):
@@ -231,6 +232,7 @@ class TestCheckQuota:
         user.group = None
         quota = MagicMock()
         quota.tokens_used = 99999
+        quota.rpm_limit = 0  # real column is an int; bare MagicMock breaks `> 0`
 
         with patch.object(_crud, "reset_quota_if_needed", new_callable=AsyncMock), \
              patch.object(_crud, "get_user_quota", new_callable=AsyncMock, return_value=quota):
@@ -875,6 +877,84 @@ class TestSTTTranscriptionsEndpoint:
 
             post_call = mock_client.post.call_args
             assert post_call[1]["headers"]["Authorization"] == "Bearer sk-stt-key"
+
+    # --- 2.8.43: OpenAI model-name aliasing + actionable upstream-404 ------
+
+    def _stt_config(self, default_model="deepdml/faster-whisper-large-v3-turbo-ct2"):
+        return {
+            ("voice.stt_enabled", False): True,
+            ("voice.stt_url", None): "http://stt:8080",
+            ("voice.stt_model", "whisper-large-v3-turbo"): default_model,
+            ("voice.stt_api_key", None): None,
+            ("voice_api.stt_quota_tokens", 200): 200,
+        }
+
+    def _stt_client(self, status=200, body=None, text=""):
+        mock_response = MagicMock()
+        mock_response.status_code = status
+        mock_response.json.return_value = body or {"text": "ok"}
+        mock_response.text = text
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(return_value=mock_response)
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+        return mock_client
+
+    @pytest.mark.asyncio
+    async def test_stt_openai_model_names_alias_to_configured_model(self):
+        """whisper-1/whisper/etc. must map to the operator-configured model —
+        forwarding them verbatim 404s the Whisper server (opaque 502 pre-2.8.43,
+        broke every OpenAI-conventional client while the web mic worked)."""
+        for alias in ("whisper-1", "Whisper", "gpt-4o-transcribe", "default-stt"):
+            client = self._stt_client()
+            with patch.object(_voice_mod, "_check_quota", new_callable=AsyncMock), \
+                 patch.object(_crud, "get_config_json", new_callable=AsyncMock,
+                              side_effect=lambda db, key, default: self._stt_config().get((key, default), default)), \
+                 patch.object(_voice_mod, "_record_and_complete", new_callable=AsyncMock), \
+                 patch.object(_voice_mod.httpx, "AsyncClient", return_value=client):
+                await stt_transcriptions(
+                    _make_mock_request(), file=self._make_upload_file(), model=alias,
+                    language=None, db=_make_mock_db(), auth=(_make_mock_user(), _make_mock_api_key()),
+                )
+                sent = client.post.call_args[1]["data"]["model"]
+                assert sent == "deepdml/faster-whisper-large-v3-turbo-ct2", alias
+
+    @pytest.mark.asyncio
+    async def test_stt_explicit_nonalias_model_passes_through(self):
+        """A real (non-alias) model name is forwarded verbatim, so a second
+        installed model stays reachable."""
+        client = self._stt_client()
+        with patch.object(_voice_mod, "_check_quota", new_callable=AsyncMock), \
+             patch.object(_crud, "get_config_json", new_callable=AsyncMock,
+                          side_effect=lambda db, key, default: self._stt_config().get((key, default), default)), \
+             patch.object(_voice_mod, "_record_and_complete", new_callable=AsyncMock), \
+             patch.object(_voice_mod.httpx, "AsyncClient", return_value=client):
+            await stt_transcriptions(
+                _make_mock_request(), file=self._make_upload_file(),
+                model="Systran/faster-whisper-small", language=None,
+                db=_make_mock_db(), auth=(_make_mock_user(), _make_mock_api_key()),
+            )
+            assert client.post.call_args[1]["data"]["model"] == "Systran/faster-whisper-small"
+
+    @pytest.mark.asyncio
+    async def test_stt_upstream_404_returns_actionable_400(self):
+        """Upstream 'model not installed' 404 → 400 naming the configured
+        default, not an opaque 502."""
+        client = self._stt_client(status=404, text='{"detail":"Model not installed"}')
+        with patch.object(_voice_mod, "_check_quota", new_callable=AsyncMock), \
+             patch.object(_crud, "get_config_json", new_callable=AsyncMock,
+                          side_effect=lambda db, key, default: self._stt_config().get((key, default), default)), \
+             patch.object(_voice_mod, "_record_and_complete", new_callable=AsyncMock), \
+             patch.object(_voice_mod.httpx, "AsyncClient", return_value=client):
+            with pytest.raises(HTTPException) as exc:
+                await stt_transcriptions(
+                    _make_mock_request(), file=self._make_upload_file(),
+                    model="Systran/faster-whisper-large-v3", language=None,
+                    db=_make_mock_db(), auth=(_make_mock_user(), _make_mock_api_key()),
+                )
+            assert exc.value.status_code == 400
+            assert "deepdml/faster-whisper-large-v3-turbo-ct2" in exc.value.detail
+            assert "Systran/faster-whisper-large-v3" in exc.value.detail
 
 
 # ================================================================

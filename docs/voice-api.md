@@ -155,7 +155,7 @@ Form fields:
 | Field | Type | Required | Default | Notes |
 |-------|------|----------|---------|-------|
 | `file` | file upload | **yes** | — | The audio file to transcribe. Sent as a multipart file part. The original filename and content-type are forwarded to the STT engine; a missing filename defaults to `audio.webm`. |
-| `model` | string | no | `whisper-large-v3-turbo` | STT model name. When omitted, the server default (config key `voice.stt_model`, default `whisper-large-v3-turbo`) is used. |
+| `model` | string | no | `whisper-large-v3-turbo` | STT model name. When omitted, the server default (config key `voice.stt_model`) is used. OpenAI-dialect names (`whisper-1`, `whisper`, `gpt-4o-transcribe`, `gpt-4o-mini-transcribe`, `default`, `default-stt`) are treated as **aliases for the server default**, so stock OpenAI SDK code works unchanged. Any other explicit name is forwarded verbatim (for installations with multiple installed models); an unknown name returns `400` naming the configured default. |
 | `language` | string | no | (auto-detect) | Optional ISO language hint (e.g. `en`). Only forwarded to the engine when provided; otherwise the engine auto-detects. |
 | `response_format` | string | no | `json` | One of `json`, `text`, `verbose_json`, `srt`, `vtt`. Case-insensitive. An unsupported value returns `400`. |
 
@@ -181,6 +181,7 @@ The response shape depends on `response_format`:
 | `422` | Missing required `file` part. |
 | `429` | Token quota or RPM rate limit exceeded. |
 | `500` | STT service URL not configured server-side. |
+| `400` | Unknown STT model name — the response names the configured default to use instead (or omit `model`). |
 | `502` | Upstream STT service returned an error, was unavailable, or timed out. The timeout message notes the model may still be loading — retry after a short delay. |
 
 The upstream request has a generous 600-second timeout to accommodate long audio and

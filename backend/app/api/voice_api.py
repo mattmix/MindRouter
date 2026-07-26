@@ -204,6 +204,17 @@ async def tts_speech(
 _STT_RESPONSE_FORMATS = {"json", "text", "verbose_json", "srt", "vtt"}
 _STT_TEXT_FORMATS = {"text", "srt", "vtt"}
 
+# OpenAI-dialect STT model names. Clients following OpenAI conventions send
+# these; the backing Whisper server only knows its locally-installed model
+# name, so forwarding them verbatim 404s upstream (surfaced as an opaque 502
+# before 2.8.43). Treat them as aliases for the operator-configured model.
+# Other explicit names still pass through, so a second installed model stays
+# reachable by its real name.
+_STT_MODEL_ALIASES = {
+    "whisper", "whisper-1", "gpt-4o-transcribe", "gpt-4o-mini-transcribe",
+    "default", "default-stt",
+}
+
 
 @router.post("/transcriptions")
 async def stt_transcriptions(
@@ -242,7 +253,12 @@ async def stt_transcriptions(
     if not stt_url:
         raise HTTPException(status_code=500, detail="STT service URL not configured")
 
-    stt_model = model or await crud.get_config_json(db, "voice.stt_model", "whisper-large-v3-turbo")
+    stt_default = await crud.get_config_json(db, "voice.stt_model", "whisper-large-v3-turbo")
+    requested_model = (model or "").strip()
+    if not requested_model or requested_model.lower() in _STT_MODEL_ALIASES:
+        stt_model = stt_default
+    else:
+        stt_model = requested_model
     stt_api_key = await crud.get_config_json(db, "voice.stt_api_key", None)
 
     headers = {}
@@ -275,6 +291,17 @@ async def stt_transcriptions(
                     model=stt_model,
                     error_message=f"STT service error: {resp.status_code}",
                 )
+                if resp.status_code == 404:
+                    # The Whisper server doesn't know this model name — tell the
+                    # caller what IS valid instead of an opaque 502.
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            f"Unknown STT model '{stt_model}'. Omit 'model' to use the "
+                            f"configured default ('{stt_default}'), or pass an installed "
+                            f"model name."
+                        ),
+                    )
                 raise HTTPException(status_code=502, detail="STT service error")
 
     except httpx.TimeoutException as e:
