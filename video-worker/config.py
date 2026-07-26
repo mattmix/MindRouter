@@ -71,7 +71,9 @@ class WorkerConfig:
             "supported_durations": list(DURATION_FRAMES.keys()),
             "supported_fps": [self.default_fps],
             "quality_tiers": QUALITY_TIERS,
-            "pipelines": ["t2v"],  # v1 is text-to-video only
+            # t2v plus image conditioning: start_image (i2v) and end_image
+            # (keyframe) are honored by the engine (ImageConditioningInput).
+            "pipelines": ["t2v", "i2v", "keyframes"],
             "max_frames": max(DURATION_FRAMES.values()),
         }
 

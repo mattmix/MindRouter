@@ -71,9 +71,9 @@ you to use `size`).
 | `size` | string | no | `vid.default_size` (`1280x704`) | `"WIDTHxHEIGHT"` from the fixed preset menu (see [Sizes & durations](#sizes-durations-fps)). Off-menu → `400`. |
 | `seconds` | int / string | no | `vid.default_seconds` (`5`) | Whole number of seconds, `4`–`30` inclusive (`vid.min_seconds`..`vid.max_total_seconds`). Non-integer or out-of-range → `400`. |
 | `fps` | int | no | `24` | Accepted but **not validated**: any value is stored and echoed back, but only `24` is actually rendered. Off-`24` values are neither honored nor rejected (no `400`). |
-| `quality` | string | no | `standard` | One of `draft` \| `standard` \| `final`. Controls denoising steps/guidance and the token cost multiplier. Anything else → `400`. |
-| `seed` | int | no | random | Optional determinism seed. |
-| `negative_prompt` | string | no | — | Optional. |
+| `quality` | string | no | `standard` | One of `draft` \| `standard` \| `final`. **Currently a billing multiplier only** (`vid.quality_multipliers`): the distilled model renders every tier with the same fixed schedule, so output is identical across tiers. Step-count/checkpoint differentiation is planned (Phase 5). Anything else → `400`. |
+| `seed` | int | no | random | Determinism seed. When omitted, a random seed is generated **at submit time, persisted, and echoed** on the job object — so every render is reproducible after the fact, and repeat submissions of the same prompt produce different takes. Pass an explicit seed to reproduce a clip exactly. |
+| `negative_prompt` | string | no | — | **Ignored.** The distilled model is guidance-free (CFG=1), so negative prompts cannot take effect; sending one gets a logged hint (or a `400` in enforce mode). Steer content through the positive prompt instead — LTX honors prose direction like "no speech, only wind and distant machinery". |
 | `callback_url` | string | no | — | Optional webhook fired on completion. |
 | `start_image_asset_id` | int | no | — | Asset id (from `POST /v1/videos/assets`) used as the **first-frame** keyframe. Must be an asset you own → else `400`. |
 | `end_image_asset_id` | int | no | — | Asset id used as the **last-frame** keyframe. Must be an asset you own → else `400`. |
@@ -187,8 +187,8 @@ Render your UI controls from this so the preset matrix has one source of truth.
       "supported_fps": [24],
       "supported_qualities": ["draft", "standard", "final"],
       "supports_text_to_video": true,
-      "supports_image_to_video": false,
-      "supports_keyframes": false,
+      "supports_image_to_video": true,
+      "supports_keyframes": true,
       "max_shots": 1,
       "license_notice": "AI-generated"
     }
@@ -196,12 +196,10 @@ Render your UI controls from this so the preset matrix has one source of truth.
 }
 ```
 
-> **Note on the capability flags.** `supports_image_to_video` and
-> `supports_keyframes` report the model runner's advertised text-to-video mode and
-> currently read `false`. The **create endpoint nonetheless accepts**
-> `start_image_asset_id` / `end_image_asset_id` today (see below) — the flags are the
-> runner's self-description, not a gate on the request fields. Treat the fields as the
-> authoritative way to do keyframe conditioning over the API.
+> **Capability flags** now reflect shipped behavior (since 2.8.42):
+> `supports_image_to_video` and `supports_keyframes` are `true` because
+> `start_image_asset_id` (first-frame conditioning) and `end_image_asset_id`
+> (last-frame keyframe) are honored end-to-end by the render worker (see below).
 
 ---
 
@@ -241,9 +239,20 @@ You can supply just a start frame, just an end frame, or both to bracket the mot
   "model": "lightricks/ltx-2.3-distilled",
   "size": "1280x704",
   "fps": 24,
-  "quality": "standard"
+  "quality": "standard",
+
+  "seed": 1804289383,
+  "seconds": 5.0,
+  "start_image_asset_id": null,
+  "end_image_asset_id": null
 }
 ```
+
+> **Echoed request parameters** (since 2.8.42): `seed`, `seconds`, and the
+> start/end image asset ids are echoed on **create** and on **single-job GET**
+> polls, alongside `model`/`size`/`fps`/`quality` — so you can always tell
+> exactly what a render used (the auto-generated seed included). The **list**
+> endpoint stays lean and omits these per-request fields.
 
 | field | meaning |
 |---|---|

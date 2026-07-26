@@ -146,7 +146,13 @@ def _patch_crud(monkeypatch, config=None, active_jobs=0, reserve_ok=True, cost=1
         _mod.crud, "create_video_job",
         AsyncMock(return_value=_job(status=_JS.QUEUED)),
     )
-    monkeypatch.setattr(_mod.crud, "create_video_shot", AsyncMock(return_value=SimpleNamespace(id=5)))
+    monkeypatch.setattr(
+        _mod.crud, "create_video_shot",
+        AsyncMock(return_value=SimpleNamespace(
+            id=5, seed=123, seconds=5.0,
+            first_frame_asset_id=None, last_frame_asset_id=None,
+        )),
+    )
 
 
 def _patch_registry(monkeypatch, exists=True):
@@ -162,7 +168,7 @@ def _job(status=_JS.QUEUED, uuid="vid-abc123", output_asset_id=None):
         id=42, job_uuid=uuid, status=status, progress=0.0, created_at=now, started_at=None,
         completed_at=None, expires_at=None, output_asset_id=output_asset_id,
         error_code=None, error_message=None, duration_seconds=None, gpu_seconds=0,
-        token_equivalent=None, user_id=7, cancel_requested=False,
+        token_equivalent=None, user_id=7, cancel_requested=False, project_id=11,
     )
 
 
@@ -470,5 +476,94 @@ async def test_list_video_models_shape(monkeypatch):
     assert out["object"] == "list"
     assert out["data"][0]["id"] == "lightricks/ltx-2.3-distilled"
     assert out["data"][0]["supports_text_to_video"] is True
-    assert out["data"][0]["supports_image_to_video"] is False  # v1 is t2v only
+    # Image conditioning (start/end keyframes) ships and is honored end-to-end,
+    # so the capability flags must advertise it (stale-False regression, 2.8.42).
+    assert out["data"][0]["supports_image_to_video"] is True
+    assert out["data"][0]["supports_keyframes"] is True
     assert out["data"][0]["max_shots"] == 1
+
+
+# --- 2.8.42: seed randomization, request-param echo, negative_prompt honesty
+
+
+@pytest.mark.asyncio
+async def test_omitted_seed_is_randomized_and_persisted(monkeypatch):
+    """No client seed -> gateway generates one (never the worker's fixed 42
+    fallback), persists it on the shot, and echoes it. Two submissions get
+    different seeds, so a second take no longer requires editing the prompt."""
+    _patch_crud(monkeypatch, config={"vid.enabled": True})
+    _patch_registry(monkeypatch)
+    seeds = []
+    for _ in range(2):
+        await create_video(_request({"prompt": "a fox in snow"}), db=_db(), auth=_auth())
+        kwargs = _mod.crud.create_video_shot.await_args.kwargs
+        assert kwargs["seed"] is not None
+        assert 0 <= kwargs["seed"] < 2**31
+        seeds.append(kwargs["seed"])
+    assert seeds[0] != seeds[1]  # randbelow(2**31): collision odds ~0
+
+
+@pytest.mark.asyncio
+async def test_explicit_seed_passes_through_unchanged(monkeypatch):
+    _patch_crud(monkeypatch, config={"vid.enabled": True})
+    _patch_registry(monkeypatch)
+    await create_video(_request({"prompt": "a fox in snow", "seed": 7}), db=_db(), auth=_auth())
+    assert _mod.crud.create_video_shot.await_args.kwargs["seed"] == 7
+
+
+@pytest.mark.asyncio
+async def test_create_echoes_shot_params(monkeypatch):
+    """Create response carries seed/seconds/asset ids so honored params are
+    distinguishable from silently-dropped ones (external tester gap #2)."""
+    _patch_crud(monkeypatch, config={"vid.enabled": True})
+    _patch_registry(monkeypatch)
+    result = await create_video(_request({"prompt": "a fox in snow"}), db=_db(), auth=_auth())
+    assert result["seed"] == 123          # from the _patch_crud shot mock
+    assert result["seconds"] == 5.0
+    assert result["start_image_asset_id"] is None
+    assert result["end_image_asset_id"] is None
+
+
+def test_job_to_dict_echoes_shot_fields():
+    shot = SimpleNamespace(seed=99, seconds=8.0, first_frame_asset_id=3, last_frame_asset_id=4)
+    proj = SimpleNamespace(model="m", size="1280x704", fps=24, quality="standard")
+    d = _job_to_dict(_job(), proj, shot)
+    assert (d["seed"], d["seconds"]) == (99, 8.0)
+    assert (d["start_image_asset_id"], d["end_image_asset_id"]) == (3, 4)
+    # list endpoint shape (no shot) must NOT carry the keys
+    assert "seed" not in _job_to_dict(_job())
+
+
+@pytest.mark.asyncio
+async def test_get_video_echoes_project_and_shot(monkeypatch):
+    """Polls (not just create) include model/size/fps/quality + seed/asset ids."""
+    monkeypatch.setattr(_mod.crud, "get_video_job_by_uuid", AsyncMock(return_value=_job()))
+    monkeypatch.setattr(
+        _mod.crud, "get_video_project",
+        AsyncMock(return_value=SimpleNamespace(model="lightricks/ltx-2.3-distilled",
+                                               size="1280x704", fps=24, quality="standard")),
+    )
+    monkeypatch.setattr(
+        _mod.crud, "get_video_shots",
+        AsyncMock(return_value=[SimpleNamespace(seed=55, seconds=5.0,
+                                                first_frame_asset_id=9, last_frame_asset_id=None)]),
+    )
+    d = await get_video("vid-abc123", db=_db(), auth=_auth())
+    assert d["model"] == "lightricks/ltx-2.3-distilled"
+    assert d["seed"] == 55
+    assert d["start_image_asset_id"] == 9
+
+
+def test_negative_prompt_not_accepted_and_has_honest_hint():
+    """negative_prompt was allowlisted but dropped everywhere (gateway, runner,
+    worker) — the distilled model is guidance-free so it CANNOT take effect.
+    It must be off VIDEO_ACCEPTED and carry a hint pointing at prose prompting."""
+    from backend.app.core.translators import field_validation as fv
+
+    assert "negative_prompt" not in fv.VIDEO_ACCEPTED
+    assert "negative_prompt" in fv.VIDEO_DIALECT_HINTS
+    hint = fv.VIDEO_DIALECT_HINTS["negative_prompt"]
+    assert "guidance-free" in hint and "positive prompt" in hint
+    # The other silently-dropped params surfaced by the tester get hints too.
+    for f in ("audio_asset_id", "modality_scale", "extend_from_video_id", "enhance_prompt"):
+        assert f in fv.VIDEO_DIALECT_HINTS, f

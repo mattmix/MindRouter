@@ -80,9 +80,13 @@ CHAT_DIALECT_HINTS: Dict[str, str] = {
 
 # --- Video generation dialect (v1 text-to-video) --------------------------
 # Fields the video create path (submit_video_job) actually consumes.
+# NOTE: negative_prompt is deliberately NOT here — the current distilled model
+# is guidance-free (CFG=1) so a negative prompt cannot take effect, and listing
+# it as accepted while dropping it violated this module's own contract. It has
+# a dialect hint below instead.
 VIDEO_ACCEPTED: Set[str] = {
     "model", "prompt", "size", "seconds", "fps", "quality", "seed",
-    "negative_prompt", "callback_url",
+    "callback_url",
     # Optional keyframe conditioning — asset ids from POST /v1/videos/assets.
     "start_image_asset_id", "end_image_asset_id",
 }
@@ -112,8 +116,18 @@ VIDEO_DIALECT_HINTS: Dict[str, str] = {
     "first_frame": "Upload the image via POST /v1/videos/assets, then pass its id as 'start_image_asset_id'.",
     "last_frame": "Upload the image via POST /v1/videos/assets, then pass its id as 'end_image_asset_id'.",
     "storyboard": "Multi-shot storyboards are not available in v1 (single clip only).",
-    "audio": "Audio generation is not available in v1.",
-    "generate_audio": "Audio generation is not available in v1.",
+    "negative_prompt": (
+        "The current video model is guidance-free (CFG=1), so negative prompts have "
+        "no effect and the field is ignored. Steer content with the positive prompt "
+        "instead (e.g. describe the ambience you want; LTX honors prose audio "
+        "direction such as 'no speech, only wind and distant machinery')."
+    ),
+    "audio": "Every clip already includes the model's native synchronized audio; a separate audio toggle is not available in v1.",
+    "generate_audio": "Every clip already includes the model's native synchronized audio; a separate audio toggle is not available in v1.",
+    "audio_asset_id": "Audio-to-video / lipsync is not available in v1; clips carry the model's native audio. For narration, mux TTS audio client-side (see docs/media-studio-integration.md).",
+    "modality_scale": "Audio/video guidance scales are fixed in v1 and cannot be set per request.",
+    "extend_from_video_id": "Video extension is not available in v1. To continue a clip, pass a frame from it as 'start_image_asset_id' on a new request.",
+    "enhance_prompt": "Prompt enhancement is not available; prompts are used verbatim.",
 }
 
 

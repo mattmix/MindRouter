@@ -38,8 +38,18 @@ def test_enforce_accepts_all_declared_video_fields():
     _v({
         "model": "lightricks/ltx-2.3-distilled", "prompt": "a fox",
         "size": "1280x704", "seconds": "5", "fps": 24, "quality": "draft",
-        "seed": 7, "negative_prompt": "blurry", "callback_url": "https://x/y",
+        "seed": 7, "callback_url": "https://x/y",
     }, mode="enforce")
+
+
+def test_enforce_rejects_negative_prompt_with_guidance_free_hint():
+    # negative_prompt was allowlisted-but-dropped (never forwarded, and the
+    # distilled model is guidance-free so it cannot act on one). 2.8.42 removed
+    # it from VIDEO_ACCEPTED; enforce mode must now surface the honest hint.
+    with pytest.raises(HTTPException) as ei:
+        _v({"prompt": "x", "negative_prompt": "no speech"}, mode="enforce")
+    msg = ei.value.detail["error"]["message"]
+    assert "guidance-free" in msg and "positive prompt" in msg
 
 
 def test_enforce_rejects_duration_typo_with_hint():

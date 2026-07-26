@@ -20,6 +20,7 @@
 
 """Public video generation API (/v1/videos)."""
 
+import secrets
 import time
 import uuid
 from typing import Any, Dict, Optional, Tuple
@@ -64,8 +65,16 @@ def _unix(dt) -> Optional[int]:
     return int(dt.timestamp()) if dt else None
 
 
-def _job_to_dict(job: VideoJob, project=None) -> Dict[str, Any]:
-    """Render a job as the OpenAI-shaped video object echoed by every endpoint."""
+def _job_to_dict(job: VideoJob, project=None, shot=None) -> Dict[str, Any]:
+    """Render a job as the OpenAI-shaped video object echoed by every endpoint.
+
+    ``project`` adds model/size/fps/quality; ``shot`` adds the honored request
+    parameters (seed, requested seconds, start/end image asset ids) so clients
+    can tell exactly what the render used — previously these were accepted but
+    never echoed, making honored params indistinguishable from dropped ones.
+    Both are included on create and single-job GET; the list endpoint stays
+    lean (job rows only).
+    """
     obj: Dict[str, Any] = {
         "id": job.job_uuid,
         "object": "video",
@@ -100,6 +109,17 @@ def _job_to_dict(job: VideoJob, project=None) -> Dict[str, Any]:
                     if hasattr(project.quality, "value")
                     else project.quality
                 ),
+            }
+        )
+    if shot is not None:
+        obj.update(
+            {
+                "seed": shot.seed,
+                "seconds": shot.seconds,
+                # Asset ids echo exactly as the client sent them (public id ==
+                # the id POST /v1/videos/assets returned); null when unused.
+                "start_image_asset_id": shot.first_frame_asset_id,
+                "end_image_asset_id": shot.last_frame_asset_id,
             }
         )
     return obj
@@ -140,9 +160,12 @@ async def list_video_models(
                 "supported_fps": [24],
                 "supported_qualities": ["draft", "standard", "final"],
                 "supports_text_to_video": True,
-                # v1 is t2v only — these arrive in later phases.
-                "supports_image_to_video": False,
-                "supports_keyframes": False,
+                # Image conditioning ships: start_image_asset_id (i2v) and
+                # end_image_asset_id (keyframe) are honored end-to-end by the
+                # worker (release 2.8.30). These were stale False literals from
+                # the t2v-only phase — fixed in 2.8.42.
+                "supports_image_to_video": True,
+                "supports_keyframes": True,
                 "max_shots": 1,
                 "license_notice": "AI-generated",
             }
@@ -356,13 +379,22 @@ async def submit_video_job(
     first_frame = await _resolve_ref(body.get("start_image_asset_id"))
     last_frame = await _resolve_ref(body.get("end_image_asset_id"))
 
-    await crud.create_video_shot(
+    # Randomize the seed when the client omits it (docs promise "random"; the
+    # worker's fallback was a FIXED 42, making same-prompt renders byte-identical
+    # — a second take required editing the prompt). Persisting it here keeps
+    # renders reproducible: it is echoed on the job object and retries of the
+    # shot reuse the stored value.
+    seed = body.get("seed")
+    if seed is None:
+        seed = secrets.randbelow(2**31)
+
+    shot = await crud.create_video_shot(
         db=db,
         job_id=job.id,
         shot_index=0,
         seconds=float(seconds),
         prompt=prompt,
-        seed=body.get("seed"),
+        seed=seed,
         first_frame_asset_id=first_frame,
         last_frame_asset_id=last_frame,
     )
@@ -372,9 +404,10 @@ async def submit_video_job(
     # expire_on_commit may have expired these; reload before serializing.
     await db.refresh(job)
     await db.refresh(project)
+    await db.refresh(shot)
 
     logger.info("video_job_created", job_uuid=job_uuid, model=model, size=size, seconds=seconds)
-    return _job_to_dict(job, project)
+    return _job_to_dict(job, project, shot)
 
 
 @router.post("/videos", status_code=status.HTTP_202_ACCEPTED)
@@ -495,12 +528,18 @@ async def get_video(
     db: AsyncSession = Depends(get_async_db),
     auth: Tuple[User, ApiKey] = Depends(authenticate_request),
 ):
-    """Poll a single job. 404 (never 403) for another user's id — no existence leak."""
+    """Poll a single job. 404 (never 403) for another user's id — no existence leak.
+
+    Echoes model/size/fps/quality (project) and seed/seconds/asset ids (shot) on
+    every poll, not just on create.
+    """
     user, _ = auth
     job = await crud.get_video_job_by_uuid(db, video_id, user_id=user.id)
     if not job:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Video not found")
-    return _job_to_dict(job)
+    project = await crud.get_video_project(db, job.project_id)
+    shots = await crud.get_video_shots(db, job.id)
+    return _job_to_dict(job, project, shots[0] if shots else None)
 
 
 @router.delete("/videos/{video_id}")
