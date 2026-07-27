@@ -122,3 +122,11 @@ def test_blog_export_is_institution_neutral():
     src = _read("backend/app/dashboard/blog_export.py")
     assert "https://mindrouter.ai" not in src
     assert "SITE_BASE_URL" not in src
+
+
+def test_feed_route_registered_before_slug_catchall():
+    """/blog/{slug} swallows /blog/feed.xml if registered first (Starlette
+    matches in registration order) — the feed 404'd as 'Post not found' on the
+    2.8.44 deploy. Feed must be defined earlier in the file."""
+    src = _read(BLOG)
+    assert src.index('"/blog/feed.xml"') < src.index('"/blog/{slug}"')

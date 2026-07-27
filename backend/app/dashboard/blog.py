@@ -87,6 +87,77 @@ async def blog_index(
     )
 
 
+# ---------------------------------------------------------------------------
+# Public syndication feeds (pull model).
+#
+# External sites (e.g. a marketing/static site) PULL the admin-selected posts
+# from here and render them with their own templates. The gateway never pushes
+# and holds no external credentials. Both endpoints are public: they expose
+# only posts that are already app-published AND flagged for syndication.
+# ---------------------------------------------------------------------------
+
+async def _syndication_base_url(db: AsyncSession) -> str:
+    """This installation's public base URL (admin-configurable)."""
+    base = await crud.get_config_json(db, "app.base_url", get_settings().app_base_url)
+    return (base or "").rstrip("/")
+
+
+@blog_router.get("/blog/feed.xml")
+async def blog_feed_xml(db: AsyncSession = Depends(get_async_db)):
+    """RSS 2.0 feed of syndicated posts. Public, cacheable."""
+    posts = await crud.get_website_published_blog_posts(db)
+    base_url = await _syndication_base_url(db)
+    site_name = branding_service.get_branding()["app_name"]
+    xml = blog_export.render_feed_xml(posts, base_url, site_name=site_name)
+    return Response(
+        content=xml,
+        media_type="application/rss+xml",
+        headers={"Cache-Control": "public, max-age=300"},
+    )
+
+
+@blog_router.get("/api/blog/syndicated")
+async def blog_syndicated_json(db: AsyncSession = Depends(get_async_db)):
+    """JSON feed of syndicated posts for external site builders.
+
+    Carries raw markdown (render with your own pipeline), pre-rendered HTML
+    (codehilite classes), and an absolute-URL image manifest so a puller can
+    download and rehost the images.
+    """
+    posts = await crud.get_website_published_blog_posts(db)
+    base_url = await _syndication_base_url(db)
+
+    def _iso(dt):
+        return dt.isoformat() if dt else None
+
+    items = []
+    for post in posts:
+        image_paths = blog_export.collect_image_paths(post.content)
+        items.append({
+            "slug": post.slug,
+            "title": post.title,
+            "description": blog_export.derive_description(
+                getattr(post, "excerpt", None), post.content
+            ),
+            "author": getattr(post, "author_name", None) or None,
+            "published_at": _iso(getattr(post, "published_at", None)),
+            "syndicated_at": _iso(getattr(post, "website_published_at", None)),
+            "updated_at": _iso(getattr(post, "updated_at", None)),
+            "content_markdown": post.content,
+            "content_html": blog_export.render_markdown(post.content),
+            "images": [
+                {"path": p, "url": f"{base_url}/blog/images/{p}"}
+                for p in image_paths
+            ],
+        })
+    return JSONResponse(
+        {"object": "list", "base_url": base_url, "posts": items},
+        headers={"Cache-Control": "public, max-age=300"},
+    )
+
+
+# NOTE: registered BEFORE /blog/{slug} — the catch-all slug route would
+# otherwise swallow /blog/feed.xml as a slug (404 'Post not found').
 @blog_router.get("/blog/{slug}", response_class=HTMLResponse)
 async def blog_post(
     request: Request,
@@ -511,75 +582,6 @@ async def admin_blog_send_test_email(
         return JSONResponse({"ok": True, "message": f"Test sent to {test_addr}"})
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
-
-
-# ---------------------------------------------------------------------------
-# Public syndication feeds (pull model).
-#
-# External sites (e.g. a marketing/static site) PULL the admin-selected posts
-# from here and render them with their own templates. The gateway never pushes
-# and holds no external credentials. Both endpoints are public: they expose
-# only posts that are already app-published AND flagged for syndication.
-# ---------------------------------------------------------------------------
-
-async def _syndication_base_url(db: AsyncSession) -> str:
-    """This installation's public base URL (admin-configurable)."""
-    base = await crud.get_config_json(db, "app.base_url", get_settings().app_base_url)
-    return (base or "").rstrip("/")
-
-
-@blog_router.get("/blog/feed.xml")
-async def blog_feed_xml(db: AsyncSession = Depends(get_async_db)):
-    """RSS 2.0 feed of syndicated posts. Public, cacheable."""
-    posts = await crud.get_website_published_blog_posts(db)
-    base_url = await _syndication_base_url(db)
-    site_name = branding_service.get_branding()["app_name"]
-    xml = blog_export.render_feed_xml(posts, base_url, site_name=site_name)
-    return Response(
-        content=xml,
-        media_type="application/rss+xml",
-        headers={"Cache-Control": "public, max-age=300"},
-    )
-
-
-@blog_router.get("/api/blog/syndicated")
-async def blog_syndicated_json(db: AsyncSession = Depends(get_async_db)):
-    """JSON feed of syndicated posts for external site builders.
-
-    Carries raw markdown (render with your own pipeline), pre-rendered HTML
-    (codehilite classes), and an absolute-URL image manifest so a puller can
-    download and rehost the images.
-    """
-    posts = await crud.get_website_published_blog_posts(db)
-    base_url = await _syndication_base_url(db)
-
-    def _iso(dt):
-        return dt.isoformat() if dt else None
-
-    items = []
-    for post in posts:
-        image_paths = blog_export.collect_image_paths(post.content)
-        items.append({
-            "slug": post.slug,
-            "title": post.title,
-            "description": blog_export.derive_description(
-                getattr(post, "excerpt", None), post.content
-            ),
-            "author": getattr(post, "author_name", None) or None,
-            "published_at": _iso(getattr(post, "published_at", None)),
-            "syndicated_at": _iso(getattr(post, "website_published_at", None)),
-            "updated_at": _iso(getattr(post, "updated_at", None)),
-            "content_markdown": post.content,
-            "content_html": blog_export.render_markdown(post.content),
-            "images": [
-                {"path": p, "url": f"{base_url}/blog/images/{p}"}
-                for p in image_paths
-            ],
-        })
-    return JSONResponse(
-        {"object": "list", "base_url": base_url, "posts": items},
-        headers={"Cache-Control": "public, max-age=300"},
-    )
 
 
 # ---------------------------------------------------------------------------
