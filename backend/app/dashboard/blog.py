@@ -32,7 +32,8 @@ from backend.app.dashboard.routes import get_session_user_id, _admin_masquerade_
 from backend.app.services import email_service
 from backend.app.storage.artifacts import get_artifact_storage
 from backend.app.dashboard import blog_export
-from backend.app.services.website_publisher import get_website_publisher
+from backend.app.services import branding as branding_service
+from backend.app.settings import get_settings
 
 blog_router = APIRouter(tags=["blog"])
 
@@ -346,12 +347,13 @@ async def admin_blog_website_publish(
     post_id: int,
     db: AsyncSession = Depends(get_async_db),
 ):
-    """Select a post for the public mindrouter.ai site.
+    """Include a post in the public syndication feed.
 
-    Requires the post to be app-published first, so drafts never leak to the
-    public site. This records the selection; the GitHub publisher (PR3) commits
-    the generated page/images to the mindrouter-website repo and captures the
-    commit sha.
+    Requires the post to be app-published first, so drafts never leak. This
+    only flips the selection flag: external sites PULL the selected posts via
+    ``GET /blog/feed.xml`` (RSS) or ``GET /api/blog/syndicated`` (JSON) on
+    their own schedule — the gateway pushes nothing and holds no credentials
+    for any external site.
     """
     user, redirect = await _require_admin(request, db)
     if redirect:
@@ -362,35 +364,19 @@ async def admin_blog_website_publish(
         raise HTTPException(status_code=404, detail="Post not found")
     if not post.is_published:
         return _blog_edit_redirect(
-            post_id, error="Publish the post before sending it to mindrouter.ai."
+            post_id, error="Publish the post before adding it to the syndication feed."
         )
 
-    # Record the selection first so the regenerated index includes this post.
     await crud.update_blog_post(
         db, post_id,
         website_published=True,
         website_published_at=datetime.now(timezone.utc),
     )
     await db.commit()
-
-    publisher = get_website_publisher()
-    if not publisher.enabled:
-        return _blog_edit_redirect(
-            post_id,
-            success="Selected for mindrouter.ai (publishing not configured — set a GitHub token to push).",
-        )
-    try:
-        selected = await crud.get_website_published_blog_posts(db)  # now includes this post
-        sha = await publisher.publish(post, selected)
-        await crud.update_blog_post(db, post_id, website_commit_sha=sha)
-        await db.commit()
-        return _blog_edit_redirect(
-            post_id, success="Published to mindrouter.ai — pull on the host to go live."
-        )
-    except Exception as e:  # noqa: BLE001 - surface any push failure to the admin
-        return _blog_edit_redirect(
-            post_id, error=f"Selected, but the push to mindrouter.ai failed: {e}"
-        )
+    return _blog_edit_redirect(
+        post_id,
+        success="Added to the public syndication feed — external sites pick it up on their next sync.",
+    )
 
 
 @blog_router.post("/admin/blog/{post_id}/website-unpublish")
@@ -399,7 +385,11 @@ async def admin_blog_website_unpublish(
     post_id: int,
     db: AsyncSession = Depends(get_async_db),
 ):
-    """Remove a post from the public mindrouter.ai site."""
+    """Remove a post from the public syndication feed.
+
+    Flag-only, like publish: external sites notice the post is gone from the
+    feed on their next sync and remove their copy.
+    """
     user, redirect = await _require_admin(request, db)
     if redirect:
         return redirect
@@ -415,20 +405,10 @@ async def admin_blog_website_unpublish(
         website_commit_sha=None,
     )
     await db.commit()
-
-    publisher = get_website_publisher()
-    if not publisher.enabled:
-        return _blog_edit_redirect(post_id, success="Removed from mindrouter.ai selection.")
-    try:
-        selected = await crud.get_website_published_blog_posts(db)  # now excludes this post
-        await publisher.unpublish(post, selected)
-        return _blog_edit_redirect(
-            post_id, success="Removed from mindrouter.ai — pull on the host to update."
-        )
-    except Exception as e:  # noqa: BLE001
-        return _blog_edit_redirect(
-            post_id, error=f"Removed from the app selection, but the push to mindrouter.ai failed: {e}"
-        )
+    return _blog_edit_redirect(
+        post_id,
+        success="Removed from the public syndication feed — external sites drop it on their next sync.",
+    )
 
 
 @blog_router.post("/admin/blog/{post_id}/send-email")
@@ -534,73 +514,72 @@ async def admin_blog_send_test_email(
 
 
 # ---------------------------------------------------------------------------
-# Static-HTML export (dry-run preview of what would ship to mindrouter.ai).
-# The actual GitHub publishing lives in services/website_publisher.py.
+# Public syndication feeds (pull model).
+#
+# External sites (e.g. a marketing/static site) PULL the admin-selected posts
+# from here and render them with their own templates. The gateway never pushes
+# and holds no external credentials. Both endpoints are public: they expose
+# only posts that are already app-published AND flagged for syndication.
 # ---------------------------------------------------------------------------
 
-@blog_router.get("/admin/blog/{post_id}/export.json")
-async def admin_blog_export_json(
-    request: Request,
-    post_id: int,
-    db: AsyncSession = Depends(get_async_db),
-):
-    """Admin dry-run: show the generated static HTML + image manifest for a post."""
-    user, redirect = await _require_admin_read(request, db)
-    if redirect:
-        return redirect
-
-    post = await crud.get_blog_post_by_id(db, post_id)
-    if not post:
-        return JSONResponse({"error": "Post not found"}, status_code=404)
-
-    exported = await blog_export.export_post(post)
-    return JSONResponse({
-        "post": {
-            "id": post.id,
-            "slug": exported.slug,
-            "title": exported.title,
-            "repo_path": exported.repo_path,
-            "url": exported.url,
-            "canonical": exported.canonical,
-        },
-        "images": [
-            {
-                "storage_path": img.storage_path,
-                "repo_path": img.repo_path,
-                "url": img.url,
-                "size": img.size,
-                "missing": img.missing,
-            }
-            for img in exported.images
-        ],
-        "missing_images": exported.missing_images,
-        "html_bytes": len(exported.html.encode("utf-8")),
-        "html": exported.html,
-    })
+async def _syndication_base_url(db: AsyncSession) -> str:
+    """This installation's public base URL (admin-configurable)."""
+    base = await crud.get_config_json(db, "app.base_url", get_settings().app_base_url)
+    return (base or "").rstrip("/")
 
 
-@blog_router.get("/admin/blog/{post_id}/export/preview", response_class=HTMLResponse)
-async def admin_blog_export_preview(
-    request: Request,
-    post_id: int,
-    db: AsyncSession = Depends(get_async_db),
-):
-    """Admin dry-run: render the generated static page as HTML for eyeballing.
+@blog_router.get("/blog/feed.xml")
+async def blog_feed_xml(db: AsyncSession = Depends(get_async_db)):
+    """RSS 2.0 feed of syndicated posts. Public, cacheable."""
+    posts = await crud.get_website_published_blog_posts(db)
+    base_url = await _syndication_base_url(db)
+    site_name = branding_service.get_branding()["app_name"]
+    xml = blog_export.render_feed_xml(posts, base_url, site_name=site_name)
+    return Response(
+        content=xml,
+        media_type="application/rss+xml",
+        headers={"Cache-Control": "public, max-age=300"},
+    )
 
-    Served from the app, so /css/style.css and /css/blog.css (website assets)
-    will 404 here; Bootstrap/Pygments load from CDN and /blog/images/* resolve
-    via the app's own image route, so this gives a rough visual check. The
-    true look is on mindrouter.ai after publishing.
+
+@blog_router.get("/api/blog/syndicated")
+async def blog_syndicated_json(db: AsyncSession = Depends(get_async_db)):
+    """JSON feed of syndicated posts for external site builders.
+
+    Carries raw markdown (render with your own pipeline), pre-rendered HTML
+    (codehilite classes), and an absolute-URL image manifest so a puller can
+    download and rehost the images.
     """
-    user, redirect = await _require_admin_read(request, db)
-    if redirect:
-        return redirect
+    posts = await crud.get_website_published_blog_posts(db)
+    base_url = await _syndication_base_url(db)
 
-    post = await crud.get_blog_post_by_id(db, post_id)
-    if not post:
-        raise HTTPException(status_code=404, detail="Post not found")
+    def _iso(dt):
+        return dt.isoformat() if dt else None
 
-    return HTMLResponse(blog_export.render_post_html(post))
+    items = []
+    for post in posts:
+        image_paths = blog_export.collect_image_paths(post.content)
+        items.append({
+            "slug": post.slug,
+            "title": post.title,
+            "description": blog_export.derive_description(
+                getattr(post, "excerpt", None), post.content
+            ),
+            "author": getattr(post, "author_name", None) or None,
+            "published_at": _iso(getattr(post, "published_at", None)),
+            "syndicated_at": _iso(getattr(post, "website_published_at", None)),
+            "updated_at": _iso(getattr(post, "updated_at", None)),
+            "content_markdown": post.content,
+            "content_html": blog_export.render_markdown(post.content),
+            "images": [
+                {"path": p, "url": f"{base_url}/blog/images/{p}"}
+                for p in image_paths
+            ],
+        })
+    return JSONResponse(
+        {"object": "list", "base_url": base_url, "posts": items},
+        headers={"Cache-Control": "public, max-age=300"},
+    )
 
 
 # ---------------------------------------------------------------------------

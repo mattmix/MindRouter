@@ -181,14 +181,11 @@ class Settings(BaseSettings):
     # per-model launch defaults.
     thinking_off_by_default: bool = True
 
-    # Public website publishing (mindrouter.ai static site). Selected blog posts
-    # are committed to the mindrouter-website repo via the GitHub API. The repo
-    # is additionally hard-allowlisted in website_publisher.py so it can never
-    # target another repository. Needs a fine-grained PAT with Contents:RW.
-    website_publish_enabled: bool = False
-    website_publish_repo: str = "sheneman/mindrouter-website"
-    website_publish_branch: str = "main"
-    website_publish_github_token: str = ""
+    # Blog syndication is PULL-only: selected posts are exposed read-only at
+    # /blog/feed.xml (RSS) and /api/blog/syndicated (JSON); external sites pull
+    # and render with their own templates. The old push-to-GitHub publisher
+    # (site-specific chrome + a write credential inside the gateway) was
+    # removed in 2.8.44.
 
     # Startup: opt-in `alembic upgrade head` before serving (env RUN_MIGRATIONS=1)
     # so a fresh/unmigrated database doesn't crash-loop the app. Off by default

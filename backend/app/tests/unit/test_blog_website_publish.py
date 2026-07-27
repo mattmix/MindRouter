@@ -1,7 +1,9 @@
-"""PR2 contract tests for selective mindrouter.ai publishing.
+"""Contract tests for blog syndication (pull model since 2.8.44).
 
 Source-inspection tests (no DB): verify the migration, model, routes, and CRUD
-that manage the ``website_published`` state stay consistent. This mirrors the
+that manage the ``website_published`` (syndication) state stay consistent, and
+that the push-era GitHub publisher stays deleted (external sites PULL from
+/blog/feed.xml and /api/blog/syndicated instead). This mirrors the
 migration/source-check style used by the responses-store tests and avoids the
 backend.app package import chain that pulls in the DB stack.
 """
@@ -73,3 +75,50 @@ def test_routes_exist_with_guard_and_state_transitions():
     assert "website_published=False" in unpub
     assert "website_published_at=None" in unpub
     assert "website_commit_sha=None" in unpub
+
+
+# --- pull model (2.8.44): push machinery deleted, feeds exposed --------------
+
+def test_push_publisher_is_deleted():
+    """The gateway must hold no external-site publisher or write credential."""
+    assert not os.path.exists(
+        os.path.join(ROOT, "backend/app/services/website_publisher.py")
+    ), "website_publisher.py must stay deleted (pull model)"
+    src = _read(BLOG)
+    assert "website_publisher" not in src
+    assert "get_website_publisher" not in src
+
+
+def test_settings_have_no_push_credentials():
+    src = _read("backend/app/settings.py")
+    for field in ("website_publish_enabled", "website_publish_repo",
+                  "website_publish_branch", "website_publish_github_token"):
+        assert field not in src, f"push-era setting {field} must stay removed"
+
+
+def test_syndication_feed_routes_exist_and_are_public():
+    src = _read(BLOG)
+    assert '"/blog/feed.xml"' in src
+    assert '"/api/blog/syndicated"' in src
+    for route_name in ("blog_feed_xml", "blog_syndicated_json"):
+        fn = src[src.index(f"async def {route_name}"):]
+        fn = fn[: fn.index("\nasync def ") if "\nasync def " in fn else len(fn)]
+        # Public: no admin/session guard — feeds expose only syndicated posts.
+        assert "_require_admin" not in fn and "get_session_user_id" not in fn
+        # Both feeds are built from the selection-filtered CRUD query.
+        assert "get_website_published_blog_posts" in fn
+
+
+def test_flag_routes_no_longer_push():
+    """publish/unpublish flip the flag only — no publisher calls, no pushes."""
+    src = _read(BLOG)
+    for name in ("admin_blog_website_publish", "admin_blog_website_unpublish"):
+        fn = src[src.index(f"async def {name}"):]
+        fn = fn[: fn.index("\nasync def ")]
+        assert "publisher" not in fn, f"{name} must not push"
+
+
+def test_blog_export_is_institution_neutral():
+    src = _read("backend/app/dashboard/blog_export.py")
+    assert "https://mindrouter.ai" not in src
+    assert "SITE_BASE_URL" not in src
