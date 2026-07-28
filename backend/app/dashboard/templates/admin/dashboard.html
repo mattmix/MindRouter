@@ -287,12 +287,17 @@
                 const statusBadge = u.is_active
                     ? '<span class="badge bg-success">Active</span>'
                     : '<span class="badge bg-secondary">Inactive</span>';
+                const typeBadge = u.account_type === 'admin'
+                    ? '<span class="badge bg-danger ms-1">Admin</span>'
+                    : (u.account_type === 'sso'
+                        ? '<span class="badge bg-info text-dark ms-1">SSO</span>'
+                        : '<span class="badge bg-dark ms-1">Local</span>');
                 const keyLink = u.top_api_key_id
                     ? '<a href="/admin/api-keys">' + u.top_api_key_name + '</a>'
                     : '—';
                 html += '<tr>' +
                     '<td>' + (i + 1) + '</td>' +
-                    '<td><a href="/admin/users/' + u.user_id + '">' + u.username + '</a></td>' +
+                    '<td><a href="/admin/users/' + u.user_id + '">' + u.username + '</a>' + typeBadge + '</td>' +
                     '<td>' + u.group_name + '</td>' +
                     '<td>' + statusBadge + '</td>' +
                     '<td title="' + u.top_model + '"><code>' + truncateModel(u.top_model) + '</code></td>' +

@@ -271,8 +271,13 @@ async def get_users(
     search: Optional[str] = None,
     sort_by: Optional[str] = None,
     sort_dir: str = "desc",
+    account_type: Optional[str] = None,
 ) -> Tuple[List[User], int]:
-    """Get list of users with optional filtering and sorting. Returns (users, total_count)."""
+    """Get list of users with optional filtering and sorting. Returns (users, total_count).
+
+    account_type filters by badge classification ("admin" | "sso" | "local"),
+    mutually exclusive with precedence admin > sso > local.
+    """
     conditions = [User.deleted_at.is_(None)]
     if role:
         conditions.append(User.role == role)
@@ -280,6 +285,19 @@ async def get_users(
         conditions.append(User.group_id == group_id)
     if is_active is not None:
         conditions.append(User.is_active == is_active)
+    if account_type in ("admin", "sso", "local"):
+        admin_group_ids = select(Group.id).where(Group.is_admin.is_(True))
+        if account_type == "admin":
+            conditions.append(User.group_id.in_(admin_group_ids))
+        else:
+            # Non-admin accounts: users with no group or a non-admin group
+            conditions.append(
+                or_(User.group_id.is_(None), User.group_id.not_in(admin_group_ids))
+            )
+            if account_type == "sso":
+                conditions.append(User.azure_oid.isnot(None))
+            else:
+                conditions.append(User.azure_oid.is_(None))
     if search:
         search_pattern = f"%{search}%"
         conditions.append(
@@ -2264,6 +2282,7 @@ async def get_pending_quota_requests(db: AsyncSession) -> List[QuotaRequest]:
     """Get all pending quota requests."""
     result = await db.execute(
         select(QuotaRequest)
+        .options(selectinload(QuotaRequest.user).selectinload(User.group))
         .where(QuotaRequest.status == QuotaRequestStatus.PENDING)
         .order_by(QuotaRequest.created_at.asc())
     )
@@ -2784,7 +2803,7 @@ async def get_all_api_keys(
 
     query = (
         base_query
-        .options(selectinload(ApiKey.user))
+        .options(selectinload(ApiKey.user).selectinload(User.group))
         .order_by(*order)
         .offset(skip)
         .limit(limit)
@@ -3454,6 +3473,7 @@ async def get_top_active_users(
             "username": user.username,
             "full_name": user.full_name or "",
             "group_name": user.group.display_name if user.group else "—",
+            "account_type": user.account_type,
             "is_active": user.is_active,
             "top_model": top_model_by_user.get(uid, "—"),
             "request_count": int(row[4]),

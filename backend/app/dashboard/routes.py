@@ -20,12 +20,14 @@ import json
 import os
 import re
 import zoneinfo
+from urllib.parse import quote_plus
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Request, Response, status
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from itsdangerous import URLSafeTimedSerializer
@@ -1237,9 +1239,12 @@ async def admin_users(
     request: Request,
     search: Optional[str] = None,
     group_id: Optional[str] = None,
+    account_type: Optional[str] = None,
     sort: Optional[str] = None,
     dir: Optional[str] = None,
     page: int = 1,
+    success: Optional[str] = None,
+    error: Optional[str] = None,
     db: AsyncSession = Depends(get_async_db),
 ):
     """Admin user management with search, sort, and pagination."""
@@ -1252,12 +1257,14 @@ async def admin_users(
         return RedirectResponse(url="/dashboard", status_code=302)
 
     parsed_group_id = int(group_id) if group_id and group_id.strip().isdigit() else None
+    if account_type not in ("admin", "sso", "local"):
+        account_type = None
     per_page = 25
     skip = (page - 1) * per_page
     sort_dir = dir if dir in ("asc", "desc") else "desc"
     users, total = await crud.get_users(
         db, skip=skip, limit=per_page, group_id=parsed_group_id, search=search,
-        sort_by=sort, sort_dir=sort_dir,
+        sort_by=sort, sort_dir=sort_dir, account_type=account_type,
     )
     groups = await crud.get_all_groups(db)
     total_pages = max(1, (total + per_page - 1) // per_page)
@@ -1294,10 +1301,13 @@ async def admin_users(
             "total_pages": total_pages,
             "search": search or "",
             "group_id": group_id,
+            "account_type": account_type,
             "sort": sort or "",
             "dir": sort_dir,
             "user_tokens": user_tokens,
             "user_quota_tokens": user_quota_tokens,
+            "success": success,
+            "error": error,
         },
     )
 
@@ -3280,6 +3290,93 @@ async def edit_user(
     except Exception as e:
         error_msg = str(e).replace(" ", "+")
         return RedirectResponse(url=f"/admin/users/{user_id}?error={error_msg}", status_code=302)
+
+
+@dashboard_router.post("/admin/users/create")
+async def create_local_user(
+    request: Request,
+    username: str = Form(...),
+    email: str = Form(...),
+    password: str = Form(...),
+    group_id: int = Form(...),
+    full_name: Optional[str] = Form(None),
+    college: Optional[str] = Form(None),
+    department: Optional[str] = Form(None),
+    intended_use: Optional[str] = Form(None),
+    db: AsyncSession = Depends(get_async_db),
+):
+    """Create a local (username/password) user account from the admin dashboard."""
+    session_user_id = get_session_user_id(request)
+    if not session_user_id:
+        return RedirectResponse(url="/login", status_code=302)
+
+    admin_user = await crud.get_user_by_id(db, session_user_id)
+    if not admin_user or not admin_user.group or not admin_user.group.is_admin:
+        return RedirectResponse(url="/dashboard", status_code=302)
+
+    def _reject(msg: str) -> RedirectResponse:
+        return RedirectResponse(url=f"/admin/users?error={quote_plus(msg)}", status_code=302)
+
+    username = username.strip()
+    email = email.strip()
+    if not username or not email:
+        return _reject("Username and email are required")
+    if len(username) > 100 or len(email) > 255:
+        return _reject("Username or email is too long")
+    if len(password) < 8:
+        return _reject("Password must be at least 8 characters")
+
+    group = await crud.get_group_by_id(db, group_id)
+    if not group:
+        return _reject("Selected group not found")
+    if await crud.get_user_by_username(db, username):
+        return _reject(f"Username '{username}' already exists")
+    if await crud.get_user_by_email(db, email):
+        return _reject(f"Email '{email}' already exists")
+
+    try:
+        new_user = await crud.create_user(
+            db,
+            username=username,
+            email=email,
+            password_hash=hash_password(password),
+            group_id=group.id,
+            full_name=full_name.strip() if full_name and full_name.strip() else None,
+            college=college.strip() if college and college.strip() else None,
+            department=department.strip() if department and department.strip() else None,
+            intended_use=intended_use.strip() if intended_use and intended_use.strip() else None,
+        )
+        await crud.create_quota(db, user_id=new_user.id, rpm_limit=group.rpm_limit)
+        await crud.log_admin_action(
+            db, user_id=session_user_id, action="user.create",
+            entity_type="user", entity_id=str(new_user.id),
+            after_value={
+                "username": new_user.username,
+                "email": new_user.email,
+                "group_id": group.id,
+                "account_type": "local",
+            },
+            ip_address=get_client_ip(request),
+        )
+        await db.commit()
+    except IntegrityError:
+        # Duplicate slipped past the pre-checks (concurrent submit). Never echo
+        # DB exception text — it embeds the INSERT parameters, incl. the hash.
+        await db.rollback()
+        return _reject(f"Username '{username}' or email '{email}' already exists")
+    except Exception:
+        await db.rollback()
+        logger.exception("local_user_create_failed", admin_id=session_user_id, username=username)
+        return _reject("Failed to create user due to an internal error")
+
+    logger.info(
+        "local_user_created_by_admin",
+        admin_id=session_user_id,
+        user_id=new_user.id,
+        username=new_user.username,
+        group=group.name,
+    )
+    return RedirectResponse(url=f"/admin/users/{new_user.id}?success=created", status_code=302)
 
 
 # ---------------------------------------------------------------------------

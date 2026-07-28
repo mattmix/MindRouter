@@ -11,7 +11,7 @@
         <div class="col-md-10 py-3">
             <div class="d-flex justify-content-between align-items-center mb-4">
                 <div>
-                    <h1><i class="bi bi-person"></i> {{ detail_user.username }}</h1>
+                    <h1><i class="bi bi-person"></i> {{ detail_user.username }} {% set badge_user = detail_user %}{% include "admin/_user_badge.html" %}</h1>
                     <p class="text-muted mb-0">{{ detail_user.email }}</p>
                 </div>
                 <div>
@@ -63,6 +63,15 @@
                                     <span class="badge {% if detail_user.group.is_admin %}bg-danger{% else %}bg-primary{% endif %}">{{ detail_user.group.display_name }}</span>
                                     {% else %}
                                     <span class="badge bg-secondary">None</span>
+                                    {% endif %}
+                                </dd>
+                                <dt class="col-sm-4">Account Type</dt>
+                                <dd class="col-sm-8">
+                                    {% set badge_user = detail_user %}{% include "admin/_user_badge.html" %}
+                                    {% if detail_user.account_type == 'sso' %}
+                                    <small class="text-muted d-block">Signs in via University SSO</small>
+                                    {% elif detail_user.account_type == 'local' %}
+                                    <small class="text-muted d-block">Signs in with username/password</small>
                                     {% endif %}
                                 </dd>
                                 <dt class="col-sm-4">College</dt>

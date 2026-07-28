@@ -251,6 +251,18 @@ class User(Base, TimestampMixin, SoftDeleteMixin):
     )
     requests: Mapped[List["Request"]] = relationship("Request", back_populates="user")
 
+    @property
+    def account_type(self) -> str:
+        """Account classification for the admin UI: "admin" > "sso" > "local".
+
+        Requires .group to be eager-loaded when accessed from async contexts.
+        """
+        if self.group is not None and self.group.is_admin:
+            return "admin"
+        if self.azure_oid:
+            return "sso"
+        return "local"
+
     __table_args__ = (
         Index("ix_users_role_active", "role", "is_active"),
         Index("ix_users_group_active", "group_id", "is_active"),

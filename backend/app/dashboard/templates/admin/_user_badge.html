@@ -1,0 +1,11 @@
+{# Account-type badge. Set badge_user (a User with .group eager-loaded) before including.
+   Classification precedence: Admin (group.is_admin) > SSO (azure_oid) > Local. #}
+{% if badge_user %}
+{% if badge_user.account_type == 'admin' %}
+<span class="badge bg-danger" title="Member of an admin group"><i class="bi bi-shield-lock-fill"></i> Admin</span>
+{% elif badge_user.account_type == 'sso' %}
+<span class="badge bg-info text-dark" title="Signs in via University SSO (Azure AD)"><i class="bi bi-cloud-fill"></i> SSO</span>
+{% else %}
+<span class="badge bg-dark" title="Local username/password account"><i class="bi bi-key-fill"></i> Local</span>
+{% endif %}
+{% endif %}

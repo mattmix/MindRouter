@@ -110,6 +110,7 @@
                                     <div class="text-muted mb-1">Owner</div>
                                     {% if sk.user %}
                                     <a href="/admin/users/{{ sk.user_id }}">{{ sk.user.username }}</a>
+                                    {% set badge_user = sk.user %}{% include "admin/_user_badge.html" %}
                                     {% if sk.user.full_name %}<span class="text-muted"> ({{ sk.user.full_name }})</span>{% endif %}
                                     {% if sk.user.email %}<br><span class="text-muted">{{ sk.user.email }}</span>{% endif %}
                                     {% else %}
@@ -248,6 +249,7 @@
                                     <td>
                                         {% if k.user %}
                                         <a href="/admin/users/{{ k.user_id }}">{{ k.user.username }}</a>
+                                        {% set badge_user = k.user %}{% include "admin/_user_badge.html" %}
                                         {% else %}
                                         <span class="text-muted">Unknown</span>
                                         {% endif %}
