@@ -1,6 +1,6 @@
 # mindrouter video-worker
 
-Standalone async video-generation service (LTX-2.3) that the MindRouter gateway
+Standalone async video-generation service that the MindRouter gateway
 drives via `submit / poll / fetch / cancel`. Runs GPU-resident on an H200,
 plain HTTP behind nginx — **no ComfyUI, no diffusers**. This is a separate
 deploy artifact with its own venv; it does **not** import the gateway.
@@ -11,7 +11,7 @@ See `../docs/video-generation-plan.md` for the full design.
 
 - `VIDEO_WORKER_MODE=mock` (default) — no GPU, deterministic placeholder MP4.
   Used for dev, CI, and gateway integration before the GPU node is ready.
-- `VIDEO_WORKER_MODE=ltx` — real LTX-2.3 on the H200 (wired during Phase 0).
+- `VIDEO_WORKER_MODE=ltx` — the real video model on the H200 (wired during Phase 0).
 
 ## Run (mock)
 
@@ -41,7 +41,7 @@ uvicorn app:app --host 0.0.0.0 --port 18300
 | `VIDEO_WORKER_MODE` | `mock` | `mock` \| `ltx` |
 | `VIDEO_WORKER_MODEL` | `lightricks/ltx-2.3-distilled` | served-model-name |
 | `VIDEO_WORKER_OUTPUT_DIR` | `/tmp/mindrouter-video-worker` | artifact dir |
-| `VIDEO_WORKER_CKPT_DIR` | — | LTX checkpoint dir (mode=ltx) |
+| `VIDEO_WORKER_CKPT_DIR` | — | model checkpoint dir (mode=ltx) |
 | `VIDEO_WORKER_MOCK_STEP_DELAY` | `0` | mock: seconds/step (load tests) |
 
 ## Register with the gateway (after it's up)

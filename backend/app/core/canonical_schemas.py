@@ -529,7 +529,7 @@ class CanonicalVideoRequest(BaseModel):
     # Generation parameters. size/seconds/fps/quality are snapped to the legal
     # preset grid before dispatch (torch.compile is warmed per-shape on the
     # worker, so off-menu values are rejected, not silently recompiled).
-    size: str = "1280x704"          # "WIDTHxHEIGHT"; must be multiples of 32 for LTX
+    size: str = "1280x704"          # "WIDTHxHEIGHT"; must be multiples of 32 for the video model
     seconds: str = "5"              # clip duration, string per OpenAI video convention
     fps: int = 24
     quality: str = "standard"       # "draft" | "standard" | "final"

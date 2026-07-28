@@ -2,7 +2,7 @@
 
 Status: **Phase A + B + C COMPLETE (code) — pending live FLUX restart + gateway deploy (2.8.17)**
 Owner: Luke Sheneman (RCDS)
-Related: `docs/video-generation-plan.md`, `docs/video-api.md` (FLUX→LTX storyboard bridge)
+Related: `docs/video-generation-plan.md`, `docs/video-api.md` (FLUX→video storyboard bridge)
 
 ## Phase A results (2026-07-23) — GATE PASSED
 
@@ -94,8 +94,8 @@ semantic from classic img2img `strength`-based denoise. Before any plumbing:
 
 - Confirm `Flux2KleinPipeline.__call__` accepts `image=` (and whether `strength`
   applies) on the installed diffusers version in `/data/flux2/venv`.
-- Run a standalone edit on webbyg2 (`test_edit.py`, mirroring the LTX `test_cond.py`
-  validation): one reference image + prompt → confirm output + measure **VRAM delta**
+- Run a standalone edit on webbyg2 (`test_edit.py`, mirroring the video worker's
+  `test_cond.py` validation): one reference image + prompt → confirm output + measure **VRAM delta**
   (two Klein instances already share GPU2; reference-image activations add memory
   and could OOM).
 
@@ -126,6 +126,6 @@ GPU2 has headroom. Everything downstream keys off it.
 
 Once the image path accepts an input image, two earlier gaps collapse into one
 capability: FLUX can condition on a prior shot's frame (shot-to-shot continuity),
-and a gallery image can feed forward as an LTX start/end keyframe. img2img on FLUX
+and a gallery image can feed forward as a video start/end keyframe. img2img on FLUX
 is the keystone for the storyboard-coherence workflow (the separate studio app),
 while MindRouter only needs to expose the clip + conditioning primitives cleanly.

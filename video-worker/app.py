@@ -1,6 +1,6 @@
 ############################################################
 #
-# mindrouter video-worker - LTX-2.3 async video generation service
+# mindrouter video-worker - async video generation service
 #
 # app.py: FastAPI app exposing the async worker contract the gateway runner
 #     drives: submit / poll / fetch / cancel, plus health + capabilities.

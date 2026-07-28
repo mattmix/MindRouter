@@ -1,12 +1,12 @@
 ############################################################
 #
-# mindrouter video-worker - LTX-2.3 async video generation service
+# mindrouter video-worker - async video generation service
 #
 # engine.py: Pluggable generation engine.
 #
 #   MockEngine — no GPU, deterministic placeholder MP4 (dev + CI).
-#   LTXEngine  — real ltx_pipelines on the H200 (torch/ltx imported lazily so
-#                this module loads without them).
+#   LTXEngine  — real ltx_pipelines on the H200 (torch/ltx_pipelines imported
+#                lazily so this module loads without them).
 #
 # Generation is a blocking call run OFF the event loop by the JobManager, so
 # GET /health stays under 5s while a render is in flight.
@@ -15,7 +15,7 @@
 #
 ############################################################
 
-"""Video generation engines (mock + LTX-2.3)."""
+"""Video generation engines (mock + real GPU-backed video model)."""
 
 import time
 from typing import Any, Callable, Dict, Protocol
@@ -78,8 +78,8 @@ class MockEngine:
 
 
 class LTXEngine:
-    """Real LTX-2.3 engine (mode=ltx). torch + ltx_pipelines are imported lazily
-    in load() so this file imports on a machine without them.
+    """Real video-model engine (mode=ltx). torch + ltx_pipelines are imported
+    lazily in load() so this file imports on a machine without them.
 
     Phase-0 validated recipe (aspen1 GPU2, H200; see
     docs/video-generation-plan.md and the phase0 memory):
@@ -89,8 +89,8 @@ class LTXEngine:
       - quantization="fp8-cast": ~24GB peak (vs bf16 ~44GB and right at the
         141GB edge). fp8-cast needs NO custom ltx-kernels build.
       - Measured: ~35s per 5s 720p clip (121f), stable 24GB, zero leak.
-      - Attention is torch SDPA (cuDNN on Hopper) — LTX ships no FA3 path.
-      - LTX generates synchronized audio natively.
+      - Attention is torch SDPA (cuDNN on Hopper) — the model ships no FA3 path.
+      - The model generates synchronized audio natively.
     Requires (installed in the worker's uv venv on the GPU node): torch cu130,
     torchvision, ltx-core, ltx-pipelines. Checkpoints under VIDEO_WORKER_CKPT_DIR.
     """
@@ -118,7 +118,7 @@ class LTXEngine:
         from ltx_pipelines.utils.quantization_factory import QuantizationKind
         from ltx_core.model.video_vae import TilingConfig, get_video_chunks_number
 
-        logging.getLogger(__name__).info("Loading LTX-2.3 distilled pipeline (fp8-cast)…")
+        logging.getLogger(__name__).info("Loading the two-stage distilled video pipeline (fp8-cast)…")
         p = self._paths()
         policy = QuantizationKind("fp8-cast").to_policy(checkpoint_path=p["dit"])
         self._pipeline = DistilledPipeline(
@@ -176,7 +176,7 @@ class LTXEngine:
         seed = int(spec["seed"]) if spec.get("seed") is not None else 42
         images, tmp_paths = self._build_images(spec, num_frames)
 
-        # LTX drives its own internal tqdm denoise loops; we surface coarse
+        # The pipeline drives its own internal tqdm denoise loops; we surface coarse
         # phase progress (per-step callbacks would require pipeline hooks).
         progress_cb(1, 3)
         t0 = time.time()

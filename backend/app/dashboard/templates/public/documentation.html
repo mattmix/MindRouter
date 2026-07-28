@@ -661,7 +661,7 @@ with open("idaho.png", "wb") as f:
                 <p>The response matches generations. Full reference: <a href="https://github.com/ui-insight/MindRouter/blob/main/docs/images-api.md">docs/images-api.md</a>.</p>
 
                 <h4 id="video-generation">Video Generation</h4>
-                <p><code>POST /v1/videos</code> renders a short text-to-video clip (LTX-2.3), optionally guided by start/end keyframe images. It is <strong>asynchronous</strong>: you get a job immediately (<code>202</code>), poll it, then download the MP4. A dashboard playground is at <a href="/video">/video</a>. Requires per-account enablement (<code>403</code> otherwise) and a global switch (<code>503</code> when off).</p>
+                <p><code>POST /v1/videos</code> renders a short text-to-video clip, optionally guided by start/end keyframe images. It is <strong>asynchronous</strong>: you get a job immediately (<code>202</code>), poll it, then download the MP4. A dashboard playground is at <a href="/video">/video</a>. Requires per-account enablement (<code>403</code> otherwise) and a global switch (<code>503</code> when off).</p>
                 <table class="table table-bordered table-sm">
                     <thead class="table-light"><tr><th>Method</th><th>Path</th><th>Description</th></tr></thead>
                     <tbody>

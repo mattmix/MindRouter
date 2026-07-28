@@ -119,7 +119,7 @@ VIDEO_DIALECT_HINTS: Dict[str, str] = {
     "negative_prompt": (
         "The current video model is guidance-free (CFG=1), so negative prompts have "
         "no effect and the field is ignored. Steer content with the positive prompt "
-        "instead (e.g. describe the ambience you want; LTX honors prose audio "
+        "instead (e.g. describe the ambience you want; the model honors prose audio "
         "direction such as 'no speech, only wind and distant machinery')."
     ),
     "audio": "Every clip already includes the model's native synchronized audio; a separate audio toggle is not available in v1.",

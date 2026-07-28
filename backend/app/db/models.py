@@ -1101,7 +1101,7 @@ class VideoShot(Base, TimestampMixin):
     )
     prompt: Mapped[Optional[str]] = mapped_column(Text, nullable=True)  # null for source shots
     seconds: Mapped[float] = mapped_column(Float, nullable=False)
-    num_frames: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)  # 8k+1 for LTX generated shots
+    num_frames: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)  # 8k+1 for generated shots (video model frame constraint)
     transition: Mapped[VideoTransition] = mapped_column(
         Enum(VideoTransition, values_callable=_enum_values),
         nullable=False, default=VideoTransition.CUT,

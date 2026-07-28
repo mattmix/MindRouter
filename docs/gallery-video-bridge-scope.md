@@ -29,7 +29,7 @@ slightly over, then the next submit is blocked); (b) **upload + gallery-import**
 ## Problem
 
 A user can generate a still in the **Images** tab (FLUX, incl. the new img2img
-reference-edit) but cannot use that still as an LTX **start/end keyframe** in the
+reference-edit) but cannot use that still as a video **start/end keyframe** in the
 **Video** tab. Video conditioning only accepts images uploaded through the video
 tab. To animate a gallery image today you must download the PNG and re-upload it.
 This is the video-side gap ("gap #1") flagged during the img2img work — the
@@ -96,7 +96,7 @@ copy is cheap; dedup by sha avoids duplicate refs.
    gallery image twice reuses the file (and may reuse the asset row — cheap to
    just create a new row pointing at the same file, matching upload behavior).
 4. **Format.** Gallery saves PNG (`content_type image/png`); ext map png/jpg/webp
-   as in upload. LTX conditioning decodes it fine.
+   as in upload. The video worker's conditioning decodes it fine.
 
 ## Non-goals / notes
 
@@ -115,7 +115,7 @@ copy is cheap; dedup by sha avoids duplicate refs.
 
 ## Payoff
 
-Closes the loop: **prompt → FLUX still (txt2img or img2img reference-edit) → LTX
+Closes the loop: **prompt → FLUX still (txt2img or img2img reference-edit) → video
 keyframe → animated clip**, entirely inside MindRouter, no download/re-upload. This
 is the concrete substrate the separate storyboard/studio app builds on for
 shot-to-shot continuity — see `docs/video-generation-plan.md`.

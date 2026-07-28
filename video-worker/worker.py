@@ -1,6 +1,6 @@
 ############################################################
 #
-# mindrouter video-worker - LTX-2.3 async video generation service
+# mindrouter video-worker - async video generation service
 #
 # worker.py: JobManager — in-memory job store + single-slot serialized
 #     execution that runs the blocking generation OFF the event loop, so

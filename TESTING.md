@@ -245,7 +245,7 @@ Subset of unit tests, broken out for convenience. 117 tests validating WCAG 2.1 
 
 | File | What it covers |
 |------|----------------|
-| `video-worker/tests/test_worker.py` | LTX-2.3 worker async contract (10 tests, FastAPI TestClient, mock engine): capabilities/models/version; submit→poll→completed→fetch full lifecycle; content 409 before complete; **/health responsive (<1s) while a render occupies the executor** (off-event-loop invariant); Range request → 206 + Accept-Ranges; disallowed size/duration/missing-prompt → 400; unknown job → 404 (poll + cancel); cancel a still-queued job |
+| `video-worker/tests/test_worker.py` | Video worker async contract (10 tests, FastAPI TestClient, mock engine): capabilities/models/version; submit→poll→completed→fetch full lifecycle; content 409 before complete; **/health responsive (<1s) while a render occupies the executor** (off-event-loop invariant); Range request → 206 + Accept-Ranges; disallowed size/duration/missing-prompt → 400; unknown job → 404 (poll + cancel); cancel a still-queued job |
 
 ---
 

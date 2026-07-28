@@ -1,6 +1,6 @@
 ############################################################
 #
-# mindrouter video-worker - LTX-2.3 async video generation service
+# mindrouter video-worker - async video generation service
 #
 # config.py: Worker configuration + the legal preset matrix.
 #
@@ -23,14 +23,14 @@ from typing import Dict, List
 # via vid.allowed_sizes / vid.allowed_durations, and the UI renders from
 # GET /v1/capabilities so there is one source of truth.
 #
-# LTX legal constraints (measured Phase 0): the TWO-STAGE distilled pipeline
+# Video-model legal constraints (measured Phase 0): the TWO-STAGE distilled pipeline
 # requires width/height divisible by 64 (stage 1 renders at half-res, which must
 # then be divisible by 32); frame count = 8k+1. 960x544 was invalid (544/64 is
 # not integer) and is replaced by 1024x576. All four presets below are ÷64.
 SUPPORTED_SIZES: List[str] = ["1280x704", "704x1280", "1024x576", "768x448"]
 
 # Duration is any whole number of seconds in [MIN_SECONDS, MAX_SECONDS].
-# frames = 24*seconds + 1 is always 8k+1 (LTX's required format), so no discrete
+# frames = 24*seconds + 1 is always 8k+1 (the model's required format), so no discrete
 # preset list is needed — the UI uses a slider. MAX_SECONDS is set from measured
 # VRAM headroom on the H200 (see Phase 0 / the ceiling test).
 MIN_SECONDS = 4
@@ -55,7 +55,7 @@ class WorkerConfig:
     output_dir: str = field(
         default_factory=lambda: os.environ.get("VIDEO_WORKER_OUTPUT_DIR", "/tmp/mindrouter-video-worker")
     )
-    # LTX checkpoint dir + fp8 flag (only used in mode=ltx).
+    # Model checkpoint dir + fp8 flag (only used in mode=ltx).
     checkpoint_dir: str = field(default_factory=lambda: os.environ.get("VIDEO_WORKER_CKPT_DIR", ""))
     default_fps: int = 24
     # Mock-only: seconds of simulated work per step (keeps /health-under-load
