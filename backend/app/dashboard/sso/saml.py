@@ -183,11 +183,19 @@ async def begin_login(request: Request):
         response = RedirectResponse(url=redirect_url, status_code=302)
         # Remember our AuthnRequest ID (signed) so the ACS can require the
         # response's InResponseTo to match it.
+        #
+        # SameSite MUST be "none" (which requires Secure): the IdP returns the
+        # assertion via a cross-site HTTP-POST form submission to our ACS, and
+        # browsers do not send SameSite=Lax cookies on cross-site POSTs. With
+        # "lax" this cookie would be missing on every login from an IdP that
+        # does not share our registrable domain, and handle_acs would reject
+        # the response as unsolicited. Consequence: SAML requires HTTPS.
         response.set_cookie(
             key=REQUEST_ID_COOKIE,
             value=state_serializer().dumps(auth.get_last_request_id()),
             httponly=True,
-            samesite="lax",
+            samesite="none",
+            secure=True,
             max_age=STATE_MAX_AGE,
         )
         return response

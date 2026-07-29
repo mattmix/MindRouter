@@ -18,6 +18,7 @@ audit log (`branding.*` actions).
 | Field | Applies to |
 |-------|-----------|
 | Organization / app name | Top navbar, browser tab titles, footer |
+| Institution / organization name | Login page SSO button ("Sign in with …") and the SSO helper text |
 | Tagline | Footer, beside the name |
 | Accent color — light theme | Buttons, links, focus rings, stat-card accents (light mode) |
 | Accent color — dark theme | Same, in dark mode |
@@ -25,6 +26,27 @@ audit log (`branding.*` actions).
 | Logo — dark theme | Top navbar (always a dark background), plus footer and login card in dark mode |
 | Logo — light theme | Footer and login card in light mode |
 | Favicon | Browser tab icon |
+
+### App name vs. institution name
+
+The first two rows are **two different fields** and are easy to confuse:
+
+- **Organization / app name** (`branding.app_name`, max 80 chars) is the
+  *product* name — what this software is called in the navbar, browser tab
+  titles, and footer.
+- **Institution / organization name** (`branding.org_name`, optional, max 120
+  chars, added in 2.8.48) is the *institution running the deployment*. It
+  supplies the sign-in wording: the SSO button reads "Sign in with University of
+  Idaho" and the helper text below it reads "Use your University of Idaho
+  credentials to sign in." (It also names the provider in the default chat
+  assistant system prompt and in the "this account has no local password" login
+  message.)
+
+Leave the institution name blank and the login page falls back to generic
+wording — **"Sign in with SSO"** and **"Use your organization credentials to
+sign in."** Which providers get the org-name label depends on which SSO
+providers are enabled; see
+[SSO configuration → Login button labels](sso-configuration.md#login-button-labels-branding-tie-in).
 
 Logos appear in the **navbar (header)**, the **footer**, and the **login card**.
 The navbar always has a dark background, so it uses the dark-theme logo (falling
@@ -36,7 +58,10 @@ card in both light and dark themes, updating as you pick colors. Nothing is
 applied site-wide until you click **Save**.
 
 Use **Reset to defaults** to restore the stock MindRouter name, colors, and
-remove all uploaded assets.
+remove all uploaded assets. It clears the institution name too, so the login
+page returns to generic SSO wording. An install with no branding configured
+looks the same way: stock name and colors, no logo on the login card, and
+"Sign in with SSO" / "Use your organization credentials to sign in."
 
 ## Accessible accent colors (contrast handling)
 

@@ -241,9 +241,22 @@ async def find_or_create_azure_user(db: AsyncSession, profile: dict):
     # 1. Look up by azure_oid first
     user = await crud.get_user_by_azure_oid(db, azure_oid)
 
-    # 2. Fallback: look up by email (link pre-existing local accounts)
+    # 2. Fallback: link a pre-existing account by email — but only one that no
+    #    identity provider has claimed yet. Email is an IdP-supplied attribute,
+    #    not proof of ownership, so without this guard an Azure-asserted address
+    #    could adopt an account already bound to another provider (or to a
+    #    different Azure object id). Mirrors find_or_create_sso_user() in sso/base.py.
     if not user:
-        user = await crud.get_user_by_email(db, email)
+        candidate = await crud.get_user_by_email(db, email)
+        if candidate is not None:
+            if candidate.azure_oid or candidate.sso_provider:
+                logger.warning(
+                    "sso_email_link_refused provider=azure email=%s reason=%s",
+                    email,
+                    "account already bound to another identity provider",
+                )
+                return None
+            user = candidate
 
     if user:
         # Update existing user with latest Azure AD info

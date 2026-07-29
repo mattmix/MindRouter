@@ -11,7 +11,8 @@ grounded in the actual implementation:
 - OIDC driver (Google + generic): `backend/app/dashboard/sso/oidc.py`
 - SAML 2.0 SP driver: `backend/app/dashboard/sso/saml.py`
 - Shared JIT provisioning: `backend/app/dashboard/sso/base.py`
-- Legacy Azure AD driver (unchanged): `backend/app/dashboard/azure_auth.py`
+- Legacy Azure AD driver (own routes, shared linking rule as of 2.9.0):
+  `backend/app/dashboard/azure_auth.py`
 
 ## Overview
 
@@ -43,9 +44,18 @@ Enablement rules (from the `settings.py` properties):
 
 ## Azure AD / Entra ID
 
-The original MindRouter SSO provider. Its behavior is **unchanged** — it keeps
-its own routes in `azure_auth.py` and appears in the new registry only as a
-login-button descriptor.
+The original MindRouter SSO provider. It keeps its own routes in
+`azure_auth.py`, its own `azure_oid` identity column, and its `jobTitle` group
+mapping, and appears in the new registry only as a login-button descriptor.
+
+**Changed in 2.9.0:** its email-linking fallback now enforces the same
+unclaimed-account-only rule as the shared driver (see *JIT provisioning and
+account linking*). The one difference an operator can notice: an Azure login
+whose email matches an account carrying a **different** `azure_oid` is now
+refused (logged as `sso_email_link_refused`) instead of silently rebinding that
+account to the new object id. This is rare — the Entra object id is stable.
+Genuinely unclaimed accounts (no `azure_oid`, no `sso_provider` — e.g. local
+password accounts) still link exactly as before.
 
 **Routes:** `GET /login/azure` (start), `GET /login/azure/authorized` (callback).
 
@@ -110,8 +120,9 @@ GOOGLE_SSO_DEFAULT_GROUP=other
 `GOOGLE_SSO_HOSTED_DOMAIN` does two things: it passes `hd=<domain>` on the
 authorization request (Google pre-filters the account picker) **and** the
 callback rejects any profile whose `hd` claim does not match — so it is
-enforced server-side, not just cosmetically. Accounts with
-`email_verified: false` are always rejected.
+enforced server-side, not just cosmetically. Sign-in is rejected when the IdP
+sends `email_verified` and it is not true (string forms like `"false"` count as
+unverified); an IdP that omits the claim entirely is trusted.
 
 The login button is always labeled **"Sign in with Google"**.
 
@@ -192,10 +203,15 @@ SAML directly (campus Shibboleth IdP, ADFS) rather than going through CILogon.
 | `GET /saml/metadata` | SP metadata XML — give this URL (or its output) to the IdP admin |
 
 **SP characteristics** (from `build_saml_settings()`): strict mode, assertions
-must be signed (`wantAssertionsSigned: true`), requested NameID format is
+must be signed (`wantAssertionsSigned: true`) while a message-level signature is
+**not** required (`wantMessagesSigned: false`), requested NameID format is
 `urn:oasis:names:tc:SAML:2.0:nameid-format:persistent`. The request adapter
-honors `X-Forwarded-Proto` / `X-Forwarded-Host`, so signature/destination
-validation works behind the nginx proxy.
+derives scheme and host from `APP_BASE_URL` rather than from
+`X-Forwarded-Proto` / `X-Forwarded-Host` — precisely so a client-supplied
+forwarded host cannot relax the Destination/Recipient validation that
+python3-saml performs against that value. (It falls back to the request scheme
+and `Host` header only when `APP_BASE_URL` is blank, which is why you should
+keep it set behind the nginx proxy.)
 
 **IdP-side setup:**
 
@@ -224,7 +240,7 @@ SAML_IDP_X509_CERT="MIIC...single-line base64, no PEM headers..."
 **Optional:**
 
 ```bash
-# Defaults to <request scheme+host>/login/saml/acs when unset:
+# Defaults to <APP_BASE_URL>/login/saml/acs when unset:
 SAML_SP_ACS_URL=https://<your-mindrouter-host>/login/saml/acs
 SAML_DISPLAY_NAME=Example University
 SAML_DEFAULT_GROUP=other
@@ -237,12 +253,43 @@ SAML_ATTR_USERNAME=eduPersonPrincipalName
 Subject selection for account keying: persistent NameID if the IdP sends one,
 else the `SAML_ATTR_USERNAME` attribute (ePPN), else the email.
 
+**Configure your IdP to release a persistent (or otherwise stable) NameID.**
+MindRouter asks for
+`urn:oasis:names:tc:SAML:2.0:nameid-format:persistent` in its AuthnRequest but
+does **not** verify the format it gets back, so an IdP configured for
+**transient** NameIDs will hand MindRouter a new subject on every login. The
+consequence is a one-login lockout: the first login provisions the account and
+stamps `sso_provider`; the second login misses on subject, falls through to the
+email match, sees `sso_provider` already set, and is **refused** permanently
+(`sso_email_link_refused`). Clearing the stale identity requires editing the
+`users` row directly in the database — there is no admin UI or API for it. If
+your IdP cannot emit a persistent NameID, release a stable
+`eduPersonPrincipalName` and suppress the NameID.
+
+**SAML requires HTTPS.** The `saml_request_id` cookie that carries the
+AuthnRequest ID is set `SameSite=None; Secure`, because the IdP returns the
+assertion by a **cross-site HTTP-POST** to the ACS and browsers withhold
+`SameSite=Lax` cookies on cross-site POSTs. A `Secure` cookie is not stored
+over plain `http`, so SAML cannot be exercised against a plain-http dev URL —
+the ACS will reject every response as unsolicited. Test SAML against a TLS
+origin.
+
 **Dependency note:** python3-saml and its xmlsec system libraries **ship in the
 Docker image** (`Dockerfile` installs `libxmlsec1-dev` + `libxmlsec1-openssl`
 and runs `pip install -e .[saml]`). Bare-metal installs need
 `apt install libxmlsec1-dev libxmlsec1-openssl` then `pip install .[saml]`.
 Without it, SAML routes fail gracefully with a "SAML support is not installed"
-error; the other providers are unaffected (the import is lazy).
+error; the other providers are unaffected (the import is lazy). `GET
+/saml/metadata` returns **404** (`SAML is not configured`) when the SAML env
+vars above are unset, and **501** (`SAML support is not installed`) when
+python3-saml is absent — but do **not** rely on the status code to tell the two
+apart. `metadata_response()` builds the SAML settings first, and in the common
+metadata-URL setup that build needs the python3-saml metadata parser: with
+`SAML_IDP_METADATA_URL` set and the library missing, settings construction
+fails and you get **404**, not 501. The 501 is only reliably reached in the
+explicit entity-id / SSO-URL / cert configuration. Confirm the library
+directly (`python -c "import onelogin.saml2"`) rather than inferring it from
+the response code.
 
 ---
 
@@ -254,25 +301,43 @@ All providers share the same semantics (`find_or_create_sso_user()` in
 1. **Lookup by `(provider, subject)` first** — the stable IdP identifier
    (OIDC `sub`, SAML persistent NameID, Azure object ID) stored on the user row.
 2. **Then lookup by email** (lowercased), but **only unclaimed accounts are
-   adopted**. If the matched account already carries an identity from another
-   provider (`azure_oid` or a different `sso_provider`), the login is
-   **refused** and an `sso_email_link_refused` warning is logged. Email is an
-   IdP-supplied attribute, not proof of ownership — without this rule, any
-   enabled IdP could assert an existing user's address (including an admin's)
-   and inherit that account.
+   adopted**. If the matched account already carries **any** IdP identity —
+   `azure_oid` set, or `sso_provider` set to *anything*, including the same
+   provider — the login is **refused** and an `sso_email_link_refused` warning
+   is logged. Email is an IdP-supplied attribute, not proof of ownership —
+   without this rule, any enabled IdP could assert an existing user's address
+   (including an admin's) and inherit that account.
+
+   Because the refusal keys on `sso_provider` being set at all — not on it
+   being a *different* provider — **an IdP that rotates its subject locks the
+   user out after one login**: the second login misses on `(provider, subject)`,
+   matches by email, sees `sso_provider` already set, and is refused. So the
+   IdP must emit a **stable** subject: a persistent NameID for SAML (MindRouter
+   requests `nameid-format:persistent` but does not verify what comes back), a
+   stable `sub` for OIDC.
 
    Unclaimed accounts — notably **local username/password accounts** — are
    linked: the SSO identity is attached and **the local password is kept**, so
-   the user can continue to log in either way. Display name, department, and
-   college are refreshed from the IdP on every login.
+   the user can continue to log in either way. Display name is refreshed from
+   the IdP on every login; **department and college are refreshed for Azure
+   only** — `profile_from_claims()` (OIDC/Google) and `profile_from_assertion()`
+   (SAML) never populate those fields, so they stay empty for those providers.
 
-   To move a user between providers, an admin must first clear the old identity
-   on the user row.
+   Moving a user between providers, or clearing a stale identity after a
+   subject rotation, means editing `azure_oid` / `sso_provider` / `sso_subject`
+   on the `users` row **directly in the database**. There is no admin UI or API
+   for it.
 3. **Otherwise, a new user is created:**
    - Username = local part of the username hint (ePPN /
      `preferred_username`) or email; on collision, `_<first 8 chars of subject>`
      is appended.
-   - No password hash (SSO-only account until an admin sets one).
+   - No password hash. The account is SSO-only: it has no local password and
+     cannot use the local login form. There is currently **no admin UI or API
+     to add one** — `/dashboard/change-password` returns early when
+     `password_hash` is NULL, and the admin user-update endpoint has no password
+     field. A local credential means creating a separate local account (admin →
+     **Users** → *Create Local User*) or setting the hash directly in the
+     database.
    - Group = the provider's `*_DEFAULT_GROUP` setting (default `other`).
      **The group must already exist** — create it on the admin **Groups** page
      first. If the named group does not exist, the user is created with no
@@ -324,7 +389,7 @@ explicit `OIDC_SSO_DISPLAY_NAME` / `SAML_DISPLAY_NAME`.
 | `OIDC_SSO_SCOPES` | `openid profile email` | Optional |
 | `OIDC_SSO_DEFAULT_GROUP` | `other` | Optional |
 | `SAML_SP_ENTITY_ID` | – | Required for SAML |
-| `SAML_SP_ACS_URL` | `<request scheme+host>/login/saml/acs` | Optional |
+| `SAML_SP_ACS_URL` | `<APP_BASE_URL>/login/saml/acs` | Optional |
 | `SAML_IDP_METADATA_URL` | – | Required for SAML unless the explicit trio below is set |
 | `SAML_IDP_ENTITY_ID` | – | Required if no metadata URL |
 | `SAML_IDP_SSO_URL` | – | Required if no metadata URL |
@@ -335,16 +400,22 @@ explicit `OIDC_SSO_DISPLAY_NAME` / `SAML_DISPLAY_NAME`.
 | `SAML_ATTR_NAME` | `displayName` | Optional |
 | `SAML_ATTR_USERNAME` | `eduPersonPrincipalName` | Optional |
 
+**Note on `AZURE_AD_REDIRECT_URI`:** in a Docker Compose deployment you must set
+it explicitly. Compose passes it as `${AZURE_AD_REDIRECT_URI:-}`, so an unset
+variable arrives in the container as an **empty string** — the placeholder
+default in `settings.py` never applies, and the Azure flow will fail with a
+redirect-URI mismatch.
+
 ## Deployment reminder
 
 The app reads settings from the container environment only — `.env` files are
 **not** mounted into the container. Therefore:
 
 - **Every SSO variable must be listed in `docker-compose.yml` under
-  `environment:`** using `${VAR:-}` passthrough. All variables above are
-  already listed there **except `AZURE_AD_DEFAULT_GROUP`** — it currently rides
-  on its in-code default (`other`); add a passthrough line if you ever need to
-  override it.
+  `environment:`** using `${VAR:-}` passthrough. Every variable in the table
+  above — including `AZURE_AD_DEFAULT_GROUP` — is **already wired through** that
+  `environment:` block, so setting it in the host `.env` is enough; no
+  compose edit is needed.
 - **Values live in `/opt/mindrouter/.env` on the production host.** Docker
   Compose interpolates them at container start. Never commit client secrets or
   certificates to the repo.
@@ -361,10 +432,13 @@ Behavior enforced by the shared framework (see `sso/base.py`, `sso/oidc.py`,
 
 - **Email linking only adopts unclaimed accounts.** A login is refused (logged
   as `sso_email_link_refused`) when the email matches an account already bound
-  to another provider. Prevents a second enabled IdP from asserting an existing
-  user's address — including an admin's — and inheriting the account.
-- **Unverified emails are rejected** for OIDC/Google. The `email_verified`
-  claim is normalized, so string forms (`"false"`, `"0"`) do not pass.
+  to any identity provider. Prevents a second enabled IdP from asserting an
+  existing user's address — including an admin's — and inheriting the account.
+  Since 2.9.0 the Azure driver enforces this too.
+- **Unverified emails are rejected** for OIDC/Google **when the IdP sends
+  `email_verified` and it is not true**; IdPs that omit the claim entirely are
+  trusted. The claim is normalized, so string forms (`"false"`, `"0"`) do not
+  pass.
 - **CSRF state** is a signed, timed token (10 min) round-tripped through an
   HttpOnly cookie, checked on every OIDC callback.
 - **SAML is SP-initiated only.** The ACS requires a signed `saml_request_id`
@@ -374,15 +448,32 @@ Behavior enforced by the shared framework (see `sso/base.py`, `sso/oidc.py`,
   python3-saml has no unsolicited-response option, and it skips its own
   `InResponseTo` comparison when the response omits the attribute.)
   `rejectDeprecatedAlgorithm` blocks SHA-1 signatures, and assertions must be
-  signed (`strict` mode). Note: IdP-initiated login (e.g. launching MindRouter
-  from a campus app portal tile) is therefore not supported — users must start
-  at the MindRouter login page.
+  signed (`strict` mode). That cookie is `SameSite=None; Secure` so it survives
+  the IdP's cross-site POST to the ACS, which makes **HTTPS a hard requirement
+  for SAML**. Note: IdP-initiated login (e.g. launching MindRouter from a
+  campus app portal tile) is therefore not supported — users must start at the
+  MindRouter login page.
 - **SAML IdP metadata must be served over HTTPS** — it carries the signing
   certificate, the only trust anchor for assertion validation. A plain-`http`
   `SAML_IDP_METADATA_URL` disables the provider. For a stronger anchor, pin the
   certificate locally with `SAML_IDP_ENTITY_ID` / `SAML_IDP_SSO_URL` /
   `SAML_IDP_X509_CERT` instead of fetching metadata.
-- **Public URLs come from `APP_BASE_URL`, not request headers.** OIDC redirect
-  URIs and the SAML Destination/Recipient check are derived from the configured
-  base URL so a spoofed `X-Forwarded-Host` cannot influence them. Set
-  `APP_BASE_URL` to your public HTTPS origin.
+- **Public URLs are derived from `APP_BASE_URL` rather than from request
+  headers — keep `APP_BASE_URL` set.** OIDC redirect URIs and the SAML
+  Destination/Recipient check are built from the configured base URL, so a
+  spoofed `X-Forwarded-Host` cannot influence them. If `APP_BASE_URL` is blank
+  the code falls back to the request's own scheme/Host headers — the OIDC path
+  reads `X-Forwarded-Proto` (`sso/oidc.py`), while the SAML request adapter
+  uses `request.url.scheme` plus the `Host` header and never consults
+  `X-Forwarded-Proto` (`sso/saml.py`), so behind a TLS-terminating proxy a
+  blank `APP_BASE_URL` yields an `http` SAML Destination. Which is exactly why
+  leaving it set matters. Point it at your public HTTPS origin.
+- **What the IdP must sign (SAML):** the **assertion**
+  (`wantAssertionsSigned: true`). A message-level signature on the SAML
+  `<Response>` is **not** required (`wantMessagesSigned: false`), so IdP admins
+  only need to enable assertion signing.
+- **`SECRET_KEY` underpins the SSO handshake.** The signed OIDC `state` cookie
+  and the SAML `saml_request_id` cookie are both signed with it
+  (`state_serializer()` in `sso/base.py`). A weak or leaked `SECRET_KEY`
+  therefore weakens OIDC CSRF protection and SAML SP-initiated-only
+  enforcement; rotating it invalidates any login already in flight.

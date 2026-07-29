@@ -13,11 +13,11 @@ MindRouter is a production-ready **LLM inference load balancer and translation l
 3. [Getting Started](#getting-started)
 4. [API Reference](#api-reference)
 5. [Web Dashboard](#web-dashboard)
-6. [Users, Groups & Quotas](#users-groups-quotas)
+6. [Users, Groups & Quotas](#users-groups--quotas)
 7. [Backend Management](#backend-management)
-8. [Scheduling & Fair Share](#scheduling-fair-share)
+8. [Scheduling & Fair Share](#scheduling--fair-share)
 9. [Translation Layer](#translation-layer)
-10. [Telemetry & Monitoring](#telemetry-monitoring)
+10. [Telemetry & Monitoring](#telemetry--monitoring)
 11. [Chat System](#chat-system)
 12. [Voice API](#voice-api)
 13. [Blog System](#blog-system)
@@ -39,6 +39,7 @@ the in-app [`/documentation`](#api-reference) page):
 ### Operator / admin guides
 
 - [UI branding & theming](branding.md) — rebrand a deployment for one institution: organization name, logos (navbar / footer / login), favicon, and accessible light/dark accent colors, from Admin → Branding
+- [Single sign-on configuration](sso-configuration.md) — step-by-step IdP setup for the four SSO providers (Azure AD / Entra ID, Google, generic OIDC including InCommon via CILogon, and native SAML 2.0), plus JIT provisioning and security notes
 
 ---
 
@@ -965,7 +966,7 @@ MindRouter includes a full web dashboard built with Bootstrap 5. All pages exten
 | Page | URL | Description |
 |------|-----|-------------|
 | Cluster Status | `/` | Shows healthy backend count, available models, queue size, and overall cluster status |
-| Login | `/login` | Username/password authentication (and Azure AD SSO when configured) |
+| Login | `/login` | Local username/password authentication, plus one sign-in button per configured SSO provider (Azure AD, SAML, generic OIDC, Google) |
 | Blog | `/blog` | Public blog with published posts |
 
 The public landing page (`/`) includes a live token flow animation showing real-time cluster throughput, along with counters for healthy backends, available models, active users (24h), and total tokens served.
@@ -1008,7 +1009,10 @@ The admin dashboard has a persistent sidebar with links to all admin pages:
 | Chat Config | `/admin/chat-config` | Configure core models, default model, system prompt, max_tokens, temperature, thinking mode, voice TTS/STT settings |
 | Voice API Config | `/admin/voice-config` | Configure TTS/STT backend connections, available voices, and API quota token costs |
 | Blog | `/admin/blog` | Blog/CMS management -- create, edit, publish, delete posts |
+| Branding | `/admin/branding` | Institution / organization name, logos (navbar / footer / login), favicon, and accessible light/dark accent colors (see [branding.md](branding.md)) |
 | Settings | `/admin/settings` | Site-wide settings: timezone, enforce `num_ctx` override |
+
+The Branding page includes an **Institution / organization name** field (config key `branding.org_name`, optional, max 120 characters). Besides labeling the UI, it supplies the institutional label for SSO login buttons -- see [Login button labels](#login-button-labels).
 
 #### Admin Dashboard Actions
 
@@ -1118,7 +1122,7 @@ Group defaults are configurable through the admin UI or API. The per-role enviro
 
 ### Change Password
 
-Users with local (non-SSO) accounts can change their password from the user dashboard (`/dashboard`). The form requires the current password, a new password (minimum 8 characters), and password confirmation.
+Users with local (non-SSO) accounts can change their password from the user dashboard (`/dashboard`). The form requires the current password, a new password (minimum 8 characters), and password confirmation. Accounts provisioned through SSO have no local password, so `POST /dashboard/change-password` returns early for them; there is no admin UI or API for adding a local password to an existing SSO account.
 
 ### API Key Lifecycle
 
@@ -1684,6 +1688,7 @@ All settings are loaded from environment variables or `.env` / `.env.prod` files
 |----------|------|---------|-------------|
 | `APP_NAME` | str | `MindRouter` | Application name |
 | `APP_VERSION` | str | (from `pyproject.toml`) | Application version |
+| `APP_BASE_URL` | str | `https://mindrouter.uidaho.edu` | Public HTTPS origin of the deployment. Used to build absolute URLs (SSO redirect URIs, SAML `Destination`/`Recipient` validation) instead of trusting request headers -- set this correctly in production |
 | `DEBUG` | bool | `false` | Enable debug mode |
 | `RELOAD` | bool | `false` | Auto-reload on code changes (development) |
 
@@ -1715,17 +1720,135 @@ All settings are loaded from environment variables or `.env` / `.env.prod` files
 | `SESSION_COOKIE_SAMESITE` | str | `lax` | SameSite cookie policy |
 | `API_KEY_HASH_ALGORITHM` | str | `argon2` | API key hashing algorithm |
 
-### Azure AD SSO
+### Single Sign-On (SSO)
+
+MindRouter supports four SSO providers: **Azure AD / Entra ID**, **Google**, **generic OIDC** (Okta, Keycloak, Auth0, CILogon, or any spec-compliant IdP), and **native SAML 2.0** (Shibboleth, ADFS).
+
+- **Providers are enabled purely by environment variables.** There is no admin-UI toggle -- a provider is on when its required variables are set and off when they are unset.
+- **Any subset can be enabled simultaneously.** The login page renders **one button per enabled provider**, in this fixed order: Azure AD, SAML, generic OIDC, Google.
+- **Local username/password accounts are always available.** SSO never disables the local login form (it is collapsed behind a "Sign in with a local account" toggle when SSO buttons are present). With no provider configured, `/login` is just the local login form.
+- **Restart after any change.** Settings are process-level and `lru_cache`d per worker; OIDC discovery documents and SAML IdP metadata are cached in-process for 1 hour. Recreate the container (`docker compose up -d`) after editing any SSO variable.
+- **`APP_BASE_URL` must be your public HTTPS origin.** OIDC redirect URIs and the SAML `Destination`/`Recipient` checks are derived from it rather than from request headers; if it is left blank the code falls back to the request's own scheme and `Host` header -- and the two paths differ, since the OIDC driver honors `X-Forwarded-Proto` while the SAML adapter does not, so behind a TLS-terminating proxy a blank value yields `http://` SAML URLs. Keep it set.
+- **Every SSO variable must be listed in `docker-compose.yml` under `environment:`** (see [Docker Compose env var passthrough](#deployment)); production values live in `/opt/mindrouter/.env` on the host.
+- **Database:** migration `068` adds `users.sso_provider` and `users.sso_subject`. Run `alembic upgrade head` after upgrading.
+
+For step-by-step IdP-side setup (Azure portal, Google Cloud console, Okta/Keycloak, Shibboleth, CILogon registration), see **[sso-configuration.md](sso-configuration.md)**.
+
+#### Azure AD / Entra ID
+
+Enabled when `AZURE_AD_CLIENT_ID` **and** `AZURE_AD_TENANT_ID` are set. Routes: `GET /login/azure`, `GET /login/azure/authorized`.
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
 | `AZURE_AD_CLIENT_ID` | str | `None` | Azure AD application (client) ID |
 | `AZURE_AD_CLIENT_SECRET` | str | `None` | Azure AD client secret |
 | `AZURE_AD_TENANT_ID` | str | `None` | Azure AD tenant ID |
-| `AZURE_AD_REDIRECT_URI` | str | `https://your-domain.example.com/login/azure/authorized` | OAuth2 redirect URI |
-| `AZURE_AD_DEFAULT_GROUP` | str | `other` | Default group for new SSO users |
+| `AZURE_AD_REDIRECT_URI` | str | `https://your-domain.example.com/login/azure/authorized` | OAuth2 redirect URI -- an absolute URL that must match the app registration exactly (**not** derived from `APP_BASE_URL`) |
+| `AZURE_AD_DEFAULT_GROUP` | str | `other` | Default group for new Azure AD users |
 
-Azure AD SSO is enabled automatically when both `AZURE_AD_CLIENT_ID` and `AZURE_AD_TENANT_ID` are set. Users authenticating via SSO for the first time are automatically created with JIT (just-in-time) group mapping based on the user's `jobTitle` claim from Azure AD. The mapping uses case-insensitive substring matching: if `jobTitle` contains "student", the user is assigned to the `students` group; if it contains "faculty" or "professor", the user is assigned to the `faculty` group; if it contains "staff", the user is assigned to the `staff` group. If `jobTitle` is missing or does not match any of these substrings, the user falls back to the group specified by `AZURE_AD_DEFAULT_GROUP`.
+Azure AD keeps its own legacy identity column (`users.azure_oid`) and its own driver; the other three providers share `users.sso_provider` / `users.sso_subject`. The driver is separate, but its **account-linking behavior is not** -- it applies the same unclaimed-account-only email guard as the shared SSO path (see [JIT Provisioning and Account Linking](#jit-provisioning-and-account-linking)). Genuinely unclaimed accounts (no `azure_oid`, no `sso_provider` -- a local password account, for instance) still link exactly as before; the one operator-visible change is that an Azure login whose email matches an account carrying a *different* `azure_oid` now fails instead of silently rebinding. Entra object IDs are stable, so this is rare.
+
+**Group mapping via job title** is unique to Azure AD. For a brand-new user, the Microsoft Graph `jobTitle` claim is matched case-insensitively: if `jobTitle` contains "student", the user is assigned to the `students` group; if it contains "faculty" or "professor", the user is assigned to the `faculty` group; if it contains "staff", the user is assigned to the `staff` group. If `jobTitle` is missing or does not match any of these substrings, the user falls back to the group specified by `AZURE_AD_DEFAULT_GROUP`.
+
+#### Google
+
+Enabled when `GOOGLE_SSO_CLIENT_ID` **and** `GOOGLE_SSO_CLIENT_SECRET` are set. Routes: `GET /login/google`, `GET /login/google/authorized`. The button is always labeled "Sign in with Google".
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| `GOOGLE_SSO_CLIENT_ID` | str | `None` | Google OAuth client ID |
+| `GOOGLE_SSO_CLIENT_SECRET` | str | `None` | Google OAuth client secret |
+| `GOOGLE_SSO_REDIRECT_URI` | str | `<APP_BASE_URL>/login/google/authorized` | Optional override for the callback URL |
+| `GOOGLE_SSO_HOSTED_DOMAIN` | str | `None` | Optional Google Workspace domain restriction |
+| `GOOGLE_SSO_DEFAULT_GROUP` | str | `other` | Default group for new Google users |
+
+`GOOGLE_SSO_HOSTED_DOMAIN` both passes `hd=<domain>` on the authorization request (Google pre-filters the account picker) **and** rejects any callback profile whose `hd` claim does not match, so the restriction is enforced server-side rather than cosmetically.
+
+#### Generic OIDC
+
+Enabled when `OIDC_SSO_ISSUER` **and** `OIDC_SSO_CLIENT_ID` **and** `OIDC_SSO_CLIENT_SECRET` are set. Routes: `GET /login/oidc`, `GET /login/oidc/authorized`.
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| `OIDC_SSO_ISSUER` | str | `None` | Issuer base URL; endpoints are read from `<issuer>/.well-known/openid-configuration` |
+| `OIDC_SSO_CLIENT_ID` | str | `None` | OIDC client ID |
+| `OIDC_SSO_CLIENT_SECRET` | str | `None` | OIDC client secret |
+| `OIDC_SSO_REDIRECT_URI` | str | `<APP_BASE_URL>/login/oidc/authorized` | Optional override for the callback URL |
+| `OIDC_SSO_DISPLAY_NAME` | str | `SSO` | Login button reads "Sign in with `<this>`" |
+| `OIDC_SSO_SCOPES` | str | `openid profile email` | Requested scopes |
+| `OIDC_SSO_DEFAULT_GROUP` | str | `other` | Default group for new OIDC users |
+
+Discovery documents are fetched at first login and cached in-process for 1 hour -- authorize/token URLs are never configured by hand. Claims used: `sub` (stable subject), `email` (required), `name`, `preferred_username` (username hint). The IdP must publish a `userinfo` endpoint.
+
+> **InCommon via CILogon (recommended InCommon path):** CILogon is an OIDC gateway fronting the entire InCommon federation, so **one** client registration replaces per-campus SAML metadata exchange. Configure the *generic OIDC* provider with `OIDC_SSO_ISSUER=https://cilogon.org`, a client registered at cilogon.org (callback `<APP_BASE_URL>/login/oidc/authorized`), and `OIDC_SSO_DISPLAY_NAME=InCommon`. Users pick their home institution on the CILogon page. Native SAML remains available for organizations that require direct federation with their own Shibboleth IdP.
+
+#### SAML 2.0
+
+Enabled when `SAML_SP_ENTITY_ID` is set **and** either `SAML_IDP_METADATA_URL` **or** all three of `SAML_IDP_ENTITY_ID` / `SAML_IDP_SSO_URL` / `SAML_IDP_X509_CERT` are set.
+
+| Route | Purpose |
+|-------|---------|
+| `GET /login/saml` | SP-initiated AuthnRequest redirect to the IdP |
+| `POST /login/saml/acs` | Assertion Consumer Service |
+| `GET /saml/metadata` | SP metadata XML -- **this is the URL an admin registers with the IdP or federation**; returns 404 when SAML is not configured. A missing `python3-saml` reports 501 ("SAML support is not installed") *only* in the explicit entity-ID / SSO-URL / cert configuration -- with `SAML_IDP_METADATA_URL` set, the parser import fails first and the endpoint answers 404 instead, so the status code is not a reliable way to tell the two failure modes apart; check the logs |
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| `SAML_SP_ENTITY_ID` | str | `None` | SP entity ID (typically the metadata URL) |
+| `SAML_SP_ACS_URL` | str | `<APP_BASE_URL>/login/saml/acs` | Optional override for the ACS URL |
+| `SAML_IDP_METADATA_URL` | str | `None` | IdP metadata URL (**must be https**) |
+| `SAML_IDP_ENTITY_ID` | str | `None` | IdP entity ID (explicit style, no metadata URL) |
+| `SAML_IDP_SSO_URL` | str | `None` | IdP SSO endpoint (explicit style) |
+| `SAML_IDP_X509_CERT` | str | `None` | IdP signing certificate, base64, no PEM headers (explicit style) |
+| `SAML_DISPLAY_NAME` | str | `SSO` | Login button label |
+| `SAML_DEFAULT_GROUP` | str | `other` | Default group for new SAML users |
+| `SAML_ATTR_EMAIL` | str | `mail` | Attribute mapped to email |
+| `SAML_ATTR_NAME` | str | `displayName` | Attribute mapped to display name |
+| `SAML_ATTR_USERNAME` | str | `eduPersonPrincipalName` | Attribute mapped to the username hint |
+
+The attribute-mapping defaults follow eduPerson / InCommon conventions.
+
+**What the IdP must sign:** MindRouter's SP settings are `wantAssertionsSigned: true` and `wantMessagesSigned: false` -- the **assertion** must be signed; a message-level (SAML `Response` element) signature is not required.
+
+**SAML requires HTTPS.** The IdP returns the assertion by *cross-site* HTTP-POST to the ACS, and browsers do not send `SameSite=Lax` cookies on a cross-site POST -- so the `saml_request_id` AuthnRequest-ID cookie is issued with `SameSite=None; Secure`. A `Secure` cookie is not stored over plain `http`, so **SAML cannot be exercised over a plain-http development URL**: the ACS would see no cookie and reject every login as unsolicited. Serve the dashboard over TLS (and point `APP_BASE_URL` at the `https://` origin) before enabling SAML.
+
+**The IdP must release a persistent (or otherwise stable) NameID.** MindRouter requests `urn:oasis:names:tc:SAML:2.0:nameid-format:persistent` in its AuthnRequest but does **not** verify the format that comes back. With a transient or rotating NameID, a user signs in successfully once -- stamping `sso_provider` / `sso_subject` on the account -- and is then **permanently refused**: every later login misses on the new subject, falls back to the email match, finds `sso_provider` already set, and is rejected as `sso_email_link_refused`. Recovering such an account requires editing the `users` table directly; there is no admin UI or API for clearing a stale identity.
+
+**Installing with SAML support:** the shipped Docker image already includes everything (the `Dockerfile` installs `libxmlsec1-dev` + `libxmlsec1-openssl` and runs `pip install -e .[saml]`; `xmlsec` and `lxml` resolve as prebuilt wheels on both amd64 and arm64, so nothing compiles). On bare metal, SAML is an optional extra -- install `libxmlsec1-dev` first, then `pip install -e .[saml]`. Without the extra, Azure/Google/OIDC work normally and the SAML routes degrade with a clear "SAML support is not installed" error rather than crashing.
+
+#### Login button labels
+
+Button labels tie into **Admin → Branding → "Institution / organization name"** (`branding.org_name`). Azure AD is treated as the primary/institutional provider: its button reads "Sign in with `<org name>`", falling back to "Sign in with SSO" when no org name is set. SAML and generic OIDC use the org name only when they are the primary provider *and* their `*_DISPLAY_NAME` is still at its default; otherwise they use their own display name. Google is always "Google". The helper text reads "Use your `<org name or 'organization'>` credentials to sign in."
+
+#### JIT Provisioning and Account Linking
+
+All providers share the same semantics. On login, MindRouter looks up `(provider, subject)` first -- the stable IdP identifier (OIDC `sub`, SAML persistent NameID, Azure object ID) -- then falls back to a lowercased email match.
+
+- **Email matches adopt unclaimed accounts only.** If the matched account already carries *any* identity -- an `azure_oid`, or an `sso_provider` of any value -- the login is **refused** and logged as `sso_email_link_refused`. The test is on any value, not on a *different* one, so the **same** provider presenting a **new** subject is refused too. Email is an IdP-supplied attribute, not proof of ownership -- without this rule, any enabled IdP could assert an existing user's address (including an admin's) and inherit the account. The guard applies to the Azure driver as well as the shared Google / OIDC / SAML path.
+- **A rotating IdP subject locks a user out after their first login.** Because the guard fires on any set `sso_provider`, an IdP that issues transient or rotating subjects (a SAML transient NameID, for example) admits a user once and refuses every attempt afterwards: the new subject misses, the email match hits, and the account is already claimed. **Configure the IdP to release a persistent (or otherwise stable) NameID / subject.**
+- **Clearing a stale identity requires direct database access.** There is no admin UI or API for resetting `azure_oid` / `sso_provider` / `sso_subject`, so moving a user between providers -- or recovering an account stranded by a rotated subject -- means editing the `users` table by hand.
+- **Unclaimed accounts -- notably local password accounts -- are linked**, and the local password is retained, so both login methods keep working. Display name is refreshed from the IdP on every login; **department and college are refreshed for Azure AD only** -- the OIDC/Google and SAML profile mappers never populate those fields, so they stay empty for those providers.
+- **New users** are created with no password hash -- the account is SSO-only, cannot use the local login form, and there is currently no admin UI or API for adding a local password to it (that would mean a separate local account or direct database access) -- and land in the provider's `*_DEFAULT_GROUP`. **That group must already exist** -- create it on the admin Groups page first. Quota is seeded from the group's defaults. The username is the local part of the username hint (ePPN / `preferred_username`) or email, with `_<first 8 chars of subject>` appended on collision.
+- **Deactivated accounts** (`is_active = false`) are refused at login regardless of provider.
+
+#### SSO Security Posture
+
+- **Account linking is restricted to unclaimed accounts** (see above) -- the single most important protection against IdP-asserted account takeover.
+- **Emails are rejected when the IdP sends `email_verified` and it is not true** (OIDC/Google); IdPs that omit the claim entirely are trusted. The claim is normalized, so string forms like `"false"` or `"0"` cannot fail open.
+- **OIDC CSRF protection** uses a signed, timed state token (10-minute lifetime) round-tripped through an HttpOnly cookie and validated on every callback.
+- **SAML is SP-initiated only.** The ACS requires a signed `saml_request_id` cookie issued by `/login/saml` **and** requires the response's `InResponseTo` to echo that AuthnRequest ID. Stated plainly: **IdP-initiated login is not supported** -- launching MindRouter from a campus app-portal tile will not work; users must start at the MindRouter login page. (This is enforced in MindRouter because python3-saml has no unsolicited-response setting and skips its own `InResponseTo` comparison when the attribute is absent.)
+- **SAML requires HTTPS.** That `saml_request_id` cookie is set `SameSite=None; Secure`, because the IdP delivers the assertion by cross-site HTTP-POST to the ACS and browsers withhold `SameSite=Lax` cookies on cross-site POSTs. A `Secure` cookie is never stored over plain `http`, so **SAML cannot be exercised over a plain-http dev URL** -- the ACS would see no cookie and reject every login as unsolicited.
+- **A stable IdP subject is a security requirement, not just an ergonomic one.** MindRouter requests a persistent NameID but does not verify the returned format; with a transient or rotating subject a user is refused on every login after their first, and only direct database access can clear the stale identity.
+- **SAML assertions must be signed** (strict mode), and `rejectDeprecatedAlgorithm` blocks SHA-1 signatures.
+- **SAML IdP metadata must be served over HTTPS** -- it carries the signing certificate, the only trust anchor. A plain-`http` `SAML_IDP_METADATA_URL` disables the provider. For a stronger anchor, pin the certificate locally with the explicit `SAML_IDP_ENTITY_ID` / `SAML_IDP_SSO_URL` / `SAML_IDP_X509_CERT` trio instead of fetching metadata.
+- **Public URLs are derived from `APP_BASE_URL` rather than from request headers** -- keep `APP_BASE_URL` set, and a spoofed `X-Forwarded-Host` / `X-Forwarded-Proto` cannot influence OIDC redirect URIs or SAML `Destination`/`Recipient` validation. If `APP_BASE_URL` is blank the code falls back to the request's own scheme and `Host` header (the OIDC path consults `X-Forwarded-Proto`; the SAML adapter does not), which is exactly why leaving it set matters.
+- **`SECRET_KEY` underpins the SSO anti-forgery cookies.** The signed OIDC state cookie and the SAML `saml_request_id` cookie are both signed with it, so a weak or leaked `SECRET_KEY` weakens those protections; rotating it invalidates any login already in flight.
+
+#### Scope and Limits
+
+- One IdP per provider type -- a single generic-OIDC issuer and a single SAML IdP.
+- SAML: SP-initiated only, no Single Logout (SLO), and no exposed encrypted-assertion configuration.
+- No SCIM / directory sync and no group-claim-driven authorization. Group assignment comes from the provider's `*_DEFAULT_GROUP` (except Azure's `jobTitle` mapping); ongoing group and role changes are managed in MindRouter, not pushed from the IdP.
 
 ### Artifact Storage
 

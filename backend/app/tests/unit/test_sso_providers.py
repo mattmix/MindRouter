@@ -612,6 +612,18 @@ def test_saml_request_id_cookie_defined(sso):
     assert "auth.process_response(request_id=request_id)" in src
 
 
+def test_saml_request_id_cookie_survives_cross_site_post(sso):
+    """CRITICAL regression: the IdP returns the assertion via a CROSS-SITE POST
+    to our ACS. Browsers withhold SameSite=Lax cookies on cross-site POSTs, so
+    a "lax" cookie here would make handle_acs reject every login from an IdP on
+    a different registrable domain. Must be SameSite=None + Secure."""
+    src = (_SSO_DIR / "saml.py").read_text()
+    setcookie = src.split("key=REQUEST_ID_COOKIE")[1].split("max_age=")[0]
+    assert 'samesite="none"' in setcookie
+    assert "secure=True" in setcookie
+    assert 'samesite="lax"' not in setcookie
+
+
 # ── Migration + model + deploy-file contracts ─────────────────────
 
 _REPO = Path(__file__).resolve().parents[4]
@@ -630,14 +642,40 @@ def test_models_account_type_covers_generic_sso():
     assert "sso_provider" in src and "sso_subject" in src
 
 
-def test_azure_driver_untouched_regression():
-    """The Azure AD flow must keep its routes and azure_oid semantics."""
+def test_azure_driver_routes_and_oid_semantics():
+    """The Azure AD flow keeps its own routes and azure_oid identity column."""
     src = (_REPO / "backend/app/dashboard/azure_auth.py").read_text()
     assert '@azure_router.get("/login/azure")' in src
     assert '@azure_router.get("/login/azure/authorized")' in src
     assert "find_or_create_azure_user" in src
     assert "user.azure_oid = azure_oid" in src
-    assert "sso_subject" not in src  # Azure keeps its own column, period
+    assert "user.sso_subject" not in src  # Azure never writes the shared column
+
+
+def test_azure_email_link_guard_matches_shared_driver():
+    """CRITICAL: the Azure driver must refuse to adopt an account already
+    claimed by another provider, exactly as sso/base.py does. Without this,
+    enabling Azure alongside SAML/OIDC/Google lets an Azure-asserted email
+    inherit an account provisioned by that other provider."""
+    src = (_REPO / "backend/app/dashboard/azure_auth.py").read_text()
+    body = src.split("async def find_or_create_azure_user")[1]
+    # The email fallback must be guarded, not a bare assignment.
+    assert "candidate = await crud.get_user_by_email" in body
+    assert "candidate.azure_oid or candidate.sso_provider" in body
+    assert "sso_email_link_refused" in body
+    # and the guard must return before any identity is stamped
+    guard = body.split("candidate.azure_oid or candidate.sso_provider")[1]
+    assert "return None" in guard.split("user = candidate")[0]
+
+
+def test_both_drivers_agree_on_link_policy():
+    """Consistency: both drivers gate email-linking on the same two fields, so
+    the documented rule is true of every provider."""
+    azure = (_REPO / "backend/app/dashboard/azure_auth.py").read_text()
+    shared = (_SSO_DIR / "base.py").read_text()
+    for src in (azure, shared):
+        assert "candidate.azure_oid or candidate.sso_provider" in src
+        assert "sso_email_link_refused" in src
 
 
 def test_docker_compose_passes_all_sso_env_vars():

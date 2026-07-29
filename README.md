@@ -6,7 +6,7 @@ MindRouter is a production-ready, self-hosted **AI inference gateway** that fron
 
 *The public Cluster Status page (shown here with University of Idaho branding): real-time token-flow throughput across the backend cluster, healthy-backend and active-user counts, queue depth, and total tokens served.*
 
-The platform is multi-modal, spanning chat and text completion, embeddings, vision, **image and video generation**, **speech (TTS/STT)**, and document OCR. It also provides the governance and operations layers a shared deployment needs: **fair-share scheduling** across users and groups, **per-user token and request quotas**, **role-based access with optional SSO (Azure AD / OAuth)**, **full audit logging**, and real-time **GPU, health, and energy monitoring**.
+The platform is multi-modal, spanning chat and text completion, embeddings, vision, **image and video generation**, **speech (TTS/STT)**, and document OCR. It also provides the governance and operations layers a shared deployment needs: **fair-share scheduling** across users and groups, **per-user token and request quotas**, **role-based access with optional SSO (Azure AD/Entra, Google, any OIDC provider, or SAML 2.0)**, **full audit logging**, and real-time **GPU, health, and energy monitoring**.
 
 Because all inference runs on hardware the operator owns, MindRouter is built to support **institutional and organizational AI sovereignty**: scalable on-premises hosting that keeps prompts, documents, and generated media on local infrastructure instead of third-party clouds.
 
@@ -45,7 +45,7 @@ Interactive API docs are also available at `/docs` (Swagger UI) and `/redoc` (Re
 - **Thinking/Reasoning Mode**: Control reasoning depth on supported models (qwen3.5, qwen3, gpt-oss)
 - **Web Search**: Standalone search API (`/v1/search`) with pluggable providers (Brave Search, SearXNG)
 - **Agentic AI Integrations**: MCP servers and agent skills for Claude Code, ForgeCode, OpenCode, Codex, Cursor, and others (`agentic_ai/`)
-- **Azure AD SSO**: Optional single sign-on with JIT user provisioning from Microsoft Entra ID
+- **Single Sign-On**: Optional SSO via Azure AD / Entra ID, Google, any OIDC provider (Okta, Keycloak, Auth0, or CILogon for InCommon federation), and SAML 2.0 (Shibboleth, ADFS) — enable any subset from environment variables, with JIT user provisioning; local accounts keep working alongside it ([guide](docs/sso-configuration.md))
 - **Voice API**: Public TTS and STT endpoints (`/v1/audio/speech`, `/v1/audio/transcriptions`) with API key auth and quota tracking
 - **Full Audit Logging**: All prompts, responses, and artifacts stored for review
 - **Dual Dashboards**: Public status + authenticated user/admin interfaces with dark mode
@@ -242,10 +242,17 @@ Key settings:
 |----------|-------------|---------|
 | `DATABASE_URL` | MariaDB connection string | Required |
 | `SECRET_KEY` | Session/JWT signing key | Required |
+| `APP_BASE_URL` | Public HTTPS origin of this deployment — required for correct SSO redirect URIs and SAML validation | `https://mindrouter.uidaho.edu` |
 | `REDIS_URL` | Redis for rate limiting (optional) | None |
 | `ARTIFACT_STORAGE_PATH` | Path for uploaded files | `/data/artifacts` |
 | `SCHEDULER_FAIRNESS_WINDOW` | Rolling window for usage tracking | 300 (5 min) |
 | `GPU_AGENT_PORT` | Sidecar agent listen port (sidecar-side env var, not a MindRouter setting) | 8007 |
+
+### Single Sign-On (optional)
+
+MindRouter supports **Azure AD / Entra ID**, **Google**, **generic OIDC** (Okta, Keycloak, Auth0, or CILogon for InCommon), and **SAML 2.0** (Shibboleth, ADFS). Each provider is enabled purely by environment variables — any subset can run at once, and the login page renders one button per enabled provider. Local username/password login is always available. The Docker image ships with SAML support included; bare-metal installs need `pip install -e ".[saml]"`. Set `APP_BASE_URL` to your public HTTPS origin, since redirect URIs and SAML validation derive from it.
+
+See [docs/sso-configuration.md](docs/sso-configuration.md) for per-provider setup, JIT provisioning, and security notes.
 
 ### Node and Backend Registration
 

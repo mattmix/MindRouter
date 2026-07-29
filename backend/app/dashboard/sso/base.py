@@ -10,8 +10,10 @@
 
 Every provider driver reduces its IdP response to an :class:`SSOProfile`,
 then calls :func:`find_or_create_sso_user`. Identity is keyed on the
-``(sso_provider, sso_subject)`` pair (``users`` table); pre-existing local
-accounts are linked by verified email, mirroring the Azure driver's behavior.
+``(sso_provider, sso_subject)`` pair (``users`` table); a pre-existing account
+matched by email is adopted only when NO identity provider has claimed it yet.
+Both this path and the Azure driver refuse an email match against an account
+that already carries an ``azure_oid`` or an ``sso_provider``.
 """
 
 import secrets
