@@ -275,3 +275,78 @@ def test_every_dashboard_template_env_registers_branding_global():
         "These create a Jinja2Templates env but never register the branding() "
         f"global that base.html requires: {offenders}"
     )
+
+
+# ── Organization name (SSO wording) ──────────────────────────────
+
+def test_build_view_org_name_default_none():
+    v = branding._build_view({})
+    assert v["org_name"] is None
+    assert v["is_customized"] is False
+
+
+def test_build_view_org_name_set():
+    v = branding._build_view({"org_name": "University of Idaho"})
+    assert v["org_name"] == "University of Idaho"
+    assert v["is_customized"] is True
+
+
+def test_build_view_org_name_whitespace_is_none():
+    assert branding._build_view({"org_name": "   "})["org_name"] is None
+
+
+def test_org_name_config_key_defined():
+    assert branding.KEY_ORG_NAME == "branding.org_name"
+    assert branding.DEFAULTS["org_name"] is None
+
+
+# ── Login page must be org-agnostic (branding-driven) ────────────
+
+def _login_template_src():
+    import pathlib
+    root = pathlib.Path(__file__).resolve().parents[2]
+    return (root / "dashboard" / "templates" / "public" / "login.html").read_text()
+
+
+def test_login_template_has_no_hardcoded_institution():
+    src = _login_template_src()
+    assert "University of Idaho" not in src
+    assert "uidaho" not in src.lower()
+
+
+def test_login_template_uses_branding_org_name():
+    src = _login_template_src()
+    assert "Sign in with {{ brand.org_name or 'SSO' }}" in src
+    assert "{{ brand.org_name or 'organization' }} credentials" in src
+
+
+def test_login_template_local_account_toggle():
+    src = _login_template_src()
+    assert "Sign in with a local account" in src
+    assert "Admin login" not in src
+
+
+def test_login_route_error_is_org_agnostic():
+    import pathlib
+    root = pathlib.Path(__file__).resolve().parents[2]
+    src = (root / "dashboard" / "routes.py").read_text()
+    assert "Please use University of Idaho sign-in" not in src
+    assert 'single sign-on (SSO)' in src
+
+
+def test_branding_form_has_org_name_field():
+    import pathlib
+    root = pathlib.Path(__file__).resolve().parents[2]
+    src = (root / "dashboard" / "templates" / "admin" / "branding.html").read_text()
+    assert 'name="org_name"' in src
+    # save route persists it
+    routes_src = (root / "dashboard" / "routes.py").read_text()
+    assert "KEY_ORG_NAME" in routes_src
+
+
+def test_reset_all_clears_org_name():
+    import pathlib
+    root = pathlib.Path(__file__).resolve().parents[2]
+    src = (root / "dashboard" / "routes.py").read_text()
+    reset_branch = src.split('action == "reset_all"')[1].split("return await _finish")[0]
+    assert "KEY_ORG_NAME" in reset_branch

@@ -993,10 +993,12 @@ async def chat_completions(
 
     # Inject system prompt for consistent math formatting
     # (prepend so it appears before conversation history)
+    _brand_org = _branding.get_branding().get("org_name")
+    _provider = _brand_org or "your organization"
     _DEFAULT_SYSTEM_PROMPT = (
-        "You are a helpful AI assistant provided by the University of Idaho. "
-        "All conversations are processed entirely on University of Idaho infrastructure — "
-        "your messages never leave campus servers and are not shared with any third party. "
+        f"You are a helpful AI assistant provided by {_provider}. "
+        f"All conversations are processed entirely on {_provider}'s own infrastructure — "
+        "your messages never leave its servers and are not shared with any third party. "
         "If users ask about data privacy, reassure them of this.\n\n"
         "When writing mathematical expressions, always use LaTeX with proper "
         "delimiters. Use $...$ for inline math and $$...$$ for display equations. "

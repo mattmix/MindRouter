@@ -557,11 +557,13 @@ async def login(
         )
 
     if user.password_hash is None:
+        org_name = branding_service.get_branding().get("org_name")
+        sso_label = f"{org_name} sign-in" if org_name else "single sign-on (SSO)"
         return templates.TemplateResponse(
             "public/login.html",
             {
                 "request": request,
-                "error": "Please use University of Idaho sign-in",
+                "error": f"This account has no local password — please use {sso_label}",
                 "azure_enabled": settings.azure_ad_enabled,
             },
         )
@@ -4876,12 +4878,15 @@ async def admin_branding_post(
 
     if action == "save_identity":
         app_name = (form.get("app_name") or "").strip()
+        org_name = (form.get("org_name") or "").strip()
         tagline = (form.get("tagline") or "").strip()
         primary_light = (form.get("primary_light") or "").strip()
         primary_dark = (form.get("primary_dark") or "").strip()
         headline_color = (form.get("headline_color") or "").strip()
         if app_name and len(app_name) > 80:
             return RedirectResponse(url="/admin/branding?error=Name+too+long+(max+80)", status_code=302)
+        if org_name and len(org_name) > 120:
+            return RedirectResponse(url="/admin/branding?error=Organization+name+too+long+(max+120)", status_code=302)
         if len(tagline) > 160:
             return RedirectResponse(url="/admin/branding?error=Tagline+too+long+(max+160)", status_code=302)
         if primary_light and not branding_service.is_valid_hex(primary_light):
@@ -4893,6 +4898,8 @@ async def admin_branding_post(
 
         await crud.set_config(db, branding_service.KEY_APP_NAME, app_name,
                               description="Branding: application/organization name")
+        await crud.set_config(db, branding_service.KEY_ORG_NAME, org_name,
+                              description="Branding: institution name for SSO sign-in wording")
         await crud.set_config(db, branding_service.KEY_TAGLINE, tagline,
                               description="Branding: tagline / subtitle")
         await crud.set_config(db, branding_service.KEY_PRIMARY_LIGHT, primary_light,
@@ -4956,7 +4963,8 @@ async def admin_branding_post(
             old = await crud.get_config_json(db, key, None)
             if old:
                 branding_service.delete_asset(old)
-        for key in (branding_service.KEY_APP_NAME, branding_service.KEY_TAGLINE,
+        for key in (branding_service.KEY_APP_NAME, branding_service.KEY_ORG_NAME,
+                    branding_service.KEY_TAGLINE,
                     branding_service.KEY_PRIMARY_LIGHT, branding_service.KEY_PRIMARY_DARK,
                     branding_service.KEY_HEADLINE_COLOR,
                     branding_service.KEY_LOGO_LIGHT, branding_service.KEY_LOGO_DARK,

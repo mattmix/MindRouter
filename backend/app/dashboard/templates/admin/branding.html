@@ -55,6 +55,12 @@
                                     <div class="form-text">Shown in the top bar, page titles, and footer.</div>
                                 </div>
                                 <div class="mb-3">
+                                    <label class="form-label" for="org_name">Institution / organization name <span class="text-muted">(optional)</span></label>
+                                    <input type="text" class="form-control" id="org_name" name="org_name" maxlength="120"
+                                           value="{{ brand.org_name or '' }}" placeholder="e.g. University of Idaho" {% if is_read_only %}disabled{% endif %}>
+                                    <div class="form-text">Used on the sign-in page (&ldquo;Sign in with &hellip;&rdquo;) and in SSO messages. Leave blank for generic wording.</div>
+                                </div>
+                                <div class="mb-3">
                                     <label class="form-label" for="tagline">Tagline <span class="text-muted">(optional)</span></label>
                                     <input type="text" class="form-control" id="tagline" name="tagline" maxlength="160"
                                            value="{{ brand.tagline }}" placeholder="{{ defaults.tagline }}" {% if is_read_only %}disabled{% endif %}>

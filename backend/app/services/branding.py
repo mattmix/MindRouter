@@ -37,6 +37,7 @@ logger = get_logger(__name__)
 
 # --- Config keys -----------------------------------------------------------
 KEY_APP_NAME = "branding.app_name"
+KEY_ORG_NAME = "branding.org_name"  # institution name for SSO wording ("Sign in with <org>")
 KEY_TAGLINE = "branding.tagline"
 KEY_PRIMARY_LIGHT = "branding.primary_light"
 KEY_PRIMARY_DARK = "branding.primary_dark"
@@ -50,6 +51,8 @@ KEY_HEADLINE_COLOR = "branding.headline_color"  # headline/heading text color (e
 # stock MindRouter look so an un-branded install is unchanged.
 DEFAULTS: dict[str, Any] = {
     "app_name": "MindRouter",
+    # No org by default: login/SSO wording stays generic until an admin sets one.
+    "org_name": None,
     "tagline": "LLM Inference Load Balancer",
     "primary_light": "#0d6efd",
     "primary_dark": "#3d8bfd",
@@ -213,6 +216,7 @@ def _asset_url(filename: Optional[str]) -> Optional[str]:
 def _build_view(raw: dict[str, Any]) -> dict[str, Any]:
     """Merge raw config with defaults and add derived/template-ready fields."""
     app_name = (raw.get("app_name") or "").strip() or DEFAULTS["app_name"]
+    org_name = (raw.get("org_name") or "").strip() or None
     tagline = raw.get("tagline")
     if tagline is None:
         tagline = DEFAULTS["tagline"]
@@ -226,6 +230,7 @@ def _build_view(raw: dict[str, Any]) -> dict[str, Any]:
 
     view: dict[str, Any] = {
         "app_name": app_name,
+        "org_name": org_name,
         "tagline": tagline,
         "headline_color": headline_color,
         # Raw stored filenames (used by the admin form / removal).
@@ -242,6 +247,7 @@ def _build_view(raw: dict[str, Any]) -> dict[str, Any]:
         # True when anything differs from stock defaults.
         "is_customized": bool(
             (raw.get("app_name") and raw.get("app_name") != DEFAULTS["app_name"])
+            or org_name is not None
             or raw.get("tagline") not in (None, DEFAULTS["tagline"])
             or primary_light != DEFAULTS["primary_light"]
             or primary_dark != DEFAULTS["primary_dark"]
@@ -257,6 +263,7 @@ async def load_branding(db) -> dict[str, Any]:
     """Read branding config from the DB and return a template-ready view dict."""
     raw = {
         "app_name": await crud.get_config_json(db, KEY_APP_NAME, None),
+        "org_name": await crud.get_config_json(db, KEY_ORG_NAME, None),
         "tagline": await crud.get_config_json(db, KEY_TAGLINE, None),
         "primary_light": await crud.get_config_json(db, KEY_PRIMARY_LIGHT, None),
         "primary_dark": await crud.get_config_json(db, KEY_PRIMARY_DARK, None),

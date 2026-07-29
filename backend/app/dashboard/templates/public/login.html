@@ -27,22 +27,22 @@
                     {% if azure_enabled %}
                     <div class="d-grid mb-3">
                         <a href="/login/azure" class="btn btn-primary btn-lg">
-                            <i class="bi bi-microsoft"></i> Sign in with University of Idaho
+                            <i class="bi bi-microsoft"></i> Sign in with {{ brand.org_name or 'SSO' }}
                         </a>
                     </div>
                     <p class="text-center text-muted small">
-                        Use your University of Idaho credentials to sign in.
+                        Use your {{ brand.org_name or 'organization' }} credentials to sign in.
                         Your account will be created automatically on first login.
                     </p>
 
                     <hr>
 
                     <div class="text-center">
-                        <a class="text-muted small" data-bs-toggle="collapse" href="#adminLogin" role="button" aria-expanded="false" aria-controls="adminLogin">
-                            Admin login
+                        <a class="text-muted small" data-bs-toggle="collapse" href="#localLogin" role="button" aria-expanded="false" aria-controls="localLogin">
+                            Sign in with a local account
                         </a>
                     </div>
-                    <div class="collapse mt-3" id="adminLogin">
+                    <div class="collapse mt-3" id="localLogin">
                     {% endif %}
 
                     <form method="POST" action="/login">
