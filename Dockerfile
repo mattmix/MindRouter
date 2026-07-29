@@ -12,6 +12,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     pkg-config \
     default-libmysqlclient-dev \
+    libxmlsec1-dev \
+    libxmlsec1-openssl \
     poppler-utils \
     libreoffice-core \
     libreoffice-writer \
@@ -32,7 +34,7 @@ COPY backend/app/__init__.py backend/app/
 
 # Install Python dependencies
 RUN pip install --upgrade pip setuptools wheel && \
-    pip install -e .
+    pip install -e .[saml]
 
 # Copy application code
 COPY backend/ backend/

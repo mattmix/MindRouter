@@ -24,12 +24,14 @@
                     </div>
                     {% endif %}
 
-                    {% if azure_enabled %}
+                    {% if sso_enabled %}
+                    {% for p in sso_providers %}
                     <div class="d-grid mb-3">
-                        <a href="/login/azure" class="btn btn-primary btn-lg">
-                            <i class="bi bi-microsoft"></i> Sign in with {{ brand.org_name or 'SSO' }}
+                        <a href="{{ p.login_url }}" class="btn {% if loop.first %}btn-primary btn-lg{% else %}btn-outline-primary{% endif %}">
+                            <i class="bi {{ p.icon }}"></i> Sign in with {{ p.label }}
                         </a>
                     </div>
+                    {% endfor %}
                     <p class="text-center text-muted small">
                         Use your {{ brand.org_name or 'organization' }} credentials to sign in.
                         Your account will be created automatically on first login.
@@ -48,7 +50,7 @@
                     <form method="POST" action="/login">
                         <div class="mb-3">
                             <label for="username" class="form-label">Username</label>
-                            <input type="text" class="form-control" id="username" name="username" required {% if not azure_enabled %}autofocus{% endif %} autocomplete="username">
+                            <input type="text" class="form-control" id="username" name="username" required {% if not sso_enabled %}autofocus{% endif %} autocomplete="username">
                         </div>
                         <div class="mb-3">
                             <label for="password" class="form-label">Password</label>
@@ -61,7 +63,7 @@
                         </div>
                     </form>
 
-                    {% if azure_enabled %}
+                    {% if sso_enabled %}
                     </div>
                     {% endif %}
                 </div>

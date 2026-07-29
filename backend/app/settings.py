@@ -91,6 +91,36 @@ class Settings(BaseSettings):
     azure_ad_redirect_uri: str = "https://your-domain.example.com/login/azure/authorized"
     azure_ad_default_group: str = "other"
 
+    # Google SSO (OIDC; set client id+secret to enable)
+    google_sso_client_id: Optional[str] = None
+    google_sso_client_secret: Optional[str] = None
+    google_sso_redirect_uri: Optional[str] = None  # default: <public URL>/login/google/authorized
+    google_sso_hosted_domain: Optional[str] = None  # restrict to a Workspace domain (hd claim)
+    google_sso_default_group: str = "other"
+
+    # Generic OIDC SSO (Okta, Keycloak, Auth0, CILogon/InCommon, ...; set issuer+client to enable)
+    oidc_sso_issuer: Optional[str] = None  # issuer base URL; discovery at <issuer>/.well-known/openid-configuration
+    oidc_sso_client_id: Optional[str] = None
+    oidc_sso_client_secret: Optional[str] = None
+    oidc_sso_redirect_uri: Optional[str] = None  # default: <public URL>/login/oidc/authorized
+    oidc_sso_display_name: str = "SSO"  # login button label ("Sign in with <name>")
+    oidc_sso_scopes: str = "openid profile email"
+    oidc_sso_default_group: str = "other"
+
+    # SAML 2.0 SSO (Shibboleth/InCommon IdPs, ADFS, ...; set SP entity id + IdP metadata to enable)
+    saml_sp_entity_id: Optional[str] = None
+    saml_sp_acs_url: Optional[str] = None  # default: <public URL>/login/saml/acs
+    saml_idp_metadata_url: Optional[str] = None  # fetch IdP entity/SSO URL/cert from metadata
+    saml_idp_entity_id: Optional[str] = None  # explicit alternative to metadata URL
+    saml_idp_sso_url: Optional[str] = None
+    saml_idp_x509_cert: Optional[str] = None
+    saml_display_name: str = "SSO"
+    saml_default_group: str = "other"
+    # Attribute names in the assertion (defaults follow eduPerson/InCommon conventions)
+    saml_attr_email: str = "mail"
+    saml_attr_name: str = "displayName"
+    saml_attr_username: str = "eduPersonPrincipalName"
+
     # Artifact Storage
     artifact_storage_path: str = "/data/artifacts"
     artifact_max_size_mb: int = 50
@@ -273,6 +303,29 @@ class Settings(BaseSettings):
     def azure_ad_enabled(self) -> bool:
         """Check if Azure AD SSO is configured."""
         return bool(self.azure_ad_client_id and self.azure_ad_tenant_id)
+
+    @property
+    def google_sso_enabled(self) -> bool:
+        """Check if Google SSO is configured."""
+        return bool(self.google_sso_client_id and self.google_sso_client_secret)
+
+    @property
+    def oidc_sso_enabled(self) -> bool:
+        """Check if generic OIDC SSO is configured."""
+        return bool(self.oidc_sso_issuer and self.oidc_sso_client_id and self.oidc_sso_client_secret)
+
+    @property
+    def saml_sso_enabled(self) -> bool:
+        """Check if SAML SSO is configured."""
+        return bool(
+            self.saml_sp_entity_id
+            and (self.saml_idp_metadata_url or (self.saml_idp_entity_id and self.saml_idp_sso_url and self.saml_idp_x509_cert))
+        )
+
+    @property
+    def sso_enabled(self) -> bool:
+        """True when at least one SSO provider is configured."""
+        return self.azure_ad_enabled or self.google_sso_enabled or self.oidc_sso_enabled or self.saml_sso_enabled
 
     def get_quota_defaults(self, role: str) -> dict:
         """Get default quota settings for a role."""

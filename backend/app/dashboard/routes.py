@@ -35,6 +35,7 @@ from itsdangerous import URLSafeTimedSerializer
 from backend.app.core.scheduler.policy import get_scheduler
 from backend.app.core.telemetry.registry import get_registry
 from backend.app.dashboard.azure_auth import azure_router
+from backend.app.dashboard.sso import enabled_providers, sso_router
 from backend.app.db import crud, chat_crud
 from backend.app.db.models import ApiKeyStatus, BackendEngine, QuotaRequestStatus, ServiceKeyRequestStatus, UserRole
 from backend.app.db.session import get_async_db, get_async_db_context
@@ -53,6 +54,7 @@ _background_tasks: set = set()
 
 dashboard_router = APIRouter(tags=["dashboard"])
 dashboard_router.include_router(azure_router)
+dashboard_router.include_router(sso_router)
 
 # Setup templates
 templates_path = os.path.join(os.path.dirname(__file__), "templates")
@@ -521,18 +523,24 @@ async def models_catalog(
 
 
 # Authentication
-@dashboard_router.get("/login", response_class=HTMLResponse)
-async def login_form(request: Request, error: Optional[str] = None):
-    """Display login form."""
-    settings = get_settings()
+def _login_page(request: Request, error: Optional[str] = None):
+    """Render the login page with the enabled SSO providers."""
+    providers = enabled_providers(org_name=branding_service.get_branding().get("org_name"))
     return templates.TemplateResponse(
         "public/login.html",
         {
             "request": request,
             "error": error,
-            "azure_enabled": settings.azure_ad_enabled,
+            "sso_providers": providers,
+            "sso_enabled": bool(providers),
         },
     )
+
+
+@dashboard_router.get("/login", response_class=HTMLResponse)
+async def login_form(request: Request, error: Optional[str] = None):
+    """Display login form."""
+    return _login_page(request, error)
 
 
 @dashboard_router.post("/login")
@@ -543,50 +551,21 @@ async def login(
     db: AsyncSession = Depends(get_async_db),
 ):
     """Handle login."""
-    settings = get_settings()
     user = await crud.get_user_by_username(db, username)
 
     if not user:
-        return templates.TemplateResponse(
-            "public/login.html",
-            {
-                "request": request,
-                "error": "Invalid username or password",
-                "azure_enabled": settings.azure_ad_enabled,
-            },
-        )
+        return _login_page(request, "Invalid username or password")
 
     if user.password_hash is None:
         org_name = branding_service.get_branding().get("org_name")
         sso_label = f"{org_name} sign-in" if org_name else "single sign-on (SSO)"
-        return templates.TemplateResponse(
-            "public/login.html",
-            {
-                "request": request,
-                "error": f"This account has no local password — please use {sso_label}",
-                "azure_enabled": settings.azure_ad_enabled,
-            },
-        )
+        return _login_page(request, f"This account has no local password — please use {sso_label}")
 
     if not verify_password(password, user.password_hash):
-        return templates.TemplateResponse(
-            "public/login.html",
-            {
-                "request": request,
-                "error": "Invalid username or password",
-                "azure_enabled": settings.azure_ad_enabled,
-            },
-        )
+        return _login_page(request, "Invalid username or password")
 
     if not user.is_active:
-        return templates.TemplateResponse(
-            "public/login.html",
-            {
-                "request": request,
-                "error": "Account is inactive",
-                "azure_enabled": settings.azure_ad_enabled,
-            },
-        )
+        return _login_page(request, "Account is inactive")
 
     # Update last login
     user.last_login_at = datetime.now(timezone.utc)

@@ -219,6 +219,9 @@ class User(Base, TimestampMixin, SoftDeleteMixin):
     email: Mapped[str] = mapped_column(String(255), unique=True, nullable=False, index=True)
     password_hash: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     azure_oid: Mapped[Optional[str]] = mapped_column(String(36), unique=True, nullable=True, index=True)
+    # Generic SSO identity for non-Azure providers ("google" | "oidc" | "saml").
+    sso_provider: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
+    sso_subject: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     full_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     role: Mapped[UserRole] = mapped_column(
         Enum(UserRole, values_callable=_enum_values), nullable=False, default=UserRole.STUDENT
@@ -259,13 +262,14 @@ class User(Base, TimestampMixin, SoftDeleteMixin):
         """
         if self.group is not None and self.group.is_admin:
             return "admin"
-        if self.azure_oid:
+        if self.azure_oid or self.sso_subject:
             return "sso"
         return "local"
 
     __table_args__ = (
         Index("ix_users_role_active", "role", "is_active"),
         Index("ix_users_group_active", "group_id", "is_active"),
+        Index("uq_users_sso_identity", "sso_provider", "sso_subject", unique=True),
     )
 
 

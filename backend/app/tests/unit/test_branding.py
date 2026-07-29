@@ -316,8 +316,16 @@ def test_login_template_has_no_hardcoded_institution():
 
 def test_login_template_uses_branding_org_name():
     src = _login_template_src()
-    assert "Sign in with {{ brand.org_name or 'SSO' }}" in src
+    # Multi-provider loop: labels are resolved server-side (azure gets
+    # brand.org_name in sso/registry.py); helper text stays branding-driven.
+    assert "Sign in with {{ p.label }}" in src
+    assert "{% for p in sso_providers %}" in src
     assert "{{ brand.org_name or 'organization' }} credentials" in src
+
+    import pathlib
+    root = pathlib.Path(__file__).resolve().parents[2]
+    registry_src = (root / "dashboard" / "sso" / "registry.py").read_text()
+    assert 'label=org_name or "SSO"' in registry_src
 
 
 def test_login_template_local_account_toggle():

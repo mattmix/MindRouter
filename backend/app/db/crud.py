@@ -222,6 +222,16 @@ async def get_user_by_azure_oid(db: AsyncSession, azure_oid: str) -> Optional[Us
     return result.scalar_one_or_none()
 
 
+async def get_user_by_sso_subject(db: AsyncSession, provider: str, subject: str) -> Optional[User]:
+    """Get user by generic SSO identity (provider, subject) with group eagerly loaded."""
+    result = await db.execute(
+        select(User)
+        .options(selectinload(User.group))
+        .where(User.sso_provider == provider, User.sso_subject == subject)
+    )
+    return result.scalar_one_or_none()
+
+
 async def create_user(
     db: AsyncSession,
     username: str,
