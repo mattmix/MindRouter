@@ -25,6 +25,8 @@ services:
       - /opt/mindrouter/artifacts:/data/artifacts
       - /opt/mindrouter/chat_files:/data/chat_files
       - /opt/mindrouter/logs:/var/log/mindrouter
+      # Uploaded branding assets (logos/favicon) must outlive `up -d --build`
+      - branding_data:/data/branding
     depends_on:
       mariadb:
         condition: service_healthy
@@ -69,7 +71,9 @@ services:
     env_file:
       - .env.prod
     volumes:
-      - /archivedb:/var/lib/mysql
+      # Host path for the archive DB (set ARCHIVE_DB_HOST_PATH in .env);
+      # defaults to a managed named volume so a fresh host works unmodified.
+      - ${ARCHIVE_DB_HOST_PATH:-mariadb_archive_data}:/var/lib/mysql
       - ./mariadb/encryption/archive:/etc/mysql/encryption:ro
       - ./mariadb/archive.cnf:/etc/mysql/conf.d/custom.cnf:ro
     healthcheck:
@@ -99,7 +103,9 @@ services:
 
 volumes:
   mariadb_data:
+  mariadb_archive_data:
   redis_data:
+  branding_data:
 
 networks:
   mindrouter_network:

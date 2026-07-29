@@ -130,16 +130,28 @@ docker compose exec app alembic upgrade head
 docker compose exec app python scripts/seed_dev_data.py
 ```
 
-### Default Development Credentials
+### Development Credentials (first admin)
 
-After running the seed script:
+The seed script creates the default groups and **one** user — the initial
+administrator. No other accounts are seeded; other users appear on first SSO
+login or are created by an admin.
 
-| Username | Password | Role | Scheduler Weight |
-|----------|----------|------|-----------------|
-| `admin` | `admin123` | admin | 10 |
-| `faculty1` | `faculty123` | faculty | 3 |
-| `staff1` | `staff123` | staff | 2 |
-| `student1` | `student123` | student | 1 |
+| Username | Password | Group | Scheduler Weight |
+|----------|----------|-------|-----------------|
+| `admin` | `admin123` (override with `ADMIN_PASSWORD`) | admin | 10 |
+
+It also mints an API key for that user and prints it as one parseable line
+(`ADMIN_API_KEY=mr2_…`); the full key is not recoverable afterwards. Optional
+env overrides: `ADMIN_PASSWORD` (admin password), `ADMIN_API_KEY` (use a
+supplied key instead of minting one), `MINT_ADMIN_KEY=1` (mint another key for
+an existing admin).
+
+!!! warning "Development credentials — not for production"
+    `admin123` is a documented default and must never be left in place on a
+    reachable deployment. Seed production with
+    `ADMIN_PASSWORD='<strong secret>' python scripts/seed_dev_data.py`, then
+    change the password from the dashboard. This first admin is what lets you
+    reach Admin → Branding, SSO configuration, and node registration.
 
 ### Accessing the Application
 

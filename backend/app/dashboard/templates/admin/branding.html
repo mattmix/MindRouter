@@ -66,6 +66,18 @@
                                            value="{{ brand.tagline }}" placeholder="{{ defaults.tagline }}" {% if is_read_only %}disabled{% endif %}>
                                     <div class="form-text">Appears in the footer beside the name.</div>
                                 </div>
+                                <div class="mb-3">
+                                    <label class="form-label" for="footer_note">Footer attribution <span class="text-muted">(optional)</span></label>
+                                    <input type="text" class="form-control" id="footer_note" name="footer_note" maxlength="120"
+                                           value="{{ brand.footer_note or '' }}" placeholder="e.g. Powered by Research Computing" {% if is_read_only %}disabled{% endif %}>
+                                    <div class="form-text">Small credit line in the footer of every page, including the public login and status pages. Defaults to &ldquo;{{ defaults.footer_note }}&rdquo;. <strong>Clear the field to remove the line entirely.</strong></div>
+                                </div>
+                                <div class="mb-3">
+                                    <label class="form-label" for="footer_note_url">Footer attribution link <span class="text-muted">(optional)</span></label>
+                                    <input type="text" class="form-control" id="footer_note_url" name="footer_note_url" maxlength="300"
+                                           value="{{ brand.footer_note_url or '' }}" placeholder="https://example.edu" {% if is_read_only %}disabled{% endif %}>
+                                    <div class="form-text">Makes the attribution text a link. Must start with <code>http://</code>, <code>https://</code>, or <code>/</code>. Leave blank for plain text.</div>
+                                </div>
                                 <div class="row">
                                     <div class="col-6 mb-3">
                                         <label class="form-label" for="primary_light_text">Accent — light theme</label>

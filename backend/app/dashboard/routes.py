@@ -4862,6 +4862,8 @@ async def admin_branding_post(
         primary_light = (form.get("primary_light") or "").strip()
         primary_dark = (form.get("primary_dark") or "").strip()
         headline_color = (form.get("headline_color") or "").strip()
+        footer_note = (form.get("footer_note") or "").strip()
+        footer_note_url = (form.get("footer_note_url") or "").strip()
         if app_name and len(app_name) > 80:
             return RedirectResponse(url="/admin/branding?error=Name+too+long+(max+80)", status_code=302)
         if org_name and len(org_name) > 120:
@@ -4874,6 +4876,15 @@ async def admin_branding_post(
             return RedirectResponse(url="/admin/branding?error=Invalid+dark+color", status_code=302)
         if headline_color and not branding_service.is_valid_hex(headline_color):
             return RedirectResponse(url="/admin/branding?error=Invalid+headline+color", status_code=302)
+        if len(footer_note) > 120:
+            return RedirectResponse(url="/admin/branding?error=Footer+attribution+too+long+(max+120)", status_code=302)
+        if len(footer_note_url) > 300:
+            return RedirectResponse(url="/admin/branding?error=Footer+attribution+link+too+long+(max+300)", status_code=302)
+        if footer_note_url and not branding_service.safe_link(footer_note_url):
+            return RedirectResponse(
+                url="/admin/branding?error=Footer+link+must+start+with+http://,+https://,+or+/",
+                status_code=302,
+            )
 
         await crud.set_config(db, branding_service.KEY_APP_NAME, app_name,
                               description="Branding: application/organization name")
@@ -4887,6 +4898,10 @@ async def admin_branding_post(
                               description="Branding: accent color (dark theme)")
         await crud.set_config(db, branding_service.KEY_HEADLINE_COLOR, headline_color,
                               description="Branding: headline/heading text color")
+        await crud.set_config(db, branding_service.KEY_FOOTER_NOTE, footer_note,
+                              description="Branding: footer attribution text ('' hides the line)")
+        await crud.set_config(db, branding_service.KEY_FOOTER_NOTE_URL, footer_note_url,
+                              description="Branding: footer attribution link target")
         return await _finish(f"app_name={app_name}", "/admin/branding?success=identity_updated")
 
     elif action in ("upload_logo_light", "upload_logo_dark", "upload_favicon", "upload_email_logo"):
@@ -4949,6 +4964,11 @@ async def admin_branding_post(
                     branding_service.KEY_LOGO_LIGHT, branding_service.KEY_LOGO_DARK,
                     branding_service.KEY_FAVICON, branding_service.KEY_EMAIL_LOGO):
             await crud.set_config(db, key, "", description="Branding: reset to default")
+        # Footer attribution uses "" to mean "hidden", so clearing it that way
+        # would not be a *reset*. Store JSON null instead → get_config_json()
+        # returns None → _build_view falls back to the shipped DEFAULTS.
+        for key in (branding_service.KEY_FOOTER_NOTE, branding_service.KEY_FOOTER_NOTE_URL):
+            await crud.set_config(db, key, None, description="Branding: reset to default")
         return await _finish("reset all branding", "/admin/branding?success=reset")
 
     return RedirectResponse(url="/admin/branding?error=Unknown+action", status_code=302)

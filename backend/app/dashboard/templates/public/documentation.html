@@ -210,19 +210,31 @@ docker compose exec app alembic upgrade head
 # 4. Seed development data (creates users, quotas, API keys)
 docker compose exec app python scripts/seed_dev_data.py</code></pre>
 
-                <h3>Default Development Credentials</h3>
-                <p>After running the seed script:</p>
+                <h3>Development Credentials (first admin)</h3>
+                <p>The seed script creates the default groups and <strong>one</strong> user &mdash; the initial administrator. No other accounts are seeded; other users are created on first SSO login or by an admin.</p>
                 <table class="table table-bordered table-sm">
                     <thead class="table-light">
                         <tr><th>Username</th><th>Password</th><th>Group</th><th>Scheduler Weight</th></tr>
                     </thead>
                     <tbody>
-                        <tr><td><code>admin</code></td><td><code>admin123</code></td><td>Admin</td><td>10</td></tr>
-                        <tr><td><code>faculty1</code></td><td><code>faculty123</code></td><td>Faculty</td><td>3</td></tr>
-                        <tr><td><code>staff1</code></td><td><code>staff123</code></td><td>Staff</td><td>2</td></tr>
-                        <tr><td><code>student1</code></td><td><code>student123</code></td><td>Student</td><td>1</td></tr>
+                        <tr><td><code>admin</code></td><td><code>admin123</code> (override with <code>ADMIN_PASSWORD</code>)</td><td>Admin</td><td>10</td></tr>
                     </tbody>
                 </table>
+                <p>The script also mints an API key for that user and prints it as a single parseable line (<code>ADMIN_API_KEY=mr2_&hellip;</code>); the full key cannot be shown again. Optional environment overrides:</p>
+                <table class="table table-bordered table-sm">
+                    <thead class="table-light">
+                        <tr><th>Variable</th><th>Effect</th></tr>
+                    </thead>
+                    <tbody>
+                        <tr><td><code>ADMIN_PASSWORD</code></td><td>Password for the seeded admin (default <code>admin123</code>)</td></tr>
+                        <tr><td><code>ADMIN_API_KEY</code></td><td>Use this exact key instead of minting a random one</td></tr>
+                        <tr><td><code>MINT_ADMIN_KEY=1</code></td><td>Mint an additional key for an already-existing admin</td></tr>
+                    </tbody>
+                </table>
+                <div class="alert alert-warning">
+                    <strong>Development credentials &mdash; not for production.</strong>
+                    <code>admin123</code> is a documented default and must never be left in place on a reachable deployment. Seed production once with <code>ADMIN_PASSWORD</code> set to a strong secret, then change the password from the dashboard. This first admin is what lets you reach Admin &rarr; Branding, SSO configuration, and node registration.
+                </div>
 
                 <h3>Accessing the Application</h3>
                 <table class="table table-bordered table-sm">
@@ -2512,7 +2524,7 @@ ARCHIVE_DATABASE_URL=mysql+pymysql://mindrouter_archive:&lt;secure-password&gt;@
                 <p>All operations are batched and use FK-order deletion to maintain referential integrity. Archive inserts use <code>INSERT IGNORE</code> for idempotent re-runs.</p>
 
                 <h3>Storage</h3>
-                <p>The archive database volume can be mounted to a separate, larger disk. In production, <code>docker-compose.prod.yml</code> uses a host bind mount (e.g., <code>/archivedb:/var/lib/mysql</code>) so the archive data can reside on a different filesystem than the primary database.</p>
+                <p>The archive database volume can be mounted to a separate, larger disk. Set <code>ARCHIVE_DB_HOST_PATH</code> to a path on that disk (it defaults to a local <code>./data/archive-mariadb</code> directory) so the archive data can reside on a different filesystem than the primary database.</p>
             </section>
 
             <hr>

@@ -20,6 +20,8 @@ audit log (`branding.*` actions).
 | Organization / app name | Top navbar, browser tab titles, footer |
 | Institution / organization name | Login page SSO button ("Sign in with …") and the SSO helper text |
 | Tagline | Footer, beside the name |
+| Footer attribution | Small credit line in the footer of **every** page, including the public login and status pages ("Powered by …"). Clear it to remove the line entirely. |
+| Footer attribution link | Optional link target for the attribution text (`http://`, `https://`, or a site-relative `/path`); blank renders plain text |
 | Accent color — light theme | Buttons, links, focus rings, stat-card accents (light mode) |
 | Accent color — dark theme | Same, in dark mode |
 | Headline color | Headlines such as the email blog/notification title; defaults to a neutral near-black (light accents read poorly as headline text). Buttons/links keep the accent. |
@@ -48,6 +50,30 @@ sign in."** Which providers get the org-name label depends on which SSO
 providers are enabled; see
 [SSO configuration → Login button labels](sso-configuration.md#login-button-labels-branding-tie-in).
 
+### Footer attribution
+
+The footer carries a small credit line above the NSF award notice. Unlike the
+other fields it is **not blank by default**: MindRouter ships with
+`branding.footer_note` = `Powered by RCDS` and `branding.footer_note_url` =
+`https://hpc.uidaho.edu`, the operator credit for the reference deployment at
+the University of Idaho, so upgrading an existing install changes nothing.
+
+Any deployment can rewrite both fields (Admin → Branding → *Footer attribution*
+/ *Footer attribution link*, max 120 / 300 chars) or **clear the text field to
+remove the line altogether** — an explicitly-saved empty value is honored and
+is *not* replaced by the default. So a fresh install elsewhere shows
+"Powered by RCDS" until an admin changes or removes it; that is the one branding
+field a new operator should review before going live.
+
+The link is validated on save: only `http://`, `https://`, and site-relative
+`/path` targets are stored, and only such values are ever emitted into the
+`href` (so a stored value cannot become a `javascript:` URL). With no link set,
+the attribution renders as plain text.
+
+The NSF award credit beside it is **product** attribution for the grant that
+funded MindRouter, not deployment branding, and is intentionally not
+configurable.
+
 Logos appear in the **navbar (header)**, the **footer**, and the **login card**.
 The navbar always has a dark background, so it uses the dark-theme logo (falling
 back to the light one); the footer and login card follow the active theme and
@@ -60,8 +86,10 @@ applied site-wide until you click **Save**.
 Use **Reset to defaults** to restore the stock MindRouter name, colors, and
 remove all uploaded assets. It clears the institution name too, so the login
 page returns to generic SSO wording. An install with no branding configured
-looks the same way: stock name and colors, no logo on the login card, and
-"Sign in with SSO" / "Use your organization credentials to sign in."
+looks the same way: stock name and colors, no logo on the login card,
+"Sign in with SSO" / "Use your organization credentials to sign in." — and the
+default "Powered by RCDS" footer attribution, since reset restores shipped
+defaults rather than blanking every field.
 
 ## Accessible accent colors (contrast handling)
 

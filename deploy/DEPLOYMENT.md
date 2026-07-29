@@ -11,6 +11,14 @@
 
 > **Request body size limits must stay in lockstep across the chain.** The effective limiter should be the app's `MAX_REQUEST_SIZE` (default 50 MB), which returns a clean JSON error. Every proxy in front of AND behind the app must allow more: the gateway nginx (`client_max_body_size 500m` in this repo's config) and — easy to forget — the **nginx TLS proxies on each GPU inference node**, which get a raw nginx default of 1 MB unless configured. Full-transcript agent clients (Codex/Responses API) exceed 1 MB routinely and will see opaque `413 Request Entity Too Large` HTML from the node proxy. Each inference node carries `/etc/nginx/conf.d/00-body-size.conf` with `client_max_body_size 64m;` (http-level, covers all server blocks). If you raise `MAX_REQUEST_SIZE`, raise the node configs too.
 
+> **Which Compose file this guide uses.** Every command below drives **`docker-compose.prod.yml`** — the hardened stack (nginx TLS terminator, no host-exposed database or Redis, configured through `env_file: .env.prod`). The flag is not optional; each `docker compose` invocation must name the file:
+>
+> ```bash
+> docker compose -f docker-compose.prod.yml <command>
+> ```
+>
+> The repository ships a **second, different stack** in `docker-compose.yml`, and that is what a bare `docker compose up -d` starts — host networking, an `environment:` passthrough block instead of `env_file:`, and its own volume layout. On a host deployed with this guide, a bare `docker compose` command does **not** restart your stack; it brings up the other one alongside it. If you want the bare commands to resolve correctly anyway, export `COMPOSE_FILE=docker-compose.prod.yml` in the deployment shell.
+
 ## Step 1: Install Dependencies (if needed)
 
 ```bash
@@ -57,6 +65,27 @@ nano .env.prod
 - `MYSQL_PASSWORD` and in `DATABASE_URL` - Same secure password
 - `REDIS_PASSWORD` and in `REDIS_URL` - Same secure password
 - `CORS_ORIGINS` - Your actual domain
+- `APP_BASE_URL` - Your own public HTTPS origin, e.g. `https://mindrouter.example.com` (scheme + host, no trailing slash or path)
+- `ARCHIVE_DB_HOST_PATH`, `ARTIFACT_HOST_PATH`, `VIDEO_HOST_PATH` - Host directories for persistent data (see below)
+
+> **`APP_BASE_URL` must be set to *your* hostname before enabling SSO.** Every OIDC and Google redirect URI, and the SAML `Destination`/`Recipient` check, is derived from this value rather than from request headers. Nothing validates it at startup, so a wrong value never fails loudly — you get a working-looking deployment whose only symptom is a `redirect_uri_mismatch` at the identity provider, which reads like an IdP misconfiguration. Leaving it blank is equally wrong: the code then falls back to the request's scheme and `Host` header. Set it in Step 3, before you configure any provider.
+
+**Host data paths.** Several data sets live in directories on the host rather than in named volumes. Point each variable at an absolute path that exists on *this* machine:
+
+| Variable | Holds |
+|----------|-------|
+| `ARCHIVE_DB_HOST_PATH` | Archive MariaDB data directory (the `mariadb-archive` service) |
+| `ARTIFACT_HOST_PATH` | Generated image artifacts served back to users |
+| `VIDEO_HOST_PATH` | Generated video files |
+
+Create them, and hand the app's directories to uid 1000, **before** the first start:
+
+```bash
+sudo mkdir -p /srv/mindrouter/{archivedb,artifacts,video}
+sudo chown -R 1000:1000 /srv/mindrouter/artifacts /srv/mindrouter/video
+```
+
+The `chown` is the part that bites. Docker silently creates a missing bind-mount source as a **root-owned** directory, while the application container runs as **uid 1000**. A root-owned artifact directory does not stop anything: the container starts, passes its health check, serves traffic, and then every artifact and upload write fails at runtime, long after the deploy looked successful. Leave the archive database directory alone — the MariaDB image initializes and takes ownership of its own data directory on first start.
 
 ## Step 4: Configure SSL Certificate
 
@@ -130,10 +159,72 @@ docker compose -f docker-compose.prod.yml logs -f app
 ```bash
 # Run Alembic migrations
 docker compose -f docker-compose.prod.yml exec app alembic upgrade head
-
-# Seed initial admin user (optional)
-docker compose -f docker-compose.prod.yml exec app python scripts/seed_dev_data.py
 ```
+
+## Step 9b: Bootstrap the First Admin Account
+
+A fresh database has **no users**. Until an admin exists you cannot reach the
+admin dashboard at all — including **Admin → Branding**, which supplies the
+institution name used as the SSO button label, and **Admin → Groups**, which
+must contain any group you name in an SSO `*_DEFAULT_GROUP` variable. Treat this
+step as required, not optional.
+
+The bootstrap tool is `scripts/seed_dev_data.py`. Its banner says
+"MindRouter Development Data Seeder", but it is the only first-admin path
+shipped, and it is safe to run in production **provided you set a password**:
+
+```bash
+docker compose -f docker-compose.prod.yml exec \
+  -e ADMIN_PASSWORD='<strong-unique-password>' \
+  app python scripts/seed_dev_data.py
+```
+
+What it creates:
+
+- The seven default groups (`students`, `staff`, `faculty`, `researchers`, `admin`, `nerds`, `other`) if the migrations have not already created them.
+- Exactly **one** user: `admin` / `admin@mindrouter.local`, role `ADMIN`, in the `admin` group, with a quota row. It creates no other accounts.
+- One API key for that user, printed once as a single parseable line, `ADMIN_API_KEY=mr2_...`. Capture it now — it cannot be redisplayed.
+
+Environment overrides it honors:
+
+| Variable | Effect |
+|----------|--------|
+| `ADMIN_PASSWORD` | Password for the admin account. **Defaults to `admin123` if unset** — never accept that default on an internet-reachable host. |
+| `ADMIN_API_KEY` | Use this exact key instead of minting a random one. |
+| `MINT_ADMIN_KEY=1` | Issue an additional API key for an admin that already exists. |
+
+Two behaviors worth knowing before you run it:
+
+- **It is idempotent, and that cuts both ways.** If `admin` already exists the script leaves it untouched and exits without minting a key (unless `ADMIN_API_KEY` or `MINT_ADMIN_KEY` is set). `ADMIN_PASSWORD` therefore applies **only at creation** — it will not reset a forgotten password.
+- **The closing banner always prints `admin / admin123` verbatim**, even when you supplied `ADMIN_PASSWORD`. It is a hardcoded string, not a readback of what was set. Ignore it and use the password you passed.
+
+Then, immediately:
+
+1. Log in at `https://your-domain/login` as `admin`.
+2. Change the password from the account page (do this even if you set a strong `ADMIN_PASSWORD`, since it was visible to your shell history and to anyone reading the deploy transcript).
+3. Set **Admin → Branding → Institution / organization name** if you plan to enable SSO — it is what the primary SSO button is labeled with.
+
+## Single sign-on (optional)
+
+SSO is **entirely environment-variable driven** — there is no admin-UI toggle. A
+provider is on when its required variables are present in `.env.prod` and off
+when they are unset.
+
+- **Azure AD / Entra ID, Google, generic OIDC, and SAML 2.0 are independent**, and any subset can run at once. The login page renders one button per enabled provider.
+- **Local username/password login never goes away.** SSO buttons appear alongside the local form, so the admin account from Step 9b remains usable if an IdP breaks.
+- **`APP_BASE_URL` must already be correct** (Step 3). Redirect URIs and the SAML `Destination` check are built from it.
+- **SAML requires HTTPS.** Its SP-initiated handshake relies on a `SameSite=None; Secure` cookie, which browsers drop over plain HTTP.
+- **Button labels come from Admin → Branding**, so complete Step 9b first.
+- **Restart after changing any SSO variable** — settings are cached per worker process at startup:
+  ```bash
+  docker compose -f docker-compose.prod.yml up -d
+  ```
+
+Per-provider walkthroughs — app registration, claim/attribute mapping, IdP
+metadata, JIT provisioning, account-linking rules, and the full variable
+reference — are in **[../docs/sso-configuration.md](../docs/sso-configuration.md)**.
+Follow that guide for the provider details; this section only covers how SSO
+fits into the deployment.
 
 ## Step 10: Deploy GPU Sidecar Agents
 
@@ -506,6 +597,9 @@ docker compose -f docker-compose.prod.yml exec app \
 
 - [ ] Changed all default passwords in .env.prod
 - [ ] Generated unique SECRET_KEY
+- [ ] First admin seeded with a strong `ADMIN_PASSWORD` — **not** the built-in `admin123` default — and its password changed after first login
+- [ ] Admin API key printed by the seeder stored in a secret manager, not left in shell history or deploy logs
+- [ ] `APP_BASE_URL` points at this deployment's own hostname (wrong values fail silently and break SSO)
 - [ ] SSL certificate installed and working
 - [ ] Firewall configured (only 80/443 open)
 - [ ] SELinux properly configured

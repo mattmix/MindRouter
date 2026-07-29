@@ -408,20 +408,40 @@ redirect-URI mismatch.
 
 ## Deployment reminder
 
-The app reads settings from the container environment only — `.env` files are
-**not** mounted into the container. Therefore:
+The app reads settings from the **container** environment. How values get there
+depends on which Compose stack the deployment runs, and the two stacks in this
+repo do it differently — check which one you are on before editing anything:
 
-- **Every SSO variable must be listed in `docker-compose.yml` under
-  `environment:`** using `${VAR:-}` passthrough. Every variable in the table
-  above — including `AZURE_AD_DEFAULT_GROUP` — is **already wired through** that
-  `environment:` block, so setting it in the host `.env` is enough; no
-  compose edit is needed.
-- **Values live in `/opt/mindrouter/.env` on the production host.** Docker
-  Compose interpolates them at container start. Never commit client secrets or
-  certificates to the repo.
-- After editing `/opt/mindrouter/.env`, recreate the container
-  (`docker compose up -d`) — a restart is required because settings are cached
-  per process (see Overview).
+| Stack | Put values in | How they reach the container |
+|---|---|---|
+| `docker-compose.yml` (host-networked stack; what a bare `docker compose` command starts) | `/opt/mindrouter/.env` on the host | Compose interpolates `${VAR:-}` into the service's `environment:` block. Every variable in the table above — including `AZURE_AD_DEFAULT_GROUP` — is **already wired through**, so setting it in the env file is enough. |
+| `docker-compose.prod.yml` (nginx/TLS stack; see [../deploy/DEPLOYMENT.md](../deploy/DEPLOYMENT.md)) | `.env.prod` in the deployment directory | The service declares `env_file:`, so the file is handed to the container wholesale. Any variable you add is picked up as-is. |
+
+- **No compose edit is needed for the variables in the table above** on either
+  stack. If you add a variable that is *not* listed there and you run the
+  `docker-compose.yml` stack, add a matching `- NEW_VAR=${NEW_VAR:-}` line to its
+  `environment:` block; the `env_file:` stack needs no such edit.
+- **Secrets stay on the host.** `.env` / `.env.prod` are never committed — no
+  client secrets, no certificates, no private keys in the repo.
+- **Restart with the same Compose file the deployment was started with.**
+  Settings are cached per process (see Overview), so a recreate is required:
+
+  ```bash
+  # docker-compose.yml stack
+  docker compose up -d
+
+  # docker-compose.prod.yml stack
+  docker compose -f docker-compose.prod.yml up -d
+  ```
+
+  These are not interchangeable. Running the bare command on a host started with
+  `-f docker-compose.prod.yml` does not reload your SSO settings — it starts the
+  *other* stack alongside the running one.
+- **`APP_BASE_URL` must name this deployment's own public HTTPS origin** before
+  any provider will work; redirect URIs and the SAML `Destination` check are
+  derived from it. It has a non-empty default, so a stale value produces a
+  plausible-looking config that fails only at the IdP. See the Security notes
+  below.
 
 ---
 

@@ -358,3 +358,98 @@ def test_reset_all_clears_org_name():
     src = (root / "dashboard" / "routes.py").read_text()
     reset_branch = src.split('action == "reset_all"')[1].split("return await _finish")[0]
     assert "KEY_ORG_NAME" in reset_branch
+
+
+# ── Footer attribution (configurable "Powered by …") ─────────────
+
+def test_footer_note_config_keys_and_defaults():
+    assert branding.KEY_FOOTER_NOTE == "branding.footer_note"
+    assert branding.KEY_FOOTER_NOTE_URL == "branding.footer_note_url"
+    # Ships with the reference-deployment credit so existing installs are
+    # unchanged by the field becoming configurable.
+    assert branding.DEFAULTS["footer_note"] == "Powered by RCDS"
+    assert branding.DEFAULTS["footer_note_url"] == "https://hpc.uidaho.edu"
+
+
+def test_build_view_footer_note_default_is_rcds():
+    v = branding._build_view({})
+    assert v["footer_note"] == "Powered by RCDS"
+    assert v["footer_note_url"] == "https://hpc.uidaho.edu"
+    assert v["is_customized"] is False
+
+
+def test_build_view_footer_note_override():
+    v = branding._build_view({
+        "footer_note": "Hosted by Acme Research Computing",
+        "footer_note_url": "https://rc.acme.edu",
+    })
+    assert v["footer_note"] == "Hosted by Acme Research Computing"
+    assert v["footer_note_url"] == "https://rc.acme.edu"
+    assert v["is_customized"] is True
+
+
+def test_build_view_footer_note_empty_string_removes_line():
+    """An explicitly-saved empty value hides the line (NOT replaced by default)."""
+    v = branding._build_view({"footer_note": "", "footer_note_url": ""})
+    assert v["footer_note"] == ""
+    assert v["footer_note_url"] is None
+    assert v["is_customized"] is True
+
+
+def test_build_view_footer_note_text_without_link():
+    v = branding._build_view({"footer_note": "Operated by IT Services", "footer_note_url": ""})
+    assert v["footer_note"] == "Operated by IT Services"
+    assert v["footer_note_url"] is None
+
+
+def test_safe_link_rejects_dangerous_schemes():
+    assert branding.safe_link("https://example.edu") == "https://example.edu"
+    assert branding.safe_link("http://example.edu/x") == "http://example.edu/x"
+    assert branding.safe_link("/about") == "/about"
+    assert branding.safe_link("javascript:alert(1)") is None
+    assert branding.safe_link("data:text/html,<script>") is None
+    assert branding.safe_link("example.edu") is None
+    assert branding.safe_link("") is None
+    assert branding.safe_link(None) is None
+
+
+def test_build_view_footer_note_url_drops_unsafe_value():
+    v = branding._build_view({"footer_note": "Credit", "footer_note_url": "javascript:alert(1)"})
+    assert v["footer_note_url"] is None
+
+
+def test_base_template_footer_note_is_branding_driven():
+    """base.html is the parent of the login/status/dashboard pages: the footer
+    attribution must come from branding, not a hardcoded institution link."""
+    import pathlib
+    root = pathlib.Path(__file__).resolve().parents[2]
+    src = (root / "dashboard" / "templates" / "base.html").read_text()
+    assert "hpc.uidaho.edu" not in src
+    assert "{% if brand.footer_note %}" in src
+    assert "{{ brand.footer_note }}" in src
+    assert "{{ brand.footer_note_url }}" in src
+    # The NSF award credit is product attribution for the grant — stays put.
+    assert "NSF Award #2427549" in src
+
+
+def test_branding_form_and_routes_handle_footer_note():
+    import pathlib
+    root = pathlib.Path(__file__).resolve().parents[2]
+    form_src = (root / "dashboard" / "templates" / "admin" / "branding.html").read_text()
+    assert 'name="footer_note"' in form_src
+    assert 'name="footer_note_url"' in form_src
+    routes_src = (root / "dashboard" / "routes.py").read_text()
+    save_branch = routes_src.split('action == "save_identity"')[1].split("elif action in")[0]
+    assert "KEY_FOOTER_NOTE" in save_branch
+    assert "KEY_FOOTER_NOTE_URL" in save_branch
+
+
+def test_reset_all_restores_footer_note_default():
+    """Reset must restore the shipped default, not persist "" (= hidden)."""
+    import pathlib
+    root = pathlib.Path(__file__).resolve().parents[2]
+    src = (root / "dashboard" / "routes.py").read_text()
+    reset_branch = src.split('action == "reset_all"')[1].split("return await _finish")[0]
+    assert "KEY_FOOTER_NOTE" in reset_branch
+    assert "KEY_FOOTER_NOTE_URL" in reset_branch
+    assert "key, None" in reset_branch  # JSON null → _build_view falls back to DEFAULTS

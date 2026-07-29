@@ -1,13 +1,15 @@
 services:
-  # Ensures the video artifact dir is owned by the app user (uid 1000) before the
-  # app starts. Docker auto-creates a missing bind-mount source as root, which
-  # the non-root app can't write to; this runs as root and fixes it idempotently.
-  video-storage-init:
+  # Ensures the bind-mounted storage dirs are owned by the app user (uid 1000)
+  # before the app starts. Docker auto-creates a missing bind-mount source as
+  # root, which the non-root app can't write to; this runs as root and fixes it
+  # idempotently. Every host-path bind mount used by `app` belongs here.
+  storage-init:
     image: busybox:1.36
     user: "0:0"
     volumes:
-      - /archivedb/video:/data/video
-    command: sh -c "mkdir -p /data/video && chown -R 1000:1000 /data/video"
+      - ${VIDEO_HOST_PATH:-./data/video}:/data/video
+      - ${ARTIFACT_HOST_PATH:-./data/artifacts}:/data/artifacts
+    command: sh -c "mkdir -p /data/video /data/artifacts && chown 1000:1000 /data/video /data/artifacts"
     restart: "no"
 
   app:
@@ -52,7 +54,9 @@ services:
       - SAML_ATTR_NAME=${SAML_ATTR_NAME:-displayName}
       - SAML_ATTR_USERNAME=${SAML_ATTR_USERNAME:-eduPersonPrincipalName}
       - BRAVE_SEARCH_API_KEY=${BRAVE_SEARCH_API_KEY:-}
-      - APP_BASE_URL=${APP_BASE_URL:-https://mindrouter.uidaho.edu}
+      # Public HTTPS origin of this deployment — set it in .env (SSO redirect
+      # URIs and SAML Destination validation derive from it).
+      - APP_BASE_URL=${APP_BASE_URL:-}
       - ARCHIVE_DATABASE_URL=mysql+pymysql://mindrouter_archive:${MYSQL_ARCHIVE_PASSWORD:-archive_password}@127.0.0.1:3307/mindrouter_archive
       - OTEL_ENABLED=${OTEL_ENABLED:-false}
       - OTEL_EXPORTER_OTLP_ENDPOINT=${OTEL_EXPORTER_OTLP_ENDPOINT:-}
@@ -75,8 +79,8 @@ services:
       - BRANDING_STORAGE_PATH=${BRANDING_STORAGE_PATH:-/data/branding}
       - BRANDING_MAX_LOGO_MB=${BRANDING_MAX_LOGO_MB:-4}
     volumes:
-      - /archivedb/artifacts:/data/artifacts
-      - /archivedb/video:/data/video
+      - ${ARTIFACT_HOST_PATH:-./data/artifacts}:/data/artifacts
+      - ${VIDEO_HOST_PATH:-./data/video}:/data/video
       - chat_data:/data/chat_files
       - branding_data:/data/branding
       - ./backend:/app/backend:ro
@@ -87,7 +91,7 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-      video-storage-init:
+      storage-init:
         condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/healthz"]
@@ -128,7 +132,7 @@ services:
       - MYSQL_PASSWORD=${MYSQL_ARCHIVE_PASSWORD:-archive_password}
       - MYSQL_TCP_PORT=3307
     volumes:
-      - /archivedb/mariadb:/var/lib/mysql
+      - ${ARCHIVE_DB_HOST_PATH:-./data/archive-mariadb}:/var/lib/mysql
       - ./mariadb/archive.cnf:/etc/mysql/conf.d/custom.cnf:ro
     healthcheck:
       test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]

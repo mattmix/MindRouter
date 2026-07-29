@@ -167,16 +167,32 @@ curl -X POST http://localhost:8000/api/generate \
 - **Chat Interface**: `http://localhost:8000/chat` - Full-featured chat with file upload, web search, streaming
 - **Admin Dashboard**: `http://localhost:8000/admin` - Full system control
 
-### Default Development Credentials
+### Development Credentials (first admin)
 
-After running the seed script:
+`scripts/seed_dev_data.py` creates the default groups and **one** user — the
+initial administrator. No other accounts are seeded; everyone else is created on
+first SSO login (or by an admin).
 
-| User | Password | Role |
-|------|----------|------|
-| admin | admin123 | admin |
-| faculty1 | faculty123 | faculty |
-| staff1 | staff123 | staff |
-| student1 | student123 | student |
+| User | Password | Group |
+|------|----------|-------|
+| `admin` | `admin123` (override with `ADMIN_PASSWORD`) | admin |
+
+The script also mints an API key for that user and prints it as a single
+parseable line, `ADMIN_API_KEY=mr2_…`. It cannot be shown again. Automation
+overrides (all optional env vars):
+
+| Env var | Effect |
+|---------|--------|
+| `ADMIN_PASSWORD` | Password for the seeded admin (default `admin123`) |
+| `ADMIN_API_KEY` | Use this exact key instead of minting a random one |
+| `MINT_ADMIN_KEY=1` | Mint an additional key for an already-existing admin |
+
+> **Development only.** `admin123` is a well-known password — never run the
+> seeder with defaults on an internet-reachable deployment. For production, run
+> it once with `ADMIN_PASSWORD` set to a strong secret (and `ADMIN_API_KEY` if
+> you manage keys elsewhere), then change the password from the dashboard.
+> You need this first admin to reach Admin → Branding, SSO, and node
+> configuration.
 
 ## Architecture
 

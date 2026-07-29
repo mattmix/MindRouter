@@ -206,7 +206,9 @@
             </div>
             {% endif %}
             <small>{{ brand.app_name }}{% if brand.tagline %} - {{ brand.tagline }}{% endif %}</small><br>
-            <small>Powered by <a href="https://hpc.uidaho.edu" class="text-muted">RCDS</a></small><br>
+            {% if brand.footer_note %}
+            <small>{% if brand.footer_note_url %}<a href="{{ brand.footer_note_url }}" class="text-muted">{{ brand.footer_note }}</a>{% else %}{{ brand.footer_note }}{% endif %}</small><br>
+            {% endif %}
             <small class="d-inline-flex align-items-center gap-1 mt-1">
                 <img src="/static/img/nsf-logo.png" alt="NSF" height="16">
                 This project was developed with support from the National Science Foundation

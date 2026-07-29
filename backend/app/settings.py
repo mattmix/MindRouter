@@ -53,7 +53,11 @@ class Settings(BaseSettings):
     # Application
     app_name: str = "MindRouter"
     app_version: str = Field(default_factory=_get_version)
-    app_base_url: str = "https://mindrouter.uidaho.edu"
+    # Public HTTPS origin of THIS deployment (scheme + host, no trailing path).
+    # Must be set per deployment: SSO redirect URIs (Azure/Google/OIDC) and SAML
+    # Destination/Recipient validation are derived from it, so a wrong value
+    # sends users to another org's host and fails as redirect_uri_mismatch.
+    app_base_url: str = "https://your-domain.example.com"
     debug: bool = False
     reload: bool = False
 

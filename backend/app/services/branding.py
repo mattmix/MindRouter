@@ -46,6 +46,8 @@ KEY_LOGO_DARK = "branding.logo_dark"        # stored filename
 KEY_FAVICON = "branding.favicon"            # stored filename
 KEY_EMAIL_LOGO = "branding.email_logo"      # stored filename — RASTER (email clients can't render SVG)
 KEY_HEADLINE_COLOR = "branding.headline_color"  # headline/heading text color (e.g. email blog title)
+KEY_FOOTER_NOTE = "branding.footer_note"        # footer attribution line ("Powered by …"); "" hides it
+KEY_FOOTER_NOTE_URL = "branding.footer_note_url"  # optional link target for the attribution text
 
 # Product defaults (used when a value is unset or invalid). These mirror the
 # stock MindRouter look so an un-branded install is unchanged.
@@ -63,6 +65,15 @@ DEFAULTS: dict[str, Any] = {
     # Neutral near-black by default: headlines shouldn't use a light brand-accent
     # shade (per U of I brand guidance). Admin-configurable.
     "headline_color": "#231f20",
+    # Footer attribution line, shown on every page including the public login and
+    # status pages. Ships with the operator credit for the reference deployment
+    # (RCDS at the University of Idaho) so existing installs are unchanged; any
+    # deployment can rewrite it or clear it (save an empty value) from
+    # Admin → Branding. Unlike the other text fields, an explicitly-saved empty
+    # string is honored and hides the line entirely — it is NOT replaced by the
+    # default (same "" means removed" convention as ``tagline``).
+    "footer_note": "Powered by RCDS",
+    "footer_note_url": "https://hpc.uidaho.edu",
 }
 
 _HEX_RE = re.compile(r"^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$")
@@ -213,6 +224,22 @@ def _asset_url(filename: Optional[str]) -> Optional[str]:
     return f"/branding/asset/{filename}"
 
 
+# Link targets we are willing to emit into an ``href``: an absolute http(s) URL
+# or a site-relative path. Anything else (notably ``javascript:`` / ``data:``) is
+# dropped, so an admin-stored config value can never become an XSS vector.
+_SAFE_LINK_RE = re.compile(r"^(?:https?://\S+|/\S*)$", re.IGNORECASE)
+
+
+def safe_link(value: Any) -> Optional[str]:
+    """Return ``value`` if it is a safe href, else None (renders as plain text)."""
+    if not isinstance(value, str):
+        return None
+    v = value.strip()
+    if not v or not _SAFE_LINK_RE.match(v):
+        return None
+    return v
+
+
 def _build_view(raw: dict[str, Any]) -> dict[str, Any]:
     """Merge raw config with defaults and add derived/template-ready fields."""
     app_name = (raw.get("app_name") or "").strip() or DEFAULTS["app_name"]
@@ -227,12 +254,23 @@ def _build_view(raw: dict[str, Any]) -> dict[str, Any]:
     logo_dark = raw.get("logo_dark") or None
     favicon = raw.get("favicon") or None
     email_logo = raw.get("email_logo") or None
+    # Footer attribution. Unset (None) → shipped default; explicitly saved empty
+    # string → hidden. Same convention as ``tagline``, so a deployment that wants
+    # no attribution can remove it without editing templates.
+    raw_note = raw.get("footer_note")
+    footer_note = DEFAULTS["footer_note"] if raw_note is None else str(raw_note).strip()
+    raw_note_url = raw.get("footer_note_url")
+    footer_note_url = safe_link(
+        DEFAULTS["footer_note_url"] if raw_note_url is None else raw_note_url
+    )
 
     view: dict[str, Any] = {
         "app_name": app_name,
         "org_name": org_name,
         "tagline": tagline,
         "headline_color": headline_color,
+        "footer_note": footer_note,
+        "footer_note_url": footer_note_url,
         # Raw stored filenames (used by the admin form / removal).
         "logo_light_file": logo_light,
         "logo_dark_file": logo_dark,
@@ -252,6 +290,8 @@ def _build_view(raw: dict[str, Any]) -> dict[str, Any]:
             or primary_light != DEFAULTS["primary_light"]
             or primary_dark != DEFAULTS["primary_dark"]
             or headline_color != DEFAULTS["headline_color"]
+            or footer_note != DEFAULTS["footer_note"]
+            or footer_note_url != DEFAULTS["footer_note_url"]
             or logo_light or logo_dark or favicon or email_logo
         ),
     }
@@ -268,6 +308,8 @@ async def load_branding(db) -> dict[str, Any]:
         "primary_light": await crud.get_config_json(db, KEY_PRIMARY_LIGHT, None),
         "primary_dark": await crud.get_config_json(db, KEY_PRIMARY_DARK, None),
         "headline_color": await crud.get_config_json(db, KEY_HEADLINE_COLOR, None),
+        "footer_note": await crud.get_config_json(db, KEY_FOOTER_NOTE, None),
+        "footer_note_url": await crud.get_config_json(db, KEY_FOOTER_NOTE_URL, None),
         "logo_light": await crud.get_config_json(db, KEY_LOGO_LIGHT, None),
         "logo_dark": await crud.get_config_json(db, KEY_LOGO_DARK, None),
         "favicon": await crud.get_config_json(db, KEY_FAVICON, None),
