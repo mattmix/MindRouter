@@ -279,10 +279,15 @@ docker compose exec app python scripts/seed_dev_data.py</code></pre>
                 <p class="text-muted">This section covers <em>API</em> authentication. Interactive sign-in to the web dashboard &mdash; local accounts plus optional Azure AD, SAML, OIDC, or Google single sign-on &mdash; is covered under <a href="#sso">Single Sign-On (SSO)</a>.</p>
 
                 <h3>Error Responses</h3>
-                <p>All error responses follow a consistent format:</p>
-                <pre><code>{
-  "detail": "Human-readable error message"
-}</code></pre>
+                <p>MindRouter registers <strong>no <code>HTTPException</code> handler</strong> &mdash; the only handler in <code>main.py</code> catches bare <code>Exception</code> &mdash; so on most endpoints FastAPI's default <code>detail</code> wrapper is applied to every error. The value of <code>detail</code> is either a plain string or a nested OpenAI-shaped error object:</p>
+                <pre><code>// flat string detail (400 / 401 / 429 / 503)
+{"detail": "Invalid JSON body"}
+{"detail": "No healthy backends available for this model"}
+
+// nested OpenAI-shaped object (404 unknown model)
+{"detail": {"error": {"message": "The model 'foo' does not exist",
+                      "type": "invalid_request_error",
+                      "code": "model_not_found"}}}</code></pre>
                 <p>Common HTTP status codes:</p>
                 <table class="table table-bordered table-sm">
                     <thead class="table-light">
@@ -294,6 +299,7 @@ docker compose exec app python scripts/seed_dev_data.py</code></pre>
                         <tr><td>403</td><td>Insufficient permissions (e.g., non-admin accessing admin endpoint)</td></tr>
                         <tr><td>404</td><td>Resource not found</td></tr>
                         <tr><td>409</td><td>Conflict (duplicate name, URL, etc.)</td></tr>
+                        <tr><td>413</td><td>Request body exceeds the reverse proxy's <code>client_max_body_size</code> (<code>50m</code> in <code>nginx/nginx.conf</code>), or an uploaded OCR file exceeds <code>ocr.max_file_size_mb</code>. The application itself enforces no global body limit &mdash; see <a href="#configuration-reference"><code>MAX_REQUEST_SIZE</code></a>.</td></tr>
                         <tr><td>429</td><td>Rate limit exceeded</td></tr>
                         <tr><td>500</td><td>Internal server error</td></tr>
                     </tbody>
@@ -302,13 +308,16 @@ docker compose exec app python scripts/seed_dev_data.py</code></pre>
                 <h4>Error Response Formats by API Style</h4>
                 <p>Error response formats differ depending on which API style the client is using:</p>
                 <ul>
-                    <li><strong>OpenAI</strong> (<code>/v1/*</code>) &mdash; Returns a nested error object: <code>{"error": {"message": "...", "type": "...", "code": ...}}</code></li>
+                    <li><strong>OpenAI</strong> (<code>/v1/*</code>) &mdash; Wrapped in <code>detail</code>, as shown above. The <code>detail</code> value is either a plain string or a nested <code>{"error": {...}}</code> object.</li>
+                    <li><strong>Responses and Conversations</strong> (<code>/v1/responses*</code>, <code>/v1/conversations*</code>) &mdash; The only endpoints that emit the true bare OpenAI envelope: <code>{"error": {"message": "...", "type": "...", "param": null, "code": "..."}}</code>. These routes build their own <code>JSONResponse</code> and re-shape service <code>HTTPException</code>s into that form.</li>
                     <li><strong>Ollama</strong> (<code>/api/*</code>) &mdash; Returns a plain detail string: <code>{"detail": "..."}</code></li>
                     <li><strong>Anthropic</strong> (<code>/anthropic/v1/*</code>) &mdash; Returns a typed error object: <code>{"type": "error", "error": {"type": "...", "message": "..."}}</code></li>
                 </ul>
+                <p><strong>Parse errors by HTTP status code, not by body shape.</strong> Outside <code>/v1/responses</code> and <code>/v1/conversations</code>, <code>detail</code> may hold either a string or an <code>{"error": {...}}</code> object, so an OpenAI SDK that expects <code>error.message</code> at the top level will not find it and may surface the failure as an opaque unknown-format error.</p>
 
                 <h3>Model Name Matching</h3>
-                <p>Model names in requests are matched <strong>exactly</strong> against the model catalog. There is no prefix matching, alias resolution, or fuzzy matching. The <code>model</code> field must match a model name as listed by <code>/v1/models</code> or <code>/api/tags</code>.</p>
+                <p>Model names in requests are matched <strong>exactly</strong> against the model catalog. There is no prefix matching and no fuzzy matching &mdash; the <code>model</code> field must exactly match either a model name or a configured alias as listed by <code>/v1/models</code> or <code>/api/tags</code>.</p>
+                <p><strong>Aliases</strong> are resolved on every inference endpoint (chat completions, completions, embeddings, rerank, score, tokenize, OCR, images, video, Ollama, Anthropic, and Responses). Alias entries are listed alongside real models in <code>/v1/models</code> and <code>/api/tags</code>, inheriting the target's metadata and adding <code>"is_alias": true</code> and <code>"alias_target": "&lt;real model name&gt;"</code>. Aliases are administrator-defined (Admin &gt; Models, stored in the <code>model_aliases</code> table), so the set published on any given deployment is purely a matter of local configuration. A common convention is to name them for an intent rather than a model version &mdash; for example <code>default-llm</code>, <code>default-llm-large</code>, <code>default-agent</code>, <code>default-coder</code>, <code>default-embedding</code> &mdash; so clients can pin a role and let the operator repoint it as models are upgraded.</p>
 
                 <h3>OpenAI-Compatible Endpoints</h3>
                 <p>These endpoints accept and return data in the OpenAI API format. Any OpenAI-compatible client or SDK can be pointed at MindRouter by changing the base URL.</p>
@@ -319,11 +328,14 @@ docker compose exec app python scripts/seed_dev_data.py</code></pre>
                     <tbody>
                         <tr><td>POST</td><td><code>/v1/chat/completions</code></td><td>API Key</td><td>Chat completions (streaming and non-streaming)</td></tr>
                         <tr><td>POST</td><td><code>/v1/responses</code></td><td>API Key</td><td>OpenAI Responses API &mdash; agent clients (Codex), typed items and SSE events</td></tr>
-                        <tr><td>POST</td><td><code>/v1/completions</code></td><td>API Key</td><td>Text completions (legacy)</td></tr>
+                        <tr><td>POST</td><td><code>/v1/completions</code></td><td>API Key</td><td>Text completions (legacy) &mdash; converted to a chat request internally, so the response is a <code>chat.completion</code> object, not <code>text_completion</code></td></tr>
                         <tr><td>POST</td><td><code>/v1/embeddings</code></td><td>API Key</td><td>Generate embeddings</td></tr>
                         <tr><td>POST</td><td><code>/v1/rerank</code></td><td>API Key</td><td>Rerank documents against a query</td></tr>
                         <tr><td>POST</td><td><code>/v1/score</code></td><td>API Key</td><td>Score similarity between text pairs</td></tr>
                         <tr><td>POST</td><td><code>/v1/tokenize</code></td><td>API Key</td><td>Count input tokens for a request</td></tr>
+                        <tr><td>POST</td><td><code>/v1/ocr</code></td><td>API Key</td><td><a href="#ocr">OCR</a> images/PDFs/Office docs to markdown or JSON (multipart)</td></tr>
+                        <tr><td>POST</td><td><code>/v1/ocrmd</code></td><td>API Key</td><td>Same OCR pipeline as <code>/v1/ocr</code>, returns raw <code>text/markdown</code></td></tr>
+                        <tr><td>POST</td><td><code>/v1/search</code></td><td>API Key</td><td><a href="#web-search">Web search</a> via the configured provider (also served at <code>/api/search</code>)</td></tr>
                         <tr><td>POST</td><td><code>/v1/images/generations</code></td><td>API Key</td><td><a href="#image-generation">Image generation</a> (diffusion models; requires per-account enablement)</td></tr>
                         <tr><td>POST</td><td><code>/v1/images/edits</code></td><td>API Key</td><td><a href="#image-edits">Image-to-image / reference edit</a> (multipart)</td></tr>
                         <tr><td>POST</td><td><code>/v1/videos</code></td><td>API Key</td><td><a href="#video-generation">Video generation</a> (async; text-to-video + keyframe conditioning)</td></tr>
@@ -352,7 +364,7 @@ docker compose exec app python scripts/seed_dev_data.py</code></pre>
 
                 <p><strong>Response:</strong></p>
                 <pre><code>{
-  "id": "chatcmpl-abc123...",
+  "id": "3f2a9c14-8d5e-4b71-9a03-1c6e5f88b2d7",
   "object": "chat.completion",
   "created": 1700000000,
   "model": "llama3.2",
@@ -397,6 +409,9 @@ docker compose exec app python scripts/seed_dev_data.py</code></pre>
   "max_completion_tokens": 16384
 }</code></pre>
                 <p>When thinking is enabled, the response includes <code>reasoning_content</code> alongside <code>content</code>.</p>
+                <div class="alert alert-info">
+                    <strong>Reasoning is OFF by default &mdash; this is a gateway policy, not the model's own default.</strong> When a request omits every thinking control, the inference service sets <code>think = false</code> on the outbound backend call (<code>chat_template_kwargs: {"enable_thinking": false}</code> to vLLM, <code>think: false</code> to Ollama), so a thinking-capable model returns no <code>reasoning_content</code> unless you opt in. The policy is the <code>THINKING_OFF_BY_DEFAULT</code> setting (default <code>true</code>) and it applies on both the streaming and non-streaming paths. Models whose name contains <code>gpt-oss</code> are exempt &mdash; they use <code>reasoning_effort</code> and are left untouched.
+                </div>
                 <div class="alert alert-warning">
                     <strong>Important:</strong> Thinking models can consume large numbers of output tokens for reasoning. Use <code>max_completion_tokens</code> (or <code>max_tokens</code>) to set an adequate budget &mdash; 16384 is recommended for qwen3.5-400b with thinking enabled.
                 </div>
@@ -549,7 +564,8 @@ max_tokens    = min(requested_max_tokens, remaining, 65536)</code></pre>
         "multimodal": false,
         "embeddings": false,
         "structured_output": true,
-        "thinking": false
+        "thinking": false,
+        "tools": false
       },
       "backends": ["node1-gpu0", "node1-gpu2"],
       "context_length": 32768,
@@ -568,7 +584,9 @@ max_tokens    = min(requested_max_tokens, remaining, 65536)</code></pre>
                     <li><code>quantization</code> &mdash; quantization level (e.g. "Q4_K_M", "FP16")</li>
                     <li><code>family</code> &mdash; model family (e.g. "llama", "qwen2")</li>
                     <li><code>capabilities.thinking</code> &mdash; whether the model supports thinking/reasoning mode</li>
+                    <li><code>capabilities.tools</code> &mdash; whether the model supports tool/function calling</li>
                 </ul>
+                <p>Configured <a href="#api-reference">aliases</a> are appended to the same <code>data</code> list. An alias entry inherits its target's metadata and adds <code>"is_alias": true</code> and <code>"alias_target"</code>.</p>
 
                 <h4 id="image-generation">Image Generation</h4>
                 <p><code>POST /v1/images/generations</code> generates images with the cluster's diffusion backends (FLUX family), using the OpenAI Images API request/response shape plus diffusion-specific extensions. A browser-based playground with the same capabilities is available at <a href="/images">/images</a> in the dashboard (generate, save, history).</p>
@@ -871,6 +889,7 @@ message = client.messages.create(
                         <tr><td>GET</td><td><code>/v1/responses/{id}</code></td><td>API Key</td><td>Retrieve a stored response</td></tr>
                         <tr><td>DELETE</td><td><code>/v1/responses/{id}</code></td><td>API Key</td><td>Delete a stored response</td></tr>
                         <tr><td>GET</td><td><code>/v1/responses/{id}/input_items</code></td><td>API Key</td><td>List a stored response's input items (paginated)</td></tr>
+                        <tr><td>POST</td><td><code>/v1/responses/{id}/cancel</code></td><td>API Key</td><td>Cancel a background response &mdash; always <code>400</code>, since background mode is unsupported (<code>404</code> if the id is unknown)</td></tr>
                         <tr><td>POST / GET / DELETE</td><td><code>/v1/conversations</code>, <code>/v1/conversations/{id}</code></td><td>API Key</td><td>Conversations API: durable conversation objects (<code>conv_*</code>)</td></tr>
                         <tr><td>POST / GET / DELETE</td><td><code>/v1/conversations/{id}/items[/{item_id}]</code></td><td>API Key</td><td>Conversation item CRUD (create up to 20 at a time; paginated list)</td></tr>
                     </tbody>
@@ -1012,6 +1031,7 @@ client.conversations.delete(conv.id)               # delete state anytime</code>
                     <li><code>background</code> mode, file inputs (<code>input_file</code>, <code>file_id</code>), and stream replay of stored responses (<code>GET ?stream=true</code>) are not supported.</li>
                 </ul>
                 <p>Errors use the OpenAI envelope: <code>{"error": {"message", "type", "param", "code"}}</code>.</p>
+                <p>The whole surface is gated by the <code>RESPONSES_API_ENABLED</code> setting (default <code>true</code>). When it is false, every route in both the Responses and Conversations routers returns <code>404</code> with <em>"The Responses API is not enabled on this server."</em> / <em>"The Conversations API is not enabled on this server."</em></p>
 
                 <h3>Health &amp; Metrics Endpoints</h3>
                 <p>These endpoints are unauthenticated and intended for monitoring infrastructure.</p>
@@ -1037,16 +1057,20 @@ client.conversations.delete(conv.id)               # delete state anytime</code>
                         <tr><th>Metric</th><th>Type</th><th>Labels</th><th>Description</th></tr>
                     </thead>
                     <tbody>
-                        <tr><td><code>mindrouter_requests_total</code></td><td>Counter</td><td><code>endpoint</code>, <code>status</code></td><td>Total requests processed</td></tr>
-                        <tr><td><code>mindrouter_request_latency_seconds</code></td><td>Histogram</td><td><code>endpoint</code></td><td>Request latency</td></tr>
-                        <tr><td><code>mindrouter_queue_size</code></td><td>Gauge</td><td>&mdash;</td><td>Current scheduler queue depth</td></tr>
-                        <tr><td><code>mindrouter_active_backends</code></td><td>Gauge</td><td>&mdash;</td><td>Number of healthy backends</td></tr>
-                        <tr><td><code>mindrouter_tokens_total</code></td><td>Counter</td><td><code>type</code> (prompt/completion)</td><td>Total tokens processed</td></tr>
+                        <tr><td><code>mindrouter_queue_size</code></td><td>Gauge</td><td>&mdash;</td><td>Current scheduler queue depth. Set on every scrape from the scheduler's stats.</td></tr>
+                        <tr><td><code>mindrouter_active_backends</code></td><td>Gauge</td><td>&mdash;</td><td>Number of healthy backends. Set on every scrape from the registry.</td></tr>
+                        <tr><td><code>mindrouter_requests_total</code></td><td>Counter</td><td><code>endpoint</code>, <code>status</code></td><td>Declared but <strong>never incremented</strong>. Labeled and never instantiated, so it exports <strong>no time series at all</strong> (not a zero).</td></tr>
+                        <tr><td><code>mindrouter_request_latency_seconds</code></td><td>Histogram</td><td><code>endpoint</code></td><td>Declared but <strong>never observed</strong>. Labeled and never instantiated, so it exports <strong>no time series at all</strong> (not empty buckets).</td></tr>
+                        <tr><td><code>mindrouter_tokens_total</code></td><td>Counter</td><td><code>type</code> (prompt/completion)</td><td>Declared but <strong>never incremented</strong>. Labeled and never instantiated, so it exports <strong>no time series at all</strong> (not a zero).</td></tr>
                     </tbody>
                 </table>
+                <div class="alert alert-warning">
+                    <strong>Only two of the five metrics carry data.</strong> <code>mindrouter_queue_size</code> and <code>mindrouter_active_backends</code> are refreshed inside the <code>/metrics</code> handler itself (<code>api/health.py</code>). The other three collectors are declared in the same module, but nothing anywhere in the backend calls <code>.inc()</code>, <code>.observe()</code>, or <code>.labels()</code> on them, so they are exported with no samples. Do not build alerts or dashboards on request counts, latency, or token totals from <code>/metrics</code> &mdash; use the telemetry API (<code>/api/admin/telemetry/*</code>) or the audit log for those.
+                </div>
 
                 <h3>Admin API Endpoints</h3>
                 <p>Admin endpoints are mounted under <code>/api/admin/</code>. <strong>Read-only</strong> (GET) endpoints require membership in a group with <code>is_admin = true</code> or <code>is_auditor = true</code>. <strong>Mutating</strong> (POST/PATCH/DELETE) endpoints require <code>is_admin = true</code>. See <a href="#users-groups-quotas">Users, Groups &amp; Quotas</a> for details on the auditor role.</p>
+                <p>Two groups of routes deviate from that rule: every <code>/api/admin/telemetry/*</code> route requires full <code>is_admin</code> (auditors are refused), and the conversations export is authenticated by dashboard session cookie only. Some endpoints additionally accept the dashboard session cookie in place of an API key so admin pages can call them by AJAX &mdash; backend refresh, the Ollama pull/delete/pull-status routes, <code>/queue/monitor</code>, <code>/top-users</code>, and all telemetry routes.</p>
 
                 <h4>Backend Management</h4>
                 <table class="table table-bordered table-sm">
@@ -1136,8 +1160,8 @@ client.conversations.delete(conv.id)               # delete state anytime</code>
                         <tr><th>Method</th><th>Path</th><th>Description</th></tr>
                     </thead>
                     <tbody>
-                        <tr><td>GET</td><td><code>/admin/conversations/export</code></td><td>Export conversations as CSV or JSON (form-based, filterable)</td></tr>
-                        <tr><td>GET</td><td><code>/api/admin/conversations/export</code></td><td>Bulk API export (JSON with content, for programmatic access)</td></tr>
+                        <tr><td>GET</td><td><code>/admin/conversations/export</code></td><td>Export conversations as CSV or JSON (form-based, filterable). Dashboard route: authenticated by the <code>mindrouter_session</code> cookie, admin or auditor.</td></tr>
+                        <tr><td>GET</td><td><code>/api/admin/conversations/export</code></td><td>Same handler, forced to <code>format=json</code> with content included. Despite the <code>/api/</code> prefix it is <strong>also session-cookie only</strong> &mdash; an API key is not accepted, and a request without the cookie is redirected (302) to <code>/login</code>.</td></tr>
                     </tbody>
                 </table>
 
@@ -1236,6 +1260,16 @@ client.conversations.delete(conv.id)               # delete state anytime</code>
                         <tr><td>Blog Management</td><td><code>/admin/blog</code></td><td>Blog CMS: create, edit, publish/unpublish, and delete blog posts</td></tr>
                         <tr><td>Branding</td><td><code>/admin/branding</code></td><td>UI branding &amp; theming: organization name, tagline, light/dark accent colors, navbar/footer/login logos, favicon, live preview (see <a href="#branding">Branding &amp; Theming</a>)</td></tr>
                         <tr><td>Site Settings</td><td><code>/admin/settings</code></td><td>Global settings: display timezone, Ollama context length enforcement</td></tr>
+                        <tr><td>Queue</td><td><code>/admin/queue</code></td><td>Live queue monitor &mdash; per-model capacity and per-user completion stats, polled from <code>GET /api/admin/queue/monitor</code></td></tr>
+                        <tr><td>Energy</td><td><code>/admin/energy</code></td><td>Server and GPU power history per node and cluster-wide, with CSV/JSON export</td></tr>
+                        <tr><td>DLP</td><td><code>/admin/dlp</code></td><td>Data-loss-prevention scanner configuration and alert review (filter by severity, scanner, text; acknowledge alerts)</td></tr>
+                        <tr><td>Voice Config</td><td><code>/admin/voice-config</code></td><td>Configure TTS/STT backend connections, available voices, and API quota token costs</td></tr>
+                        <tr><td>OCR</td><td><code>/admin/ocr-config</code></td><td>OCR enable toggle, default model, prompts, DPI, page/file limits, chunk size and overlap, chunk concurrency, retries</td></tr>
+                        <tr><td>Images</td><td><code>/admin/images-config</code></td><td>Image generation enable toggle, default model, default/allowed sizes, steps and guidance defaults, safety judge models and policy, per-user access grants</td></tr>
+                        <tr><td>Video</td><td><code>/admin/video-config</code></td><td>Video generation enable toggle, default model, allowed sizes and durations, per-user concurrent job cap and storage cap, token cost per second, per-user access grants</td></tr>
+                        <tr><td>Email</td><td><code>/admin/email</code></td><td>Compose and send announcement email to selected users or groups, with recipient count preview and test send</td></tr>
+                        <tr><td>Data Retention</td><td><code>/admin/retention</code></td><td>Retention policies for request, conversation, and telemetry data, plus archive statistics and an archive browser</td></tr>
+                        <tr><td>Backup &amp; Restore</td><td><code>/admin/backup</code></td><td>Export or restore MindRouter configuration (nodes, backends, users, groups, API keys, quotas, models, settings, blog posts)</td></tr>
                     </tbody>
                 </table>
 
@@ -1451,7 +1485,7 @@ client.conversations.delete(conv.id)               # delete state anytime</code>
                     <li>Web search toggle &mdash; when enabled, queries the Brave Search API and injects results as context into the system prompt (requires <code>BRAVE_SEARCH_API_KEY</code>)</li>
                     <li>Code syntax highlighting</li>
                     <li>LaTeX rendering</li>
-                    <li>Message editing and deletion</li>
+                    <li>Conversation renaming and deletion (individual messages cannot be edited or deleted)</li>
                     <li>Dark mode toggle (stored in browser localStorage)</li>
                     <li>Advanced models toggle &mdash; show or hide non-core models in the model selector</li>
                     <li>Per-request thinking controls &mdash; enable/disable thinking mode and set reasoning effort for supported models</li>
@@ -1706,10 +1740,13 @@ curl -X PATCH https://mindrouter.example.edu/api/admin/users/42 \
                         <tr><th>Engine</th><th>Health Check</th><th>Model Discovery</th><th>Telemetry Source</th></tr>
                     </thead>
                     <tbody>
-                        <tr><td><strong>Ollama</strong></td><td><code>GET /api/tags</code></td><td><code>GET /api/tags</code> + <code>POST /api/ps</code> (loaded models)</td><td>Sidecar agent</td></tr>
-                        <tr><td><strong>vLLM</strong></td><td><code>GET /health</code> (fallback: <code>GET /v1/models</code>)</td><td><code>GET /v1/models</code></td><td><code>GET /metrics</code> (Prometheus format)</td></tr>
+                        <tr><td><strong>Ollama</strong> (<code>ollama</code>)</td><td><code>GET /api/tags</code></td><td><code>GET /api/tags</code> + <code>POST /api/ps</code> (loaded models)</td><td>Sidecar agent</td></tr>
+                        <tr><td><strong>vLLM</strong> (<code>vllm</code>)</td><td><code>GET /health</code> (fallback: <code>GET /v1/models</code>)</td><td><code>GET /v1/models</code></td><td><code>GET /metrics</code> (Prometheus format)</td></tr>
+                        <tr><td><strong>Diffusion</strong> (<code>diffusion</code>)</td><td><code>GET /health</code> (fallback: <code>GET /v1/models</code>)</td><td><code>GET /v1/models</code></td><td><code>GET /metrics</code> when the server exposes it; otherwise sidecar GPU data only</td></tr>
+                        <tr><td><strong>Video</strong> (<code>video</code>)</td><td><code>GET /health</code> (fallback: <code>GET /v1/models</code>)</td><td><code>GET /v1/models</code></td><td><code>GET /metrics</code> when the server exposes it; otherwise sidecar GPU data only</td></tr>
                     </tbody>
                 </table>
+                <p>The <code>BackendEngine</code> enum has exactly these four values. The registry builds an <code>OllamaAdapter</code> for <code>ollama</code> backends and a <code>VLLMAdapter</code> for every other engine, so diffusion and video servers must expose the same OpenAI-compatible <code>/health</code> and <code>/v1/models</code> surface as vLLM. Discovery then assigns modality by engine before looking at the model name: every model found on a <code>diffusion</code> backend becomes <code>IMAGE_GENERATION</code>, every model on a <code>video</code> backend becomes <code>VIDEO_GENERATION</code>.</p>
 
                 <h3>Registration</h3>
                 <p><strong>Register a node:</strong></p>
@@ -1849,7 +1886,7 @@ curl -X PATCH https://mindrouter.example.edu/api/admin/users/42 \
                 <p>MindRouter enforces two types of rate limits. Both return HTTP 429 when exceeded &mdash; clients should implement exponential backoff.</p>
                 <ul>
                     <li><strong>Token quota</strong> &mdash; Rolling token budget per user (period defaults to 30 days). When the budget is exhausted, all requests are rejected until the period resets. Configured per group, overridable per user.</li>
-                    <li><strong>Requests per minute (RPM)</strong> &mdash; Enforced cluster-wide via Redis using an atomic INCR + EXPIRE counter with a 60-second sliding window. The limit is shared across all application workers, so a user configured for 120 RPM gets exactly 120 RPM regardless of which worker handles the request. Configured per group, overridable per user or per API key. If Redis is unavailable, RPM enforcement fails open (requests are allowed).</li>
+                    <li><strong>Requests per minute (RPM)</strong> &mdash; Enforced cluster-wide via Redis using an atomic INCR + EXPIRE counter over a <strong>fixed</strong> 60-second window (the TTL is set only on the first request of a window, not refreshed per request). The limit is shared across all application workers, so a user configured for 120 RPM gets exactly 120 RPM regardless of which worker handles the request. Configured per group, overridable per user or per API key. If Redis is unavailable, RPM enforcement fails open (requests are allowed).</li>
                 </ul>
             </section>
 
@@ -2237,10 +2274,13 @@ cp -r agentic_ai/skills/web-search .claude/skills/</code></pre>
             <!-- Request ID -->
             <section id="request-id">
                 <h2>Request ID</h2>
-                <p>Every inference response includes a unique request ID for tracing and debugging.</p>
+                <p>Every API response carries an <code>X-Request-ID</code> response header. The body <code>id</code> field is a <strong>separate</strong> value and is not the same thing.</p>
                 <ul>
-                    <li><strong>Auto-generated IDs</strong> &mdash; MindRouter generates request IDs with format-specific prefixes: <code>chatcmpl-*</code> for chat completions, <code>cmpl-*</code> for text completions, <code>embd-*</code> for embeddings, etc.</li>
-                    <li><strong>Custom IDs</strong> &mdash; You can provide your own request ID by setting the <code>X-Request-ID</code> header. When provided, MindRouter uses your ID instead of generating one, making it easier to correlate requests across your systems.</li>
+                    <li><strong><code>X-Request-ID</code> header</strong> &mdash; A request-ID middleware echoes a client-supplied <code>X-Request-ID</code> back verbatim, or generates a bare UUID4 if the client did not send one. This value is used for server-side log correlation.</li>
+                    <li><strong>Client-supplied IDs never appear in the response body.</strong> Sending <code>X-Request-ID: my-id</code> gets <code>my-id</code> back in the header only; the body <code>id</code> is still minted server-side.</li>
+                    <li><strong>Body <code>id</code> on inference endpoints</strong> &mdash; <code>/v1/chat/completions</code>, <code>/v1/completions</code>, and <code>/anthropic/v1/messages</code> return the audit row's bare UUID4 (<code>requests.request_uuid</code>) &mdash; <em>not</em> a prefixed id &mdash; in the non-streaming body. In SSE chunks the same UUID is used for Ollama backends; vLLM backends pass their own <code>chatcmpl-*</code> chunk id through. <code>/v1/responses</code> returns a <code>resp_*</code> id and <code>/v1/ocr</code> returns its own <code>ocr-*</code> id.</li>
+                    <li><strong>The <code>chatcmpl-*</code>, <code>cmpl-*</code>, <code>emb-*</code>, <code>rnk-*</code>, <code>scr-*</code>, <code>msg_*</code>, <code>img-*</code> prefixes exist only in server logs.</strong> Each route mints one at entry to bind its log context, then the inference service replaces it with the audit UUID before the response is built.</li>
+                    <li><strong>Audit trail</strong> &mdash; Because the body <code>id</code> on chat/completion endpoints <em>is</em> <code>requests.request_uuid</code>, it is the value to search on when tracing a response back to its audit row.</li>
                 </ul>
             </section>
 
@@ -2425,7 +2465,7 @@ docker run --rm --gpus all nvidia/cuda:12.2.0-base-ubuntu22.04 nvidia-smi</code>
                 <ul>
                     <li><strong>Inflight streaming token counting</strong> &mdash; Atomically tracks tokens currently being streamed across all workers, enabling accurate real-time throughput metrics.</li>
                     <li><strong>Per-user quota token caching</strong> &mdash; Caches per-user token counters (<code>quota:tokens:{user_id}</code>) for fast atomic increments without hitting the database on every request.</li>
-                    <li><strong>RPM rate limiting</strong> &mdash; Cluster-wide requests-per-minute enforcement via atomic INCR + EXPIRE counters (<code>rpm:user:{user_id}</code>) with a 60-second sliding window. Shared across all workers.</li>
+                    <li><strong>RPM rate limiting</strong> &mdash; Cluster-wide requests-per-minute enforcement via atomic INCR + EXPIRE counters (<code>rpm:user:{user_id}</code>) over a fixed 60-second window. Shared across all workers.</li>
                     <li><strong>Graceful degradation</strong> &mdash; All features that depend on Redis continue to work without it. Token quota enforcement falls back to database queries, RPM enforcement fails open (requests are allowed), and inflight token counts default to zero. No functionality is lost; only caching and rate limiting benefits are reduced.</li>
                 </ul>
             </section>
@@ -2667,6 +2707,7 @@ response.stream_to_file("output.mp3")</code></pre>
 
                 <h4>Speech-to-Text &mdash; <code>POST /v1/audio/transcriptions</code></h4>
                 <p>Transcribes an audio file to text.</p>
+                <p><strong>Long-audio constraints.</strong> The upstream proxy timeout on this endpoint is <strong>600 seconds</strong> (hardcoded in <code>voice_api.py</code>; the chat UI's own microphone proxy uses a shorter 120-second timeout). Upload size is bounded by the gateway's <code>client_max_body_size</code> (<code>50m</code> as shipped) &mdash; a one-hour MP3 at 128&nbsp;kbps is roughly 57&nbsp;MB and will be rejected with a <code>413</code> before it reaches the app. The whole file is buffered in memory before forwarding, there is no server-side segmentation (one file = one upstream request), and the quota cost is flat regardless of duration. For long recordings, split the audio client-side and submit each segment separately.</p>
 
                 <p><strong>Request (multipart form):</strong></p>
                 <table class="table table-bordered table-sm">
@@ -2836,7 +2877,7 @@ Hello from MindRouter!</code></pre>
                     <tbody>
                         <tr><td>Service URL</td><td><code>voice.stt_url</code></td><td><em>none</em></td><td>Base URL of the STT service (e.g., <code>http://whisper:8000</code>)</td></tr>
                         <tr><td>API Key</td><td><code>voice.stt_api_key</code></td><td><em>none</em></td><td>Bearer token for the upstream STT service (if required)</td></tr>
-                        <tr><td>Default Model</td><td><code>voice.stt_model</code></td><td><code>"deepdml/faster-whisper-large-v3-turbo-ct2"</code></td><td>Whisper model passed to the upstream service</td></tr>
+                        <tr><td>Default Model</td><td><code>voice.stt_model</code></td><td><code>"whisper-large-v3-turbo"</code></td><td>Whisper model passed to the upstream service</td></tr>
                     </tbody>
                 </table>
 
@@ -3001,6 +3042,7 @@ Hello from MindRouter!</code></pre>
                         <tr><th>Key</th><th>Type</th><th>Default</th><th>Description</th><th>Managed Via</th></tr>
                     </thead>
                     <tbody>
+                        <tr><td><code>app.base_url</code></td><td>string</td><td><em>falls back to <code>APP_BASE_URL</code></em></td><td>Public-facing base URL for this installation, written by the <strong>Site URL</strong> field on Admin &gt; Settings. Read by the blog/feed URL builders; SSO redirect URIs still come from the <code>APP_BASE_URL</code> environment variable.</td><td>Site Settings</td></tr>
                         <tr><td><code>app.timezone</code></td><td>string</td><td><code>None</code></td><td>Display timezone for the dashboard (e.g. <code>"America/Los_Angeles"</code>)</td><td>Site Settings</td></tr>
                         <tr><td><code>ollama.enforce_num_ctx</code></td><td>bool</td><td><code>true</code></td><td>Whether MindRouter overrides user-supplied <code>num_ctx</code> values</td><td>Site Settings</td></tr>
                         <tr><td><code>chat.core_models</code></td><td>list</td><td><code>[]</code></td><td>Subset of models shown in the chat interface model selector. Empty means show all.</td><td>Chat Configuration</td></tr>
@@ -3048,7 +3090,7 @@ Hello from MindRouter!</code></pre>
                     <tbody>
                         <tr><td><code>APP_NAME</code></td><td>str</td><td><code>MindRouter</code></td><td>Application name</td></tr>
                         <tr><td><code>APP_VERSION</code></td><td>str</td><td><em>(from pyproject.toml)</em></td><td>Application version (read dynamically at startup)</td></tr>
-                        <tr><td><code>APP_BASE_URL</code></td><td>str</td><td><code>https://mindrouter.uidaho.edu</code></td><td>Public HTTPS origin of this install. Used to build absolute URLs &mdash; notably <a href="#sso">SSO</a> redirect URIs and the SAML <code>Destination</code>/<code>Recipient</code> check, which are derived from this value in preference to forwarded request headers. If it is left blank, those URLs fall back to the request's own scheme and <code>Host</code> header &mdash; and the two paths differ: the OIDC driver honors <code>X-Forwarded-Proto</code> when deriving the scheme, while the SAML adapter uses <code>request.url.scheme</code> and never reads it. Behind a TLS-terminating proxy a blank <code>APP_BASE_URL</code> therefore yields <code>http://</code> SAML URLs. Keep it set.</td></tr>
+                        <tr><td><code>APP_BASE_URL</code></td><td>str</td><td><code>https://your-domain.example.com</code> (placeholder &mdash; <strong>must be set per deployment</strong>; Docker Compose passes it as <code>${APP_BASE_URL:-}</code>, so an unset variable arrives empty and the placeholder never applies)</td><td>Public HTTPS origin of this install. Used to build absolute URLs &mdash; notably <a href="#sso">SSO</a> redirect URIs and the SAML <code>Destination</code>/<code>Recipient</code> check, which are derived from this value in preference to forwarded request headers. If it is left blank, those URLs fall back to the request's own scheme and <code>Host</code> header &mdash; and the two paths differ: the OIDC driver honors <code>X-Forwarded-Proto</code> when deriving the scheme, while the SAML adapter uses <code>request.url.scheme</code> and never reads it. Behind a TLS-terminating proxy a blank <code>APP_BASE_URL</code> therefore yields <code>http://</code> SAML URLs. Keep it set.</td></tr>
                         <tr><td><code>DEBUG</code></td><td>bool</td><td><code>false</code></td><td>Enable debug mode</td></tr>
                         <tr><td><code>RELOAD</code></td><td>bool</td><td><code>false</code></td><td>Auto-reload on code changes (development)</td></tr>
                     </tbody>
@@ -3358,11 +3400,22 @@ Hello from MindRouter!</code></pre>
                         <tr><th>Variable</th><th>Type</th><th>Default</th><th>Description</th></tr>
                     </thead>
                     <tbody>
-                        <tr><td><code>MAX_REQUEST_SIZE</code></td><td>int</td><td><code>52428800</code></td><td>Max HTTP request body (50 MB)</td></tr>
+                        <tr><td><code>MAX_REQUEST_SIZE</code></td><td>int</td><td><code>52428800</code></td><td><strong>Inert.</strong> Defined in <code>settings.py</code> but nothing in the application reads it, so the app enforces no global body limit. The effective limit is the reverse proxy's <code>client_max_body_size</code> (<code>50m</code> in <code>nginx/nginx.conf</code>); raise that, not this.</td></tr>
                         <tr><td><code>BACKEND_REQUEST_TIMEOUT</code></td><td>int</td><td><code>300</code></td><td>Total request timeout (seconds)</td></tr>
                         <tr><td><code>BACKEND_REQUEST_TIMEOUT_PER_ATTEMPT</code></td><td>int</td><td><code>180</code></td><td>Per-attempt timeout (seconds, high for large model prefills)</td></tr>
                         <tr><td><code>BACKEND_RETRY_MAX_ATTEMPTS</code></td><td>int</td><td><code>3</code></td><td>Max total retry attempts</td></tr>
                         <tr><td><code>STRUCTURED_OUTPUT_RETRY_ON_INVALID</code></td><td>bool</td><td><code>true</code></td><td>Retry on invalid structured output</td></tr>
+                    </tbody>
+                </table>
+
+                <h3>Feature Flags</h3>
+                <table class="table table-bordered table-sm">
+                    <thead class="table-light">
+                        <tr><th>Variable</th><th>Type</th><th>Default</th><th>Description</th></tr>
+                    </thead>
+                    <tbody>
+                        <tr><td><code>RESPONSES_API_ENABLED</code></td><td>bool</td><td><code>true</code></td><td>Master switch for <a href="#responses-api"><code>/v1/responses</code></a> <strong>and the entire <code>/v1/conversations</code> surface</strong> &mdash; every route in both routers checks it and returns <code>404</code> when false</td></tr>
+                        <tr><td><code>THINKING_OFF_BY_DEFAULT</code></td><td>bool</td><td><code>true</code></td><td>Gateway policy: reasoning/thinking is forced <strong>off</strong> unless the client explicitly opts in (<code>think: true</code>, <code>thinking: {type: "enabled"}</code>, or <code>chat_template_kwargs.enable_thinking</code>). Models whose name contains <code>gpt-oss</code> are exempt. Set <code>false</code> to restore per-model launch defaults. Not currently forwarded by <code>docker-compose.yml</code>, so it runs at this default under that stack.</td></tr>
                     </tbody>
                 </table>
 
@@ -3398,7 +3451,7 @@ Hello from MindRouter!</code></pre>
                     <tbody>
                         <tr><td><code>TELEMETRY_RETENTION_DAYS</code></td><td>int</td><td><code>30</code></td><td>Telemetry data retention period</td></tr>
                         <tr><td><code>TELEMETRY_CLEANUP_INTERVAL</code></td><td>int</td><td><code>3600</code></td><td>Cleanup interval (seconds)</td></tr>
-                        <tr><td><code>SIDECAR_TIMEOUT</code></td><td>int</td><td><code>5</code></td><td>Sidecar HTTP call timeout (seconds)</td></tr>
+                        <tr><td><code>SIDECAR_TIMEOUT</code></td><td>int</td><td><code>15</code></td><td>Sidecar HTTP call timeout (seconds)</td></tr>
                     </tbody>
                 </table>
 
@@ -3743,9 +3796,10 @@ docker run -d --name gpu-sidecar \
                 <p><strong>Set the limit once at http level</strong> so it covers every server block on the node &mdash; past practice of adding it inside individual <code>server&nbsp;{}</code> blocks caused an outage when new blocks were added without it:</p>
 <pre><code># /etc/nginx/conf.d/00-body-size.conf   (one line, applies to ALL proxies on the node)
 client_max_body_size 64m;</code></pre>
-                <p>Keep the limits in <strong>lockstep across the chain</strong>, with the MindRouter app as the strictest link so oversized requests always get its clean JSON error rather than raw nginx HTML:</p>
-<pre><code>gateway nginx (500m)  &gt;  inference-node nginx (64m)  &gt;  app MAX_REQUEST_SIZE (50MB)</code></pre>
-                <p>If you raise <code>MAX_REQUEST_SIZE</code>, raise the node configs with it. Diagnosis tip: the nginx version string in a 413 page identifies which layer rejected the request.</p>
+                <p>Keep the limits in <strong>lockstep across the chain</strong>. There are only two enforcing layers &mdash; the MindRouter application enforces no global body limit of its own (<code>MAX_REQUEST_SIZE</code> is defined in <code>settings.py</code> but never read):</p>
+<pre><code>gateway nginx (client_max_body_size 50m, in nginx/nginx.conf)
+    &gt;  inference-node nginx (client_max_body_size 64m)</code></pre>
+                <p>As shipped the <strong>gateway</strong> is the strictest link, so an oversized request is rejected at the edge with nginx's own 413 page before it ever reaches the application. If you need to accept larger bodies, raise the gateway value first and keep the node configs at or above it. Diagnosis tip: the nginx version string in a 413 page identifies which layer rejected the request.</p>
 
                 <h4>Example: Ollama proxy config</h4>
 <pre><code># /etc/nginx/conf.d/ollama-proxy.conf
@@ -3790,7 +3844,7 @@ server {
 
                 <h4>Verifying the setting</h4>
 <pre><code># Check all nginx proxy configs across the cluster:
-for host in marten lynx webbyg1 webbyg2 calvin eunice aspen1 aspen2 aspen3 aspen4 aspen5; do
+for host in node1 node2 node3; do   # substitute your inference node hostnames
     echo -n "$host: "
     ssh $host "grep -r client_max_body_size /etc/nginx/conf.d/ 2>/dev/null || echo 'NOT SET - needs fix'"
 done</code></pre>
@@ -3809,7 +3863,7 @@ done</code></pre>
                         <tr><th>Command</th><th>Description</th></tr>
                     </thead>
                     <tbody>
-                        <tr><td><code>make test-unit</code></td><td>Run unit tests (525+ tests)</td></tr>
+                        <tr><td><code>make test-unit</code></td><td>Run unit tests (1,000+ tests, no live services needed)</td></tr>
                         <tr><td><code>make test-int</code></td><td>Integration tests (requires live backends)</td></tr>
                         <tr><td><code>make test-e2e</code></td><td>End-to-end tests</td></tr>
                         <tr><td><code>make test-smoke</code></td><td>Smoke tests (full API surface)</td></tr>

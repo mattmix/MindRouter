@@ -9,7 +9,7 @@
 
 > **Reverse proxy:** The production Docker Compose stack includes an nginx container that handles TLS termination and reverse proxying on ports 80/443. You do **not** need to install a separate web server (Apache, nginx, etc.) on the host. If you prefer to use an external reverse proxy (e.g., Apache httpd), see [Alternative: External Apache Reverse Proxy](#alternative-external-apache-reverse-proxy) below and remove the `nginx` service from `docker-compose.prod.yml`.
 
-> **Request body size limits must stay in lockstep across the chain.** The effective limiter should be the app's `MAX_REQUEST_SIZE` (default 50 MB), which returns a clean JSON error. Every proxy in front of AND behind the app must allow more: the gateway nginx (`client_max_body_size 500m` in this repo's config) and — easy to forget — the **nginx TLS proxies on each GPU inference node**, which get a raw nginx default of 1 MB unless configured. Full-transcript agent clients (Codex/Responses API) exceed 1 MB routinely and will see opaque `413 Request Entity Too Large` HTML from the node proxy. Each inference node carries `/etc/nginx/conf.d/00-body-size.conf` with `client_max_body_size 64m;` (http-level, covers all server blocks). If you raise `MAX_REQUEST_SIZE`, raise the node configs too.
+> **Request body size limits come from the proxies, not from the app.** The application enforces no body-size ceiling of its own: `MAX_REQUEST_SIZE` exists in `settings.py` and `.env.example`, but nothing in `backend/` reads it, so changing it has no effect. The effective limiter is the gateway proxy — `client_max_body_size 50m` in this repo's `nginx/nginx.conf` (or `LimitRequestBody 52428800` in `deploy/apache-mindrouter.conf` if you run the external-Apache variant) — and an oversized request gets that proxy's opaque `413 Request Entity Too Large` HTML, not a JSON error. Easy to forget: the **nginx TLS proxies on each GPU inference node** count too, and get a raw nginx default of 1 MB unless configured. Full-transcript agent clients (Codex/Responses API) exceed 1 MB routinely and will see a 413 from the node proxy. Each inference node carries `/etc/nginx/conf.d/00-body-size.conf` with `client_max_body_size 64m;` (http-level, covers all server blocks). Raise the gateway and the node configs together — every hop in the chain must allow the largest legitimate request.
 
 > **Which Compose file this guide uses.** Every command below drives **`docker-compose.prod.yml`** — the hardened stack (nginx TLS terminator, no host-exposed database or Redis, configured through `env_file: .env.prod`). The flag is not optional; each `docker compose` invocation must name the file:
 >
@@ -486,12 +486,12 @@ Key nginx parameters in the production config that operators may need to adjust:
 
 | Parameter | Value | Notes |
 |-----------|-------|-------|
-| `client_max_body_size` | `50m` | Maximum upload/request body size |
-| `proxy_read_timeout` | `300s` | Must be >= `BACKEND_REQUEST_TIMEOUT` for long-running LLM requests |
-| `proxy_send_timeout` | `300s` | Timeout for sending data to the proxied server |
+| `client_max_body_size` | `50m` | Maximum upload/request body size. This is the deployment's effective limit — the app enforces none of its own |
+| `proxy_read_timeout` | `720s` | Must exceed the app's worst-case request lifetime for long-running LLM requests |
+| `proxy_send_timeout` | `720s` | Timeout for sending data to the proxied server |
 | `proxy_connect_timeout` | `60s` | Timeout for establishing a connection to the backend |
 
-If LLM requests are timing out at the nginx layer before the backend responds, increase `proxy_read_timeout` to match or exceed the `BACKEND_REQUEST_TIMEOUT` setting (default 300s).
+The shipped `720s` read/send timeouts are sized to cover the app's worst case: routing wait plus `BACKEND_RETRY_MAX_ATTEMPTS` (default 3) attempts of `BACKEND_REQUEST_TIMEOUT_PER_ATTEMPT` (default 180s) each. If you raise those settings, or `BACKEND_REQUEST_TIMEOUT` (default 300s), raise `proxy_read_timeout` to stay ahead of them — otherwise nginx cuts the connection before the backend answers.
 
 ## Docker Network Subnet
 

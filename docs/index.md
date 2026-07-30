@@ -198,29 +198,52 @@ Browser-based dashboard calls authenticate via the `mindrouter_session` cookie s
 
 | Detail message | Cause |
 |----------------|-------|
-| "Missing API key. Provide via Authorization header or X-API-Key header." | No API key provided in the request |
+| "Missing API key. Provide via 'Authorization: Bearer `<key>`' or 'X-API-Key: `<key>`'" | No API key provided in the request |
 | "Invalid API key" | API key not found in the database |
-| "API key is {status}" | API key has been revoked |
+| "API key is {status}" | API key's status is not `active` -- `{status}` is the literal enum value, either `revoked` or `expired` |
 | "API key has expired" | API key's `expires_at` timestamp has passed |
 | "User account is inactive" | The user associated with the key is disabled |
 
 ### Request IDs
 
-Every API response includes a unique request ID for tracing and audit correlation:
+Every API response carries an `X-Request-ID` response header. The body `id` field is a **separate** value and is not the same thing:
 
-- **Auto-generated** in the format `chatcmpl-*`, `cmpl-*`, `emb-*`, `msg-*`, `resp_*`, or `img-*` based on the endpoint type.
-- **Client-provided** -- Clients can supply their own ID via the `X-Request-ID` header, which MindRouter will use instead of generating one.
-- **Returned** in both the response body (`id` field) and response headers for easy correlation.
-- **Audit trail** -- The request ID links the audit log entry to the API response for end-to-end traceability.
+- **`X-Request-ID` header** -- A request-ID middleware echoes a client-supplied `X-Request-ID` back verbatim, or generates a bare UUID4 if the client did not send one. This value is used for server-side log correlation.
+- **Client-supplied IDs never appear in the response body.** Sending `X-Request-ID: my-id` gets `my-id` back in the header only; the body `id` is still minted server-side.
+- **Body `id` on inference endpoints** -- `/v1/chat/completions`, `/v1/completions`, and `/anthropic/v1/messages` return the audit row's bare UUID4 (`requests.request_uuid`) -- **not** a prefixed id -- in the non-streaming body. For **streaming**, only Ollama-backed responses carry that UUID in their SSE chunks (`ollama_out.py`); vLLM-backed chunks pass the backend's own `chatcmpl-*` id through (`vllm_out.py`), so a streamed chunk id is not a reliable audit key -- use the `X-Request-ID` header or the non-streaming body id. `/v1/embeddings` returns no `id` field at all. `/v1/rerank` and `/v1/score` pass the backend's own id through. `/v1/responses` returns a real `resp_<hex>` id (the stored-response row), and `/v1/ocr` returns its own `ocr-<hex>` id.
+- **`chatcmpl-*`, `cmpl-*`, `emb-*`, `rnk-*`, `scr-*`, `msg_*`, `img-*` prefixes exist only in server logs.** Each route mints one at entry to bind its log context, then the inference service replaces it with the audit UUID before the response is built.
+- **Streaming responses return two `x-request-id` headers** -- the route's prefixed log id (e.g. `chatcmpl-…`) plus the middleware's value. Non-streaming responses return only the middleware's.
+- **Audit trail** -- Because the body `id` on chat/completion endpoints *is* `requests.request_uuid`, it is the value to search on when tracing a response back to its audit row.
 
 ### Error Responses
 
-Error response format varies by API style:
+Error response format varies by API style. MindRouter registers **no `HTTPException` handler** (the only handler in `main.py` catches bare `Exception`), so on most endpoints FastAPI's default `{"detail": ...}` wrapper is applied to every error.
 
-**OpenAI endpoints** (`/v1/*`):
+**Most OpenAI endpoints** (`/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/rerank`, `/v1/score`, `/v1/tokenize`, `/v1/ocr`, `/v1/models`, `/v1/images/*`, `/v1/videos/*`, `/v1/search`) -- errors are wrapped in `detail`, whose value is either a nested OpenAI-style error object or a plain string:
+
 ```json
-{"error": {"message": "...", "type": "invalid_request_error", "code": "model_not_found"}}
+// 404 unknown model -- OpenAI-shaped object nested under "detail"
+{"detail": {"error": {"message": "The model 'foo' does not exist", "type": "invalid_request_error", "code": "model_not_found"}}}
 ```
+```json
+// 400/401/429/503 -- flat string detail
+{"detail": "Invalid JSON body"}
+{"detail": "No healthy backends available for this model"}
+```
+
+**Responses and Conversations endpoints** (`/v1/responses*`, `/v1/conversations*`) -- the only endpoints that emit the true bare OpenAI envelope, with `param` and `code` always present. These routes build their own `JSONResponse` and re-shape service `HTTPException`s into this form:
+
+```json
+{"error": {"message": "The model 'foo' does not exist or you do not have access to it.", "type": "invalid_request_error", "param": null, "code": "model_not_found"}}
+```
+
+**Unhandled server errors (500)** -- the global `Exception` handler emits a bare envelope with no `detail` wrapper:
+
+```json
+{"error": {"message": "Internal server error", "type": "server_error"}}
+```
+
+**`/v1/ocrmd`** returns errors as `text/plain` bodies (the message only, no JSON at all), matching its plain-markdown success response.
 
 **Ollama endpoints** (`/api/*`):
 ```json
@@ -243,7 +266,7 @@ Common HTTP status codes:
 | 403 | Insufficient permissions (e.g., non-admin accessing admin endpoint) |
 | 404 | Resource not found |
 | 409 | Conflict (duplicate name, URL, etc.) |
-| 413 | Request payload exceeds `MAX_REQUEST_SIZE` (default 50 MB) |
+| 413 | Request body exceeds the reverse proxy's `client_max_body_size` (`50m` in `nginx/nginx.conf`), or an uploaded OCR file exceeds the configured OCR max file size. The `MAX_REQUEST_SIZE` setting exists in `settings.py` but nothing in the application reads it -- the app itself enforces no global body limit. |
 | 422 | Request validation failed (malformed JSON, wrong types, missing required fields). Returned by FastAPI's built-in request validation. |
 | 429 | Rate limit exceeded. MindRouter does not include a `Retry-After` header on 429 responses. Clients should implement exponential backoff. |
 | 500 | Internal server error |
@@ -253,7 +276,9 @@ Common HTTP status codes:
 
 > **Backend pass-through:** Backend 4xx errors (e.g., invalid prompt format) are forwarded directly to the client and are not retried.
 
-> **Model names are exact match only.** MindRouter does not support prefix matching, aliases, or fuzzy matching. The `model` field in requests must exactly match a model name as shown in `/v1/models` or `/api/tags`.
+> **Parsing errors:** branch on the HTTP status code, not on the body shape. Outside `/v1/responses` and `/v1/conversations`, `detail` may hold either a string or an `{"error": {...}}` object, so an OpenAI SDK that expects `error.message` at the top level will not find it and may surface the error as an opaque unknown-format failure.
+
+> **Model names are exact match, except for aliases.** MindRouter does not support prefix matching or fuzzy matching -- the `model` field must exactly match either a model name or a configured alias as shown in `/v1/models` or `/api/tags`. Aliases are resolved on every inference endpoint (chat completions, completions, embeddings, rerank, score, tokenize, OCR, images, Ollama, Anthropic, Responses, and video). Alias entries are listed alongside real models in `/v1/models` and `/api/tags`, tagged with `"is_alias": true` and `"alias_target": "<real model name>"`. Aliases are administrator-defined (Admin > Models) and stored in the `model_aliases` table, so the set available on any given deployment is entirely a matter of local configuration. A common convention is to name them for an intent rather than a model version -- for example `default-llm`, `default-llm-large`, `default-agent`, `default-coder`, `default-vision`, `default-embedding` -- so that clients can pin a role and let the operator repoint it as models are upgraded.
 
 ### OpenAI-Compatible Endpoints
 
@@ -264,13 +289,29 @@ These endpoints accept and return data in the OpenAI API format. Any OpenAI-comp
 | POST | `/v1/chat/completions` | API Key | Chat completions (streaming and non-streaming) |
 | POST | `/v1/responses` | API Key | OpenAI Responses API (typed items/SSE events; serves agent clients like Codex) |
 | POST | `/v1/responses/input_tokens` | API Key | Count input tokens without generating |
+| GET | `/v1/responses/{response_id}` | API Key | Retrieve a stored response (`?stream=true` replay is rejected with 400) |
+| DELETE | `/v1/responses/{response_id}` | API Key | Delete a stored response and its offloaded artifacts |
+| GET | `/v1/responses/{response_id}/input_items` | API Key | List the input items of a stored response (`limit`, `order`, `after`) |
+| POST | `/v1/responses/{response_id}/cancel` | API Key | Cancel a background response (background mode is unsupported) |
 | * | `/v1/conversations` | API Key | OpenAI Conversations API (conv_* objects, item CRUD) |
-| POST | `/v1/completions` | API Key | Text completions (legacy, internally converts to chat format) |
+| POST | `/v1/completions` | API Key | Text completions (legacy; converts to chat and returns a `chat.completion` object) |
 | POST | `/v1/embeddings` | API Key | Generate embeddings |
 | POST | `/v1/rerank` | API Key | Rerank documents against a query |
 | POST | `/v1/score` | API Key | Score similarity between text pairs |
+| POST | `/v1/tokenize` | API Key | Count input tokens for a chat request (exact for vLLM, tiktoken estimate for Ollama) |
+| POST | `/v1/ocr` | API Key | OCR images/PDFs/Office docs to markdown or JSON (multipart upload) |
+| POST | `/v1/ocrmd` | API Key | Same OCR pipeline as `/v1/ocr`, returns raw `text/markdown` |
+| POST | `/v1/search` | API Key | Web search via the configured provider (also served at `/api/search`) |
 | POST | `/v1/images/generations` | API Key | Image generation (FLUX; requires per-account enablement) |
-| GET | `/v1/models` | API Key | List available models |
+| POST | `/v1/images/edits` | API Key | Reference-image edit / img2img (multipart upload) |
+| POST | `/v1/videos` | API Key | Submit an async video generation job (202 Accepted) |
+| POST | `/v1/videos/assets` | API Key | Upload a keyframe asset for video generation (201 Created) |
+| GET | `/v1/videos` | API Key | List your video jobs |
+| GET | `/v1/videos/models` | API Key | List available video models |
+| GET | `/v1/videos/{video_id}` | API Key | Get a video job's status |
+| GET | `/v1/videos/{video_id}/content` | API Key | Stream the rendered MP4 (HTTP range requests supported) |
+| DELETE | `/v1/videos/{video_id}` | API Key | Delete a video job and its artifacts |
+| GET | `/v1/models` | API Key | List available models (including aliases) |
 
 #### Chat Completions
 
@@ -293,7 +334,7 @@ curl -X POST http://localhost:8000/v1/chat/completions \
 **Response:**
 ```json
 {
-  "id": "chatcmpl-abc123...",
+  "id": "19730079-3a32-4888-9c6c-9eac62ad0bcc",
   "object": "chat.completion",
   "created": 1700000000,
   "model": "llama3.2",
@@ -325,6 +366,8 @@ curl -X POST http://localhost:8000/v1/chat/completions \
 ```
 
 **Thinking/Reasoning Mode:**
+
+> **Reasoning is OFF by default -- this is a gateway policy, not the model's own default.** When a request omits every thinking control, MindRouter forces thinking off on the outbound backend call, so a thinking-capable model such as `qwen/qwen3.6-35b` returns no `reasoning_content` unless you opt in. The policy is the `THINKING_OFF_BY_DEFAULT` setting (default `true`), applied in the inference service on both the streaming and non-streaming paths; it emits `chat_template_kwargs: {"enable_thinking": false}` to vLLM backends and `think: false` to Ollama backends. Models whose name contains `gpt-oss` are exempt -- they use `reasoning_effort` and are left untouched. Set `THINKING_OFF_BY_DEFAULT=false` to restore each backend's per-model launch default. (Ollama models that do not advertise thinking support have the field stripped entirely.)
 
 MindRouter supports multiple formats for controlling thinking/reasoning on models that support it (qwen3.5, qwen3, gpt-oss):
 
@@ -455,12 +498,14 @@ MindRouter supports OpenAI-style tool/function calling across all API formats (O
 
 #### Completions Parameters
 
-The `/v1/completions` endpoint supports additional parameters beyond the standard chat completions set:
+`/v1/completions` accepts the legacy OpenAI completion parameters, but internally converts the request to a chat request before routing:
 
-- **`suffix`** -- Text appended after the completion.
-- **`echo`** -- Echo the prompt back in the response.
-- **`n`** -- Number of completions to generate (default 1).
-- **`best_of`** -- Number of beam search candidates to consider.
+- **`n`** -- Number of completions to generate (default 1). Carried through the conversion.
+- **`suffix`** -- Parsed, then **silently dropped**: the chat conversion does not copy it. No error is returned.
+- **`echo`** -- Parsed, then **silently dropped**. The prompt is not echoed back.
+- **`best_of`** -- Parsed, then **silently dropped**. No beam search is requested of the backend.
+
+> **Response shape:** `/v1/completions` does **not** return a `text_completion` object with `choices[].text`. Because the request is converted with `to_chat_request()`, the response is a `chat.completion` object whose choices carry `message.role` / `message.content`, exactly like `/v1/chat/completions`. Clients using an OpenAI SDK's legacy completions helper will not find `choices[0].text`. Only the prompt is carried over -- a list-valued `prompt` uses only its first element, and it becomes a single `user` message.
 
 > **Note:** Chat completions (`/v1/chat/completions`) also support `n` to generate multiple alternative responses (default 1).
 
@@ -495,7 +540,7 @@ curl http://localhost:8000/v1/models \
       "object": "model",
       "created": 1700000000,
       "owned_by": "mindrouter",
-      "capabilities": {"multimodal": false, "embeddings": false, "structured_output": true, "thinking": false},
+      "capabilities": {"multimodal": false, "embeddings": false, "structured_output": true, "thinking": false, "tools": true},
       "backends": ["ollama-gpu1", "ollama-gpu2"],
       "context_length": 32768,
       "model_max_context": 131072,
@@ -504,6 +549,19 @@ curl http://localhost:8000/v1/models \
       "family": "llama"
     }
   ]
+}
+```
+
+Configured aliases are appended to the same `data` list. An alias entry inherits all of its target's metadata (capabilities, backends, context lengths, family) and adds two fields:
+
+```json
+{
+  "id": "default-llm",
+  "object": "model",
+  "owned_by": "mindrouter",
+  "is_alias": true,
+  "alias_target": "openai/gpt-oss-120b",
+  "capabilities": {"multimodal": false, "embeddings": false, "structured_output": true, "thinking": true, "tools": true}
 }
 ```
 
@@ -588,6 +646,8 @@ This endpoint accepts and returns data in the Anthropic Messages API format. Ant
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
 | POST | `/anthropic/v1/messages` | API Key | Anthropic Messages API (streaming and non-streaming) |
+| POST | `/v1/messages` | API Key | Same handler, also mounted at the OpenAI base path for clients that append `/v1/messages` to a bare host |
+| GET | `/anthropic/v1/models` | API Key | Model list served at the Anthropic base path (delegates to `/v1/models`; identical response body) |
 
 #### Messages
 
@@ -732,7 +792,7 @@ The transcription endpoint is designed for short-to-medium audio clips (up to ~1
 | Constraint | Value | Impact |
 |------------|-------|--------|
 | Upload size limit | 50 MB (nginx `client_max_body_size`) | A 1-hour MP3 at 128 kbps is ~57 MB -- over the limit. WAV files are much larger. |
-| Proxy timeout | 120 seconds (hardcoded in `voice_api.py`) | Whisper transcribing a long file can take 5--10+ minutes, causing a 502 timeout. |
+| Proxy timeout | 600 seconds (10 min, hardcoded in `voice_api.py`) | Generous, so the upload size cap usually binds first -- but a very long file can still exceed it. The bundled nginx allows `proxy_read_timeout 720s`, so this application timeout fires first. |
 | Memory buffering | Entire file read into RAM | Large uploads spike container memory since the file is fully buffered before forwarding. |
 | No chunking | Single request per file | There is no server-side segmentation -- one file = one request to the upstream STT service. |
 | Flat quota cost | Same cost regardless of duration | A 1-hour file costs the same 200 tokens as a 5-second clip. |
@@ -832,15 +892,18 @@ These endpoints are unauthenticated and intended for monitoring infrastructure.
 ```json
 {
   "service": "MindRouter",
-  "version": "2.0.0",
+  "version": "2.9.2",
   "timestamp": "2026-03-01T12:00:00+00:00",
   "backends": {"total": 6, "healthy": 5},
   "models": ["gpt-oss-120b", "llama3.2", "qwen3.5"],
-  "queue": {"total": 3},
+  "queue": {"total": 3, "by_user": {}, "by_model": {}, "average_wait_seconds": 0.0},
+  "queue_health": {"status": "healthy", "queue_total": 3, "trend": "stable", "stale_jobs": 0, "backend_depths": {"4": 1, "9": 2}},
   "fair_share": {"total_users": 2},
   "active_users": 12
 }
 ```
+
+`version` is the running build (`settings.app_version`, taken from the package version -- `2.9.2` at the time of writing), so `/status` is the quickest way to confirm which release a deployment is serving. `models` lists every model exposed by a currently healthy backend, and `queue_health` carries the scheduler's self-assessment (`status`, `trend`, `stale_jobs`, per-backend depths, and last garbage-collection run).
 
 **GET /api/cluster/throughput** — Token throughput:
 ```json
@@ -875,15 +938,21 @@ The `/metrics` endpoint exposes the following Prometheus metrics:
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
-| `mindrouter_requests_total` | Counter | `endpoint`, `status` | Total requests processed |
-| `mindrouter_request_latency_seconds` | Histogram | `endpoint` | Request latency |
-| `mindrouter_queue_size` | Gauge | -- | Current scheduler queue depth |
-| `mindrouter_active_backends` | Gauge | -- | Number of healthy backends |
-| `mindrouter_tokens_total` | Counter | `type` (prompt/completion) | Total tokens processed |
+| `mindrouter_queue_size` | Gauge | -- | Current scheduler queue depth. Set on every scrape from the scheduler's stats. |
+| `mindrouter_active_backends` | Gauge | -- | Number of healthy backends. Set on every scrape from the registry. |
+| `mindrouter_requests_total` | Counter | `endpoint`, `status` | Declared but **never incremented**. Because it is labeled and `.labels()` is never called, it exports **no time series at all** (not a zero). |
+| `mindrouter_request_latency_seconds` | Histogram | `endpoint` | Declared but **never observed**. Labeled and never instantiated, so it exports **no time series at all** (not empty buckets). |
+| `mindrouter_tokens_total` | Counter | `type` (prompt/completion) | Declared but **never incremented**. Labeled and never instantiated, so it exports **no time series at all** (not a zero). |
+
+> **Only two of the five metrics carry data.** `mindrouter_queue_size` and `mindrouter_active_backends` are refreshed inside the `/metrics` handler itself (`api/health.py`). The other three collectors are declared in the same module but nothing anywhere in the backend calls `.inc()`, `.observe()`, or `.labels()` on them, so they are exported with no samples. Do not build alerts or dashboards on request counts, latency, or token totals from `/metrics` -- use the telemetry API (`/api/admin/telemetry/*`) or the audit log for those.
 
 ### Admin API Endpoints
 
-All admin endpoints require the `admin` role. They are mounted under `/api/admin/`.
+These endpoints are mounted under `/api/admin/`. Authorization is not uniform:
+
+- **Write operations** (`POST`, `PATCH`, `DELETE`) require a group with `is_admin`. Anything else gets 403 `"Admin access required"`.
+- **Every `GET`** below uses the read-only gate, which accepts `is_admin` **or** `is_auditor` (`Group.has_admin_read`). An auditor group can therefore read the entire admin surface -- backends, nodes, users, groups, API keys, quota requests, queue, audit log including prompt and response content -- while being unable to change anything. The two exceptions are noted in place: the telemetry routes require full `is_admin`, and the conversations export is authenticated by session cookie only.
+- **Some endpoints also accept the dashboard session cookie** in place of an API key, so admin pages can call them by AJAX: backend refresh, the Ollama pull/delete/pull-status routes, `/queue/monitor`, `/top-users`, and every `/api/admin/telemetry/*` route.
 
 #### Backend Management
 
@@ -919,6 +988,7 @@ All admin endpoints require the `admin` role. They are mounted under `/api/admin
 | PATCH | `/api/admin/users/{id}` | Update user properties (group, quotas, etc.) |
 | DELETE | `/api/admin/users/{id}` | Hard-delete a user and all associated data |
 | POST | `/api/admin/users/{id}/api-keys` | Create an API key for a user |
+| GET | `/api/admin/top-users` | Top 10 users by token usage in a window (`window` = `1m`, `1h`, `4h`, `12h`, or `24h`; default `1h`) |
 
 #### Group Management
 
@@ -947,6 +1017,7 @@ All admin endpoints require the `admin` role. They are mounted under `/api/admin
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/api/admin/queue` | Scheduler queue statistics |
+| GET | `/api/admin/queue/monitor` | Queue capacity and completion stats by model and user (`window` = minutes, default 5) |
 | GET | `/api/admin/audit/search` | Search audit logs (filter by user, model, status, date, text) |
 | GET | `/api/admin/audit/{id}` | Full audit detail including prompt and response content |
 
@@ -954,7 +1025,11 @@ All admin endpoints require the `admin` role. They are mounted under `/api/admin
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/api/admin/conversations/export` | Export conversations as CSV or JSON (filterable by user, date range, search) |
+| GET | `/api/admin/conversations/export` | Export conversations as JSON (filters: `search`, `user_id_filter`, `model_filter`, `start_date`, `end_date`, `include_content` -- default `true`) |
+
+> **This route is session-authenticated, not API-key authenticated.** Unlike every other endpoint in this section, `/api/admin/conversations/export` is served by the dashboard router and identifies the caller only from the signed `mindrouter_session` cookie. An `Authorization: Bearer` or `X-API-Key` header is ignored: an unauthenticated request is redirected (302) to `/login`, and a signed-in user whose group lacks admin-or-auditor read is redirected to `/dashboard` -- neither returns 401/403 JSON. The caller's group must satisfy the same admin-or-auditor read check as the rest of the section.
+>
+> **`format` is not honored here.** The handler hardcodes JSON output; passing `format=csv` has no effect. CSV export is available from the browser at `/admin/conversations/export?format=csv`, which is the same underlying handler reached through the admin dashboard page (also session-authenticated).
 
 #### Telemetry
 
@@ -966,6 +1041,11 @@ All admin endpoints require the `admin` role. They are mounted under `/api/admin
 | GET | `/api/admin/telemetry/gpus/{gpu_device_id}/history` | Time-series telemetry for a GPU device |
 | GET | `/api/admin/telemetry/nodes/{node_id}/history` | Aggregated time-series for a node (all GPUs) |
 | GET | `/api/admin/telemetry/export` | Export raw telemetry as JSON or CSV |
+| GET | `/api/admin/telemetry/energy/nodes/{node_id}/history` | Power history for one node (`metric` = `server_power` or `gpu_power`; `range`, `resolution`) |
+| GET | `/api/admin/telemetry/energy/cluster/history` | Cluster-wide power history (all nodes summed) |
+| GET | `/api/admin/telemetry/energy/export` | Export energy/power data as CSV or JSON (`node_id`, `scope` = `all`/`server`/`gpu`, `range`, `resolution`) |
+
+> **Telemetry routes require full admin.** Every route in this subsection uses the admin-or-session gate rather than the read-only one, so `is_auditor` alone is not sufficient -- the group must have `is_admin`. All of them accept either an admin API key or the dashboard session cookie.
 
 ---
 
@@ -998,7 +1078,7 @@ The user dashboard includes the following features:
 - **TTS Speed Preference** -- A playback speed slider (0.5--2.0) lets users set their preferred TTS speed. Changes auto-save with a brief confirmation. A "Reset to default" button clears the override to use the admin-configured speed.
 - **Live Token Usage** -- Token usage statistics on the dashboard update in real-time via polling (every 1 second), providing live feedback without page refresh.
 - **Lifetime vs Rolling Usage** -- The dashboard displays two token metrics: **Lifetime Token Usage** (all-time total tokens consumed) and **Current Period Usage** (tokens used in the current rolling budget period). These are distinct -- the lifetime counter never resets, while the period counter resets when the budget period rolls over.
-- **Quota Details** -- Users can view their current quota limits (RPM limit and max concurrent requests) in the Quota Details card on the dashboard.
+- **Quota Details** -- The Quota Details card shows the group token budget, tokens used in the current period, and the RPM limit. There is no per-user concurrency limit to display; that field was dropped from the quota table (see [Rate Limiting](#rate-limiting)).
 - **API Key Expiration Warnings** -- API keys nearing expiration (7 days or fewer remaining) display a yellow warning countdown. Expired keys show an "Expired" badge. The "Last Used" column shows when each key was last used for authentication.
 
 ### Admin Dashboard
@@ -1011,18 +1091,31 @@ The admin dashboard has a persistent sidebar with links to all admin pages:
 | Backends | `/admin/backends` | Backend health, models, enable/disable/drain controls |
 | Models | `/admin/models` | Model catalog with capability overrides, metadata editing, context length configuration (see below) |
 | Nodes | `/admin/nodes` | GPU node management, sidecar status, take offline/bring online, force drain, active requests |
+| Queue | `/admin/queue` | Live queue monitor -- per-model capacity and per-user completion stats, polled from `GET /api/admin/queue/monitor` |
 | GPU Metrics | `/admin/metrics` | Real-time GPU utilization, memory, temperature, power charts with time range controls |
-| Users | `/admin/users` | User accounts, group assignment, quota management, masquerade |
-| Groups | `/admin/groups` | Group management with quota defaults, scheduler weights, admin flag |
+| Energy | `/admin/energy` | Server and GPU power history per node and cluster-wide, with CSV/JSON export |
+| Users | `/admin/users` | User accounts, group assignment, quota management, masquerade, account-type filter, Create Local User |
+| Groups | `/admin/groups` | Group management with token budget, RPM, scheduler weight, admin/auditor flags, API key expiry and count limits |
 | API Keys | `/admin/api-keys` | All API keys across users, status filtering, search |
-| Requests | `/admin/requests` | Pending API key and quota increase requests, approve/deny |
+| Requests | `/admin/requests` | Pending API key, service key, and quota increase requests, approve/deny |
 | Audit Log | `/admin/audit` | Inference request history with filtering and search |
+| Admin Audit | `/admin/admin-audit` | Log of administrative actions -- who changed what, when, and from which IP |
+| DLP | `/admin/dlp` | Data-loss-prevention scanner configuration and alert review (filter by severity, scanner, text; acknowledge alerts) |
 | Conversations | `/admin/conversations` | Browse and search all user conversations, view messages, export |
 | Chat Config | `/admin/chat-config` | Configure core models, default model, system prompt, max_tokens, temperature, thinking mode, voice TTS/STT settings |
-| Voice API Config | `/admin/voice-config` | Configure TTS/STT backend connections, available voices, and API quota token costs |
-| Blog | `/admin/blog` | Blog/CMS management -- create, edit, publish, delete posts |
+| Voice Config | `/admin/voice-config` | Configure TTS/STT backend connections, available voices, and API quota token costs |
+| Search | `/admin/search-config` | Web search provider (Brave or SearXNG), endpoint, API key, max results, per-search quota token cost, plus a test query |
+| OCR | `/admin/ocr-config` | OCR enable toggle, default model, prompts, DPI, page/file limits, chunk size and overlap, chunk concurrency, retries |
+| Images | `/admin/images-config` | Image generation enable toggle, default model, default/allowed sizes, steps and guidance defaults, safety judge models and policy, per-user access grants |
+| Video | `/admin/video-config` | Video generation enable toggle, default model, allowed sizes and durations, per-user concurrent job cap and storage cap, token cost per second, per-user access grants |
+| Blog Posts | `/admin/blog` | Blog/CMS management -- create, edit, publish, delete posts |
+| Email | `/admin/email` | Compose and send announcement email to selected users or groups, with recipient count preview and test send |
+| Data Retention | `/admin/retention` | Retention policies for request, conversation, and telemetry data, plus archive statistics and an archive browser |
+| Backup & Restore | `/admin/backup` | Export or restore MindRouter configuration (nodes, backends, users, groups, API keys, quotas, models, settings, blog posts) |
 | Branding | `/admin/branding` | Institution / organization name, logos (navbar / footer / login), favicon, and accessible light/dark accent colors (see [branding.md](branding.md)) |
 | Settings | `/admin/settings` | Site-wide settings: timezone, enforce `num_ctx` override |
+
+> **Auditor groups can read every page in this table.** All of the admin page `GET` handlers gate on the admin-or-auditor read check (`Group.has_admin_read`, i.e. `is_admin OR is_auditor`), so a group with only `is_auditor` can browse the entire admin dashboard. The write actions below, and every mutating admin form post, require `is_admin`.
 
 The Branding page includes an **Institution / organization name** field (config key `branding.org_name`, optional, max 120 characters). Besides labeling the UI, it supplies the institutional label for SSO login buttons -- see [Login button labels](#login-button-labels).
 
@@ -1076,6 +1169,22 @@ Admins can force the entire MindRouter system offline or back online via `POST /
 
 Admins can masquerade as any user to view the system from their perspective. Start masquerading via `POST /admin/masquerade/{target_user_id}` -- a signed cookie is set and the admin is redirected to the target user's dashboard. The admin sees the user's token usage, API keys, and conversations as if logged in as that user. Stop masquerading via `POST /admin/masquerade/stop` to return to the admin view.
 
+### Account Types and Local Users
+
+The user list (`/admin/users`) shows an **account-type badge** in a "Type" column. The three types are mutually exclusive and are resolved in this precedence order:
+
+| Badge | Condition (`User.account_type`) | Meaning |
+|-------|--------------------------------|---------|
+| **Admin** | The user's group has `is_admin` | Member of an admin group (checked first, regardless of how they sign in) |
+| **SSO** | Not admin, and `azure_oid` or `sso_subject` is set | Signs in through a configured identity provider |
+| **Local** | Not admin, and neither identifier is set | Signs in with a local username and password |
+
+The same three values drive the `account_type` query filter on `/admin/users` (`admin`, `sso`, or `local`; any other value is ignored), which composes with the existing `search`, `group_id`, `sort`, and `dir` parameters.
+
+> **The filter is narrower than the badge.** The `account_type=sso` / `account_type=local` SQL filter tests `azure_oid` only, while the badge also accepts a generic `sso_subject`. A non-admin user provisioned through a non-Azure provider (SAML, generic OIDC, Google) therefore renders an **SSO** badge but is returned by `account_type=local`.
+
+Admins can create a local account directly from the user list with the **Create Local User** button, which posts to `POST /admin/users/create` (admin session required; `is_admin`, not auditor). The form takes username, email, password, and group, plus optional full name, college, department, and intended use. The handler rejects a password shorter than 8 characters and a username or email that already exists, provisions the user's quota from the selected group's `rpm_limit`, writes a `user.create` entry to the admin audit log, and redirects to the new user's detail page. Local accounts coexist with SSO accounts -- see [Change Password](#change-password) for how they differ afterward.
+
 ### Chat Interface
 
 | Page | URL | Description |
@@ -1091,7 +1200,7 @@ The chat interface supports:
 - **Web search toggle** -- when enabled, queries are sent to the Brave Search API and results are injected into the system message as context before the LLM generates its response (requires `BRAVE_SEARCH_API_KEY` configuration)
 - Code syntax highlighting
 - LaTeX rendering
-- Message editing and deletion
+- Conversation renaming and deletion (individual messages cannot be edited or deleted)
 
 ---
 
@@ -1103,32 +1212,43 @@ MindRouter uses database-driven **groups** to control permissions, quotas, and s
 
 Each group has the following fields:
 
-| Field | Description |
-|-------|-------------|
-| `name` | Unique identifier (e.g., `student`, `staff`, `faculty`, `admin`) |
-| `display_name` | Human-readable name shown in the UI |
-| `description` | Optional description |
-| `is_admin` | Whether members have admin access |
-| `scheduler_weight` | Scheduling priority weight for fair-share scheduling |
-| `default_token_budget` | Default monthly token budget for new users in this group |
-| `default_rpm` | Default requests-per-minute limit |
-| `default_max_concurrent` | Default maximum concurrent requests |
+| Field | Default | Description |
+|-------|---------|-------------|
+| `name` | -- | Unique identifier, lowercase (e.g., `students`, `staff`, `faculty`, `admin`) |
+| `display_name` | -- | Human-readable name shown in the UI |
+| `description` | `null` | Optional description |
+| `token_budget` | `100000` | Token budget applied to every member of the group. `0` means unlimited |
+| `rpm_limit` | `30` | Requests-per-minute limit, copied into each new member's quota record |
+| `scheduler_weight` | `1` | Scheduling priority weight for fair-share scheduling |
+| `is_admin` | `false` | Full admin access -- required for every mutating admin action |
+| `is_auditor` | `false` | Read-only admin access. `is_admin OR is_auditor` is exposed as `Group.has_admin_read` and gates all admin `GET` routes |
+| `api_key_expiry_days` | `45` | Lifetime applied to API keys created by members |
+| `max_api_keys` | `16` | Maximum number of active API keys a member may hold |
+
+> There is no `max_concurrent` field on a group. The column existed until migration `056`, which dropped `max_concurrent` from `groups`, `quotas`, and `api_keys`; per-user concurrency limits are not part of the data model any more. The unrelated per-**backend** `max_concurrent` (how many in-flight requests a single inference endpoint accepts) is still real -- see [Registration](#registration).
 
 Groups are managed via the admin dashboard (`/admin/groups`) or the admin API (`/api/admin/groups`).
 
 ### Default Quotas by Group
 
-The seed script creates four default groups:
+Migration `009` creates **seven** groups when the schema is first built, and migration `041` adds an eighth (`auditor`) alongside the `is_auditor` column. `scripts/seed_dev_data.py` re-creates the same seven for a development database, skipping any that already exist:
 
-| Setting | Student | Staff | Faculty | Admin |
-|---------|---------|-------|---------|-------|
-| Token budget (monthly) | 100,000 | 500,000 | 1,000,000 | 10,000,000 |
-| Requests per minute (RPM) | 30 | 60 | 120 | 1,000 |
-| Max concurrent requests | 2 | 4 | 8 | 50 |
-| Scheduler weight | 1 | 2 | 3 | 10 |
-| Admin access | No | No | No | Yes |
+| Group | Display name | Token budget | RPM | Scheduler weight | `is_admin` | `is_auditor` |
+|-------|--------------|--------------|-----|------------------|------------|--------------|
+| `students` | Students | 100,000 | 30 | 1 | No | No |
+| `staff` | Staff | 500,000 | 60 | 2 | No | No |
+| `faculty` | Faculty | 1,000,000 | 120 | 3 | No | No |
+| `researchers` | Researchers | 1,000,000 | 120 | 3 | No | No |
+| `admin` | Admin | 10,000,000 | 1,000 | 10 | **Yes** | No |
+| `nerds` | Nerds | 500,000 | 60 | 2 | No | No |
+| `other` | Other | 100,000 | 30 | 1 | No | No |
+| `auditor` | Auditor | 100,000 | 30 | 1 | No | **Yes** |
 
-Group defaults are configurable through the admin UI or API. The per-role environment variables (e.g., `DEFAULT_TOKEN_BUDGET_STUDENT`, `SCHEDULER_WEIGHT_STAFF`) are **deprecated** and serve only as fallbacks for environments that have not migrated to database-driven groups.
+These names are only a starting point -- they are ordinary rows, and a deployment is expected to rename, delete, or add to them. The token budget is a rolling-window budget, not a calendar-month one (see [Quota System](#quota-system)).
+
+Seeded groups get `api_key_expiry_days = 45` and `max_api_keys = 8` (the column defaults added by migration `020`); groups created afterwards through the admin UI or API get `max_api_keys = 16` from the model default.
+
+Group settings are editable through the admin UI or API. The per-role environment variables (e.g., `DEFAULT_TOKEN_BUDGET_STUDENT`, `SCHEDULER_WEIGHT_STAFF`) are **deprecated** and serve only as fallbacks for environments that have not migrated to database-driven groups.
 
 > **Per-user weight override:** Admins can override an individual user's scheduler weight via the user detail page (`/admin/users/{id}`). When set, the user's `weight_override` takes precedence over their group's `scheduler_weight`. An empty or null `weight_override` means the user inherits the group default. This allows fine-grained fair-share tuning for specific users without changing group-wide settings.
 
@@ -1149,11 +1269,15 @@ Users with local (non-SSO) accounts can change their password from the user dash
 
 ### Quota System
 
-Each user has a quota record with:
+Each user has a quota record holding:
 
-- **Token budget** -- Total tokens allowed per period. Deducted on each completed request (prompt + completion tokens).
-- **RPM limit** -- Maximum requests per minute.
-- **Max concurrent** -- Maximum simultaneous in-flight requests.
+- **`tokens_used`** -- Tokens consumed in the current rolling period. Incremented on each completed request (prompt + completion tokens).
+- **`lifetime_tokens_used`** -- All-time total, never reset.
+- **`budget_period_start` / `budget_period_days`** -- The rolling window (see below).
+- **`rpm_limit`** -- Maximum requests per minute for this user.
+- **`weight_override`** -- Optional per-user scheduler weight (null = inherit the group's).
+
+The **token budget itself lives on the group**, not on the quota row: enforcement compares `quota.tokens_used` against `user.group.token_budget`, and a budget of `0` (or no group) means unlimited. There is no per-user concurrency field -- migration `056` dropped `max_concurrent` from `quotas`.
 
 When a quota is exceeded, the request is rejected with HTTP 429.
 
@@ -1161,7 +1285,13 @@ When a quota is exceeded, the request is rejected with HTTP 429.
 
 ### Rate Limiting
 
-> **Note:** RPM and concurrent request rate limiting are defined in the codebase but **not currently enforced**. The rate limiter middleware is not registered in the application. Only token quota (monthly budget) enforcement is active, returning HTTP 429 when the token budget is exceeded. The `rpm_limit` and `max_concurrent` fields are stored in group/quota configuration for future use.
+**RPM limiting is enforced.** It runs inside the same pre-flight check as the token budget (`InferenceService._check_quota`, and the equivalent helper in the voice API), not as middleware -- so it applies to requests that reach an inference or voice endpoint, and endpoints that never call the check are not rate limited.
+
+The limit that applies is the API key's `rpm_limit` when the key sets one, otherwise the user's quota `rpm_limit`. A limit of `0` disables the check. Counting is done in Redis (`check_rpm`) with an `INCR` plus a 60-second `EXPIRE` on a per-user key, so the window is shared across all application workers. Over-limit requests are rejected with **HTTP 429** and the message `Rate limit exceeded: N requests per minute (current: M)`; exceeding the token budget returns **HTTP 429** with `Token quota exceeded`.
+
+> **Redis fail-open.** If Redis is unavailable, or the Redis call raises, `check_rpm` returns "allowed" -- RPM limiting silently stops being enforced rather than blocking traffic. Token budget enforcement is unaffected, since it reads from the database.
+
+> **Concurrency limiting per user or group does not exist.** Migration `056` dropped `max_concurrent` from `groups`, `quotas`, and `api_keys`, and `backend/app/security/rate_limits.py` is now only a docstring pointing at the Redis implementation. The surviving concurrency controls are per-backend (`backends.max_concurrent`, used by the scheduler) and, for video, a per-user concurrent **job** cap configured at `/admin/video-config`.
 
 ### Quota Increase Requests
 
@@ -1180,7 +1310,7 @@ Admins review requests at `/admin/requests` or via `POST /api/admin/quota-reques
 MindRouter separates the concept of physical GPU servers (**Nodes**) from inference endpoints (**Backends**):
 
 - A **Node** represents a physical server with GPUs and a sidecar agent.
-- A **Backend** is an Ollama or vLLM instance running on a node.
+- A **Backend** is an inference server running on a node -- an Ollama, vLLM, diffusion (image), or video-generation instance.
 - One node can host multiple backends, each assigned specific GPUs via `gpu_indices`.
 - Backends without a `node_id` work as standalone endpoints (no GPU telemetry).
 
@@ -1195,8 +1325,12 @@ Node: gpu-server-1 (4x A100-80GB, sidecar at :8007)
 
 | Engine | Health Check | Model Discovery | Telemetry Source |
 |--------|-------------|-----------------|------------------|
-| **Ollama** | `GET /api/tags` | `GET /api/tags` + `POST /api/show` (model details) + `POST /api/ps` (loaded models) | Sidecar agent |
-| **vLLM** | `GET /health` (fallback: `GET /v1/models`) | `GET /v1/models` | `GET /metrics` (Prometheus format) |
+| **Ollama** (`ollama`) | `GET /api/tags` | `GET /api/tags` + `POST /api/show` (model details) + `POST /api/ps` (loaded models) | Sidecar agent |
+| **vLLM** (`vllm`) | `GET /health` (fallback: `GET /v1/models`) | `GET /v1/models` | `GET /metrics` (Prometheus format) |
+| **Diffusion** (`diffusion`) | `GET /health` (fallback: `GET /v1/models`) | `GET /v1/models` | `GET /metrics` when the server exposes it; otherwise sidecar GPU data only |
+| **Video** (`video`) | `GET /health` (fallback: `GET /v1/models`) | `GET /v1/models` | `GET /metrics` when the server exposes it; otherwise sidecar GPU data only |
+
+The `BackendEngine` enum has exactly these four values. The registry builds an `OllamaAdapter` for `ollama` backends and a `VLLMAdapter` for every other engine, so diffusion and video servers must expose the same OpenAI-compatible `/health` and `/v1/models` surface as vLLM. Discovery then assigns modality by engine before looking at the model name: every model found on a `diffusion` backend becomes `IMAGE_GENERATION`, every model on a `video` backend becomes `VIDEO_GENERATION`.
 
 ### Registration
 
@@ -1610,10 +1744,10 @@ Voice API settings are managed on two admin pages:
 - Quota token costs per TTS/STT request
 
 **Chat Config** (`/admin/chat-config`):
-- TTS enable/disable toggle, provider, default voice, playback speed (chat UI only)
-- STT enable/disable toggle (chat UI only)
+- TTS enable/disable toggle (gates the chat UI **and** `POST /v1/audio/speech`), provider, default voice, playback speed (chat UI only)
+- STT enable/disable toggle (gates the chat UI **and** `POST /v1/audio/transcriptions`)
 
-The backend connection settings (URLs, API keys) are shared between the chat UI and the Voice API. The chat-specific settings (enable toggles, provider, voice, speed) only affect the chat interface and do not gate the Voice API endpoints.
+The backend connection settings (URLs, API keys) are shared between the chat UI and the Voice API. So are the **enable toggles**: `POST /v1/audio/speech` reads `voice.tts_enabled` and `POST /v1/audio/transcriptions` reads `voice.stt_enabled` -- the same keys the Chat Config page writes -- and each returns **HTTP 404** (`TTS is not enabled` / `STT is not enabled`) when its toggle is off. Turning TTS or STT off for the chat UI therefore turns the corresponding public endpoint off as well. The remaining chat-specific settings (provider, default voice, playback speed) affect only the chat interface; API callers pass `voice` and `speed` in the request body.
 
 **Voice discovery endpoint** (`GET /api/tts-voices`): Returns the list of available TTS voices and the current default voice. Tries the upstream TTS service first (`{tts_url}/v1/audio/voices`), then falls back to the `voice_api.tts_voices` config. Supports `?allowed_only=true` to filter to only admin-configured voices (used by the user dashboard). Response: `{"voices": [...], "source": "upstream"|"config", "default_voice": "af_heart"}`.
 
@@ -1632,12 +1766,12 @@ The backend connection settings (URLs, API keys) are shared between the chat UI 
 The Voice API is a thin proxy layer. It does not perform any audio processing itself -- it forwards requests to the upstream TTS/STT service and relays the response.
 
 **STT upload constraints:**
-- **50 MB** maximum upload size (nginx limit)
-- **120-second** proxy timeout to the upstream Whisper service
+- **50 MB** maximum upload size (the reverse proxy's `client_max_body_size`, set to `50m` in the bundled `nginx/nginx.conf`)
+- **600-second** (10-minute) proxy timeout to the upstream Whisper service, hardcoded in `voice_api.py`. The bundled nginx sets `proxy_read_timeout 720s`, so the application timeout is the one that fires first.
 - The entire audio file is buffered in memory before forwarding
 - No server-side audio segmentation or chunking
 
-These limits are appropriate for short-to-medium clips (up to ~10 minutes). For longer audio, clients should split the file into chunks before sending -- see [STT Limitations & Long Audio](#stt-limitations--long-audio) in the API Reference for code examples.
+The 50 MB upload cap, not the timeout, is what usually binds: 50 MB is roughly 52 minutes of 128 kbps MP3 (a one-hour file at that bitrate is about 57 MB), and higher bitrates or uncompressed WAV reach it far sooner. Within that size, a request survives up to 10 minutes of upstream transcription. Clients should still split long audio into chunks -- it keeps each upload well under both ceilings, avoids buffering a large file in RAM, and gives per-segment error recovery. See [STT Limitations & Long Audio](#stt-limitations--long-audio) in the API Reference for code examples.
 
 **Quota model:** Both TTS and STT use a flat per-request token cost regardless of input size. Admins can adjust the cost via the Voice API Config page.
 
@@ -1650,11 +1784,11 @@ These limits are appropriate for short-to-medium clips (up to ~10 minutes). For 
 | `voice.stt_url` | string | (none) | STT service base URL |
 | `voice.stt_api_key` | string | (none) | STT service API key |
 | `voice.stt_model` | string | `"whisper-large-v3-turbo"` | Default STT model |
-| `voice.tts_enabled` | boolean | `false` | Enable TTS in chat UI |
+| `voice.tts_enabled` | boolean | `false` | Enable TTS -- gates both the chat UI and `POST /v1/audio/speech` (404 when false) |
 | `voice.tts_provider` | string | `"kokoro"` | Chat TTS provider (`kokoro` or `openedai`) |
 | `voice.tts_voice` | string | `"af_heart"` | Default voice for chat TTS |
 | `voice.tts_speed` | float | `1.0` | Default playback speed for chat TTS |
-| `voice.stt_enabled` | boolean | `false` | Enable STT in chat UI |
+| `voice.stt_enabled` | boolean | `false` | Enable STT -- gates both the chat UI and `POST /v1/audio/transcriptions` (404 when false) |
 | `voice_api.tts_voices` | string | `"af_heart\naf_bella\nam_adam\nam_michael"` | Available TTS voices (newline-separated, restricts user choices) |
 | `voice_api.default_voice` | string | `"af_heart"` | Default System Voice — assigned to users unless they choose their own |
 | `voice_api.tts_quota_tokens` | integer | `100` | Token cost per TTS API request |
@@ -1692,7 +1826,9 @@ The blog editor includes:
 
 ## Configuration Reference
 
-All settings are loaded from environment variables or `.env` / `.env.prod` files. Variable names are case-insensitive.
+All settings are loaded from environment variables or `.env` / `.env.prod` files. Variable names are case-insensitive. Inside Docker, whether a variable actually reaches the process depends on which Compose file you run -- see [Docker Compose env var passthrough](#docker-compose-env-var-passthrough).
+
+Per-model and per-feature runtime tunables (chat defaults, voice, video presets and quotas, branding, retention windows) are **not** environment variables -- they live as rows in the `app_config` table and are edited from the Admin Dashboard. See [Runtime AppConfig](#runtime-appconfig-database-driven).
 
 ### Application
 
@@ -1700,7 +1836,9 @@ All settings are loaded from environment variables or `.env` / `.env.prod` files
 |----------|------|---------|-------------|
 | `APP_NAME` | str | `MindRouter` | Application name |
 | `APP_VERSION` | str | (from `pyproject.toml`) | Application version |
-| `APP_BASE_URL` | str | `https://mindrouter.uidaho.edu` | Public HTTPS origin of the deployment. Used to build absolute URLs (SSO redirect URIs, SAML `Destination`/`Recipient` validation) instead of trusting request headers -- set this correctly in production |
+| `APP_BASE_URL` | str | `https://your-domain.example.com` (placeholder -- **no usable default**) | Public HTTPS origin of *this* deployment, scheme + host, no trailing path. **Must be set per deployment.** SSO redirect URIs (Azure/Google/OIDC) and SAML `Destination`/`Recipient` validation are derived from it rather than from request headers, so a wrong value sends users to another host and fails as `redirect_uri_mismatch`. `docker-compose.yml` passes it through with an *empty* default (`${APP_BASE_URL:-}`), so leaving it out of `.env` reaches the app as an empty string and the code falls back to the request's own scheme and `Host` header |
+| `MCP_SERVER_URL` | str | `http://127.0.0.1:8001` | Upstream address of the standalone single-worker MCP server that the mounted `/mcp/*` proxy forwards to |
+| `RUN_MIGRATIONS` | bool | `false` | When true, the app runs `alembic upgrade head` at startup before serving, so a fresh or unmigrated database does not crash-loop. Opt-in; run single-worker on first boot |
 | `DEBUG` | bool | `false` | Enable debug mode |
 | `RELOAD` | bool | `false` | Auto-reload on code changes (development) |
 
@@ -1712,6 +1850,7 @@ All settings are loaded from environment variables or `.env` / `.env.prod` files
 | `DATABASE_POOL_SIZE` | int | `30` | Connection pool size |
 | `DATABASE_MAX_OVERFLOW` | int | `20` | Max overflow connections beyond pool |
 | `DATABASE_ECHO` | bool | `false` | Log SQL queries |
+| `ARCHIVE_DATABASE_URL` | str | `None` | Optional second database for tiered retention. Archival is skipped entirely when unset |
 
 ### Cache
 
@@ -1741,7 +1880,7 @@ MindRouter supports four SSO providers: **Azure AD / Entra ID**, **Google**, **g
 - **Local username/password accounts are always available.** SSO never disables the local login form (it is collapsed behind a "Sign in with a local account" toggle when SSO buttons are present). With no provider configured, `/login` is just the local login form.
 - **Restart after any change.** Settings are process-level and `lru_cache`d per worker; OIDC discovery documents and SAML IdP metadata are cached in-process for 1 hour. Recreate the container (`docker compose up -d`) after editing any SSO variable.
 - **`APP_BASE_URL` must be your public HTTPS origin.** OIDC redirect URIs and the SAML `Destination`/`Recipient` checks are derived from it rather than from request headers; if it is left blank the code falls back to the request's own scheme and `Host` header -- and the two paths differ, since the OIDC driver honors `X-Forwarded-Proto` while the SAML adapter does not, so behind a TLS-terminating proxy a blank value yields `http://` SAML URLs. Keep it set.
-- **Every SSO variable must be listed in `docker-compose.yml` under `environment:`** (see [Docker Compose env var passthrough](#deployment)); production values live in `/opt/mindrouter/.env` on the host.
+- **SSO variables must actually reach the container**, and how that works differs between the two shipped stacks: `docker-compose.yml` forwards only the variables named in its `environment:` block (all SSO variables are already listed there), while `docker-compose.prod.yml` uses `env_file: .env.prod` and forwards every key in that file. See [Docker Compose env var passthrough](#docker-compose-env-var-passthrough). Secrets belong in the host `.env` / `.env.prod`, never in the repository.
 - **Database:** migration `068` adds `users.sso_provider` and `users.sso_subject`. Run `alembic upgrade head` after upgrading.
 
 For step-by-step IdP-side setup (Azure portal, Google Cloud console, Okta/Keycloak, Shibboleth, CILogon registration), see **[sso-configuration.md](sso-configuration.md)**.
@@ -1866,9 +2005,36 @@ All providers share the same semantics. On login, MindRouter looks up `(provider
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
-| `ARTIFACT_STORAGE_PATH` | str | `/data/artifacts` | File storage directory |
-| `ARTIFACT_MAX_SIZE_MB` | int | `50` | Max artifact file size |
-| `ARTIFACT_RETENTION_DAYS` | int | `365` | Artifact retention period |
+| `ARTIFACT_STORAGE_PATH` | str | `/data/artifacts` | File storage directory. Also the root for audit-offloaded request images and Responses API image offload |
+| `ARTIFACT_MAX_SIZE_MB` | int | `50` | Defined in `settings.py`, but **nothing in the application reads it** -- no artifact size cap is enforced from this value |
+| `ARTIFACT_RETENTION_DAYS` | int | `365` | Defined in `settings.py`, but **nothing in the application reads it**. Actual reaping is driven by `app_config` keys -- `retention.request_images_days` (default 180) and `retention.responses_store_days` (default 30) |
+
+### Video Generation
+
+Video settings are process-level. Per-model tunables -- presets, allowed sizes, duration limits, per-user storage cap, the `vid.enabled` master switch -- are `vid.*` rows in `app_config`, managed from Admin > Video Config, not environment variables.
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| `VIDEO_STORAGE_PATH` | str | `/data/video` | Root directory for rendered clips and uploaded reference images |
+| `VIDEO_RUNNER_ENABLED` | bool | `true` | Start the background video runner in this process |
+| `VIDEO_RUNNER_POLL_INTERVAL_SECONDS` | int | `5` | Queue poll interval for the runner |
+| `VIDEO_WORKER_TIMEOUT_SECONDS` | int | `60` | Timeout for control-plane calls to the worker (submit/poll/cancel) |
+| `VIDEO_WORKER_FETCH_TIMEOUT_SECONDS` | int | `900` | Timeout for pulling the finished artifact back from the worker |
+| `VIDEO_JOB_MAX_WALL_SECONDS` | int | `3600` | Hard wall-clock cap on a single render before it is failed |
+| `VIDEO_JOB_STALE_HEARTBEAT_SECONDS` | int | `120` | Heartbeat age after which a rendering job is treated as stale |
+| `VIDEO_RECONCILE_INTERVAL_SECONDS` | int | `20` | Interval of the ground-truth sweep that recovers orphaned renders |
+| `VIDEO_RUNNER_LEASE_TTL_SECONDS` | int | `30` | Redis leader-lease TTL, so only **one** runner is active across workers/containers |
+| `VIDEO_MAX_UPLOAD_MB` | int | `64` | Defined in `settings.py`, but **nothing in the application reads it** -- the reference-image upload cap comes from the `vid.max_image_upload_mb` config key (default 10) |
+| `VIDEO_WEBHOOK_SIGNING_KEY` | str | `""` | Reserved for HMAC-signing worker callbacks. Defined and passed through Compose, but **nothing in the application reads it yet** -- the runner polls the worker rather than receiving webhooks. When used, the value belongs in the host `.env` only |
+
+### UI Branding
+
+Colors, organization name, and logo selections are `branding.*` rows in `app_config` (Admin > Branding). Only the on-disk storage of uploaded assets is configured here.
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| `BRANDING_STORAGE_PATH` | str | `/data/branding` | Directory for uploaded logo/favicon files. Must be a persistent volume, or uploads are lost on rebuild |
+| `BRANDING_MAX_LOGO_MB` | int | `4` | Per-file cap for logo and favicon uploads |
 
 ### Quotas (Deprecated)
 
@@ -1884,10 +2050,8 @@ All providers share the same semantics. On login, MindRouter looks up `(provider
 | `DEFAULT_RPM_STAFF` | int | `60` | Staff requests per minute |
 | `DEFAULT_RPM_FACULTY` | int | `120` | Faculty requests per minute |
 | `DEFAULT_RPM_ADMIN` | int | `1000` | Admin requests per minute |
-| `DEFAULT_MAX_CONCURRENT_STUDENT` | int | `2` | Student max concurrent requests |
-| `DEFAULT_MAX_CONCURRENT_STAFF` | int | `4` | Staff max concurrent requests |
-| `DEFAULT_MAX_CONCURRENT_FACULTY` | int | `8` | Faculty max concurrent requests |
-| `DEFAULT_MAX_CONCURRENT_ADMIN` | int | `50` | Admin max concurrent requests |
+
+> **There are no `DEFAULT_MAX_CONCURRENT_*` variables.** Migration `056` dropped the `max_concurrent` column from `groups`, `quotas`, and `api_keys`, and no per-user or per-group concurrency setting exists in `settings.py`. The surviving `max_concurrent` is a **per-backend** capability field on the `backends` table (default `4`), set through the admin backend API -- it caps in-flight requests to one backend, not to one user.
 
 ### Scheduler
 
@@ -1930,13 +2094,30 @@ All providers share the same semantics. On login, MindRouter looks up `(provider
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
-| `MAX_REQUEST_SIZE` | int | `52428800` | Max HTTP request body (50 MB) |
+| `MAX_REQUEST_SIZE` | int | `52428800` | Defined in `settings.py`, but **nothing in the application reads it** -- the app enforces no global body limit. The real ceiling is the reverse proxy: `client_max_body_size 50m` in the bundled `nginx/nginx.conf`, which is what returns `413` |
 | `BACKEND_REQUEST_TIMEOUT` | int | `300` | Total request timeout (seconds) |
 | `BACKEND_REQUEST_TIMEOUT_PER_ATTEMPT` | int | `180` | Per-attempt timeout (seconds) |
 | `BACKEND_RETRY_MAX_ATTEMPTS` | int | `3` | Max total retry attempts |
-| `STRUCTURED_OUTPUT_RETRY_ON_INVALID` | bool | `true` | When enabled, retries the request on a different backend if the response fails structured output JSON validation |
+| `STRUCTURED_OUTPUT_RETRY_ON_INVALID` | bool | `true` | Intended to retry on a different backend when a response fails structured-output JSON validation |
+| `THINKING_OFF_BY_DEFAULT` | bool | `true` | Gateway policy: reasoning/thinking is forced **off** unless the client explicitly opts in (`think: true`, `thinking: {type: "enabled"}`, or `reasoning_effort`). Applies to `enable_thinking`-style models (Qwen, Gemma, Nemotron); gpt-oss uses `reasoning_effort` and is left untouched. Set `false` to restore per-model launch defaults |
+| `FIELD_VALIDATION` | str | `log` | Handling of unknown or vLLM-dialect request fields that would otherwise be silently dropped: `off`, `log` (record and continue), or `enforce` (reject with `400`). Deploy at `log` to observe real traffic, then flip to `enforce` |
 
-> *Note: `STRUCTURED_OUTPUT_RETRY_ON_INVALID` is defined but not currently implemented in the inference pipeline. It is reserved for future use.*
+> *Note: `STRUCTURED_OUTPUT_RETRY_ON_INVALID` is defined but not read anywhere in the inference pipeline. Setting it has no effect today; it is reserved for future use.*
+
+### Responses & Conversations APIs
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| `RESPONSES_API_ENABLED` | bool | `true` | Master switch for `/v1/responses` **and the entire `/v1/conversations` surface** -- every route in both routers checks it and returns `404` with `"The Responses API is not enabled on this server."` / `"The Conversations API is not enabled on this server."` when false |
+| `RESPONSES_STORE_MAX_CHAIN_DEPTH` | int | `20` | Maximum `previous_response_id` hops walked when rebuilding a stored chain |
+| `RESPONSES_STORE_MAX_PAYLOAD_BYTES` | int | `5242880` | Per-response stored-payload cap (5 MB). `0` = uncapped |
+| `RESPONSES_STORE_MAX_ROWS_PER_USER` | int | `1000` | Stored responses retained per user; oldest are evicted. `0` = uncapped |
+| `RESPONSES_WEB_SEARCH_ENABLED` | bool | `true` | Enable the hosted `{"type": "web_search"}` tool, executed server-side via the `/v1/search` provider stack |
+| `RESPONSES_WEB_SEARCH_MAX_CALLS` | int | `4` | Search calls allowed per response. A request's `max_tool_calls` can lower it, not raise it |
+| `RESPONSES_WEB_SEARCH_MAX_RESULTS` | int | `5` | Results fed back to the model per search |
+| `CONVERSATIONS_MAX_PER_USER` | int | `1000` | Conversation objects per user; creation is rejected beyond it. `0` = uncapped |
+| `CONVERSATIONS_MAX_ITEMS` | int | `10000` | Items per conversation; appends are rejected beyond it |
+| `CONVERSATIONS_MAX_ITEM_BYTES` | int | `2097152` | Per-item size cap after image offload (2 MB). `0` = uncapped |
 
 > **Timeout split behavior:** The total `BACKEND_REQUEST_TIMEOUT` is split in half -- the first half is allocated for routing and capacity wait (waiting for a backend with available capacity), and the remaining half for actual inference. Retry attempts after the first use immediate fail-fast routing (`max_wait=0`) to avoid wasting time waiting again. `BACKEND_REQUEST_TIMEOUT_PER_ATTEMPT` (default 180s) applies independently to each individual attempt, separate from the total timeout budget.
 
@@ -1962,7 +2143,7 @@ All providers share the same semantics. On login, MindRouter looks up `(provider
 |----------|------|---------|-------------|
 | `TELEMETRY_RETENTION_DAYS` | int | `30` | Telemetry data retention period |
 | `TELEMETRY_CLEANUP_INTERVAL` | int | `3600` | Cleanup interval (seconds) |
-| `SIDECAR_TIMEOUT` | int | `5` | Sidecar HTTP call timeout (seconds) |
+| `SIDECAR_TIMEOUT` | int | `15` | Sidecar HTTP call timeout (seconds) |
 | `GPU_AGENT_HOST` | str | `0.0.0.0` | Bind address for sidecar HTTP server |
 | `GPU_AGENT_PORT` | int | `8007` | Port for sidecar HTTP server |
 
@@ -1974,6 +2155,7 @@ All providers share the same semantics. On login, MindRouter looks up `(provider
 | `METRICS_PREFIX` | str | `mindrouter` | Metrics name prefix |
 | `OTEL_ENABLED` | bool | `false` | Enable OpenTelemetry |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | str | `None` | OpenTelemetry exporter endpoint |
+| `OTEL_SERVICE_NAME` | str | `mindrouter` | Value reported as `service.name` on exported traces |
 
 ### CORS
 
@@ -1989,7 +2171,7 @@ All providers share the same semantics. On login, MindRouter looks up `(provider
 | `CHAT_UPLOAD_MAX_SIZE_MB` | int | `10` | Max upload file size (MB) |
 | `CHAT_UPLOAD_ALLOWED_EXTENSIONS` | list | See below | Allowed upload file extensions |
 
-Default allowed extensions: `.txt`, `.md`, `.csv`, `.json`, `.html`, `.htm`, `.log`, `.docx`, `.xlsx`, `.pdf`, `.jpg`, `.jpeg`, `.png`, `.gif`, `.webp`
+Default allowed extensions: `.txt`, `.md`, `.csv`, `.json`, `.html`, `.htm`, `.log`, `.docx`, `.xlsx`, `.pptx`, `.pdf`, `.jpg`, `.jpeg`, `.png`, `.gif`, `.webp`
 
 ### Conversation Retention
 
@@ -2041,8 +2223,13 @@ In addition to the environment variables above, MindRouter stores runtime config
 | `voice_api.stt_quota_tokens` | integer | `200` | Token cost per STT API request |
 | `user.{user_id}.tts_voice` | string | (none) | Per-user TTS voice preference |
 | `user.{user_id}.tts_speed` | float | (none) | Per-user TTS playback speed preference |
+| `app.base_url` | string | falls back to the `APP_BASE_URL` setting | Public base URL, written by Admin > Settings > **Site URL**. Used for the links MindRouter *generates* -- blog/RSS links and outgoing email. **SSO does not read this key**: OIDC redirect URIs and SAML `Destination`/`Recipient` come from the `APP_BASE_URL` environment variable, so setting Site URL alone does not fix an SSO mismatch |
 | `app.timezone` | string | `"America/Los_Angeles"` | IANA timezone for date display in web UI |
 | `ollama.enforce_num_ctx` | boolean | `true` | Override user-supplied `num_ctx` with model config `context_length` |
+| `vid.*` | mixed | (see Admin > Video Config) | Video generation runtime policy -- `vid.enabled`, `vid.default_model`, `vid.allowed_sizes`, `vid.min_seconds`, `vid.max_total_seconds`, `vid.max_concurrent_jobs_per_user`, `vid.user_storage_cap_gb`, `vid.max_image_upload_mb` |
+| `branding.*` | mixed | (see Admin > Branding) | Organization name, accent colors, and uploaded logo/favicon filenames |
+| `retention.request_images_days` | integer | `180` | Retention window for audit-offloaded request images on disk |
+| `retention.responses_store_days` | integer | `30` | Retention window for stored Responses API state. `0` disables the sweep |
 
 ---
 
@@ -2105,17 +2292,34 @@ MindRouter is designed for deployment on Linux servers with NVIDIA GPUs. The ful
 
 - Rocky Linux 8 prerequisites and dependency installation
 - SSL/TLS configuration (self-signed and Let's Encrypt)
-- Apache reverse proxy setup
+- Reverse proxy: the production stack ships its own **nginx** container for TLS termination on ports 80/443, so no host web server is required. An external Apache reverse proxy is documented as an alternative
 - Firewall and SELinux configuration
-- Docker Compose production stack
+- Docker Compose production stack, and bootstrapping the first admin account
 - Database migrations
-- GPU sidecar agent deployment
+- GPU sidecar agent deployment (NVIDIA Container Toolkit, per-node nginx proxy)
 - Node and backend registration
-- Verification and ongoing operations
+- Verification, tuning (uvicorn workers, MariaDB, nginx timeouts), Compose profiles, ongoing operations, and a security checklist
 
 For step-by-step production deployment instructions, see **[../deploy/DEPLOYMENT.md](../deploy/DEPLOYMENT.md)**.
 
-> **Database migrations:** MindRouter uses Alembic for schema migrations. Run `alembic upgrade head` inside the app container after deployment. When writing new migrations, note that MariaDB DDL is non-transactional -- a failed migration leaves partial state requiring manual cleanup. Always drop foreign key constraints before dropping their backing indexes (MariaDB error 1553).
+### Docker Compose env var passthrough
+
+The repository ships **two different Compose stacks**, and they get their configuration in two different ways. `pydantic-settings` reads `.env` / `.env.prod` only from *inside* the container, and neither file is mounted into the image -- so how a variable reaches the process depends on which file you run:
+
+| | `docker-compose.yml` (development / host-network stack) | `docker-compose.prod.yml` (guide's production stack) |
+|---|---|---|
+| Mechanism | `environment:` block, one `- VAR=${VAR:-default}` line per variable | `env_file: - .env.prod` |
+| Passthrough | **Only variables explicitly listed** reach the container. Anything absent from the block is invisible to the app no matter what the host `.env` says | **Every key in `.env.prod`** reaches the container; no per-variable edit needed |
+| Adding a new setting | Add the setting to `settings.py` **and** add a matching `- NEW_VAR=${NEW_VAR:-}` line here | Add the key to `.env.prod` on the host |
+
+Consequences worth knowing:
+
+- `docker-compose.yml` currently forwards the database/Redis/secret basics, all SSO variables, `APP_BASE_URL`, `BRAVE_SEARCH_API_KEY`, OTel, MCP, `RESPONSES_API_ENABLED`, and the full `VIDEO_*` and `BRANDING_*` blocks. Settings **not** in that list -- `THINKING_OFF_BY_DEFAULT`, `FIELD_VALIDATION`, `RUN_MIGRATIONS`, the `SCHEDULER_*` and `BACKEND_*` tunables, the `RESPONSES_STORE_*` / `CONVERSATIONS_*` caps -- run at their `settings.py` defaults under that stack until a passthrough line is added.
+- `APP_BASE_URL` is forwarded with an **empty** default (`${APP_BASE_URL:-}`), so an unset value does not fall back to the `settings.py` placeholder; the app sees an empty string and derives URLs from request headers instead.
+- A bare `docker compose up -d` on a host deployed from the guide starts the *other* stack alongside the running one. Pass `-f docker-compose.prod.yml` on every command, or export `COMPOSE_FILE=docker-compose.prod.yml` in the deployment shell.
+- Secrets belong only in the host `.env` / `.env.prod`. Never commit them.
+
+> **Database migrations:** MindRouter uses Alembic for schema migrations. Run `alembic upgrade head` inside the app container after deployment, or set `RUN_MIGRATIONS=1` to have the app apply them at startup before serving (run single-worker on first boot). When writing new migrations, note that MariaDB DDL is non-transactional -- a failed migration leaves partial state requiring manual cleanup. Always drop foreign key constraints before dropping their backing indexes (MariaDB error 1553).
 
 ---
 
@@ -2127,13 +2331,18 @@ MindRouter has a comprehensive test suite covering unit, integration, end-to-end
 
 | Command | Description |
 |---------|-------------|
-| `make test-unit` | Run unit tests (525+ tests) |
+| `make test` | Every pytest suite under `backend/app/tests` (unit + integration + e2e) |
+| `make test-unit` | Unit tests -- 1,000+ tests, no live services needed |
 | `make test-int` | Integration tests (requires live backends) |
 | `make test-e2e` | End-to-end tests |
-| `make test-smoke` | Smoke tests (full API surface) |
-| `make test-stress` | Load/stress tests |
-| `make test-a11y` | WCAG 2.1 accessibility tests |
+| `make test-smoke` | Smoke tests against a live deployment (`API_KEY=` required; `BASE_URL=` defaults to `http://localhost:8000`) |
+| `make test-stress` | Load/stress tests (`DURATION`, `CONCURRENCY` overridable) |
+| `make test-matrix` | Structured-output matrix tests across all API styles (live stack) |
+| `make test-thinking` | Structured output + thinking compliance (live stack) |
+| `make test-tools` | Live tool-calling compliance across tool-capable models |
+| `make test-a11y` | WCAG 2.1 accessibility tests (a subset of the unit suite) |
 | `make test-sidecar` | GPU sidecar agent tests |
-| `make test-all` | Run all test suites |
+| `make test-all` | `backend/app/tests` plus `sidecar/tests` -- note this runs the pytest suites and the sidecar tests, **not** the smoke or stress targets |
+| `make coverage` | Unit + integration with an HTML/terminal coverage report |
 
-For the complete test manifest including all test files, descriptions, and counts, see **[../TESTING.md](../TESTING.md)**.
+For the complete test manifest including all test files, descriptions, and counts, see **[../TESTING.md](../TESTING.md)** -- it is the single source of truth, and new test files must be registered there.
