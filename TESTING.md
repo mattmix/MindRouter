@@ -182,6 +182,24 @@ Exercises every API surface. Sections: `health`, `auth`, `openai`, `ollama`, `an
 --verbose        Print individual request results
 ```
 
+### Chat-capacity benchmark (`chat_bench.py`)
+
+**Runner:** `python chat_bench.py --base-url <vllm-backend-or-gateway> --model <name> ...`
+**Requirements:** Python 3.11+ with httpx; a host that can reach the target
+(inference-node ports are firewalled from workstations — run it from the
+mindrouter prod host's app container). No Makefile target on purpose: it is a
+capacity experiment, not a CI check.
+
+| File | What it covers |
+|------|----------------|
+| `chat_bench.py` | Simulated multi-turn chat users (think times, slot-templated prompts, 4-way prompt-length mixture with XL pastes, per-conversation salts) swept over user counts to find per-GPU chat capacity. Client-side TTFT/e2e/stream-tok/s/stall metrics with right-censoring at overload; per-stage vLLM /metrics deltas (queue, prefill, KV usage, spec-decode acceptance, prefix-cache hit rate) over exactly the measured window; configurable SLO gates; adaptive sweep extension + knee bisection; `--cache-adversarial` to remove cross-conversation prefix sharing (within-conversation history caching is inherent to chat and remains); `--no-think-time` for pure saturation mode. Outputs `turns.jsonl`, `server_samples.jsonl`, `summary.json`. |
+
+Key flags: `--users 1,2,4,...` `--stage-duration 300` `--min-turns 30`
+`--repeats K` `--no-adapt` `--max-users 512` `--mode direct|gateway`
+`--metrics-url <vllm /metrics>` `--slo-ttft-p95 2.0` `--slo-tps-p10 15`
+`--think off|on|none` (default off, matching the gateway fleet default).
+See the module docstring for the full traffic-model and measurement notes.
+
 ---
 
 ## 6. Structured Output + Thinking Compliance Tests
