@@ -14,7 +14,9 @@
 
 """API key generation and verification."""
 
+import asyncio
 import hashlib
+import hmac
 import secrets
 from typing import Optional, Tuple
 
@@ -36,30 +38,42 @@ _hasher = PasswordHasher(
     parallelism=1,
 )
 
+# Each Argon2 verify allocates memory_cost (64 MiB) and runs off-thread
+# (argon2-cffi releases the GIL); the cap keeps a flood of unknown keys
+# from blowing up worker RSS.
+_argon2_verify_semaphore = asyncio.Semaphore(4)
 
-def generate_api_key() -> Tuple[str, str, str]:
+
+def generate_api_key() -> Tuple[str, str, str, str]:
     """
     Generate a new API key.
 
     Returns:
-        Tuple of (full_key, key_hash, key_prefix)
+        Tuple of (full_key, key_hash, key_prefix, key_sha256)
         - full_key: The complete API key to give to the user (store nowhere!)
         - key_hash: Argon2 hash to store in database
         - key_prefix: First 8 chars for identification
+        - key_sha256: SHA-256 hexdigest for hot-path lookup
     """
-    # Generate random bytes
+    # SECURITY INVARIANT: token_urlsafe(32) = 256 bits of entropy. Storing a
+    # plain SHA-256 of the key is safe ONLY because the key is high-entropy
+    # and unguessable — never lower this, and never apply this scheme to
+    # low-entropy secrets like passwords.
     random_part = secrets.token_urlsafe(32)
 
     # Full key with prefix
     full_key = f"{API_KEY_PREFIX}{random_part}"
 
-    # Hash for storage
+    # Argon2 hash kept alongside key_sha256 for rollback safety
     key_hash = hash_api_key(full_key)
+
+    # SHA-256 digest for O(1) verification
+    key_sha256 = hashlib.sha256(full_key.encode()).hexdigest()
 
     # Prefix for identification (first 8 chars of random part)
     key_prefix = f"{API_KEY_PREFIX}{random_part[:8]}"
 
-    return full_key, key_hash, key_prefix
+    return full_key, key_hash, key_prefix, key_sha256
 
 
 def hash_api_key(api_key: str) -> str:
@@ -110,7 +124,12 @@ async def verify_api_key(db: AsyncSession, api_key: str) -> Optional[ApiKey]:
     """
     Verify an API key and return the ApiKey record if valid.
 
-    This performs a lookup by prefix first (fast), then verifies the hash.
+    Fast path: unique lookup on the SHA-256 digest — no Argon2 work.
+    Fallback (keys created before migration 069): prefix lookup + Argon2
+    verify, then backfill key_sha256 so the next request takes the fast path.
+
+    Status/expiry/user-active checks live in the callers (auth.py et al.)
+    against the returned row — this function only proves key possession.
 
     Args:
         db: Database session
@@ -119,22 +138,35 @@ async def verify_api_key(db: AsyncSession, api_key: str) -> Optional[ApiKey]:
     Returns:
         ApiKey record if valid, None otherwise
     """
-    # Extract prefix for lookup
     if not api_key.startswith(API_KEY_PREFIX):
         return None
 
-    # Get the prefix portion (first 8 chars after mr2_)
+    digest = hashlib.sha256(api_key.encode()).hexdigest()
+
+    # Fast path: key_sha256 is unique, so a hit identifies the key
+    db_key = await crud.get_api_key_by_sha256(db, digest)
+    if db_key is not None:
+        # Belt-and-braces constant-time recheck of the stored digest
+        if db_key.key_sha256 and hmac.compare_digest(db_key.key_sha256, digest):
+            return db_key
+        return None
+
+    # Fallback: prefix lookup (first 8 chars after mr2_) + Argon2 verify
     random_part = api_key[len(API_KEY_PREFIX):]
     key_prefix = f"{API_KEY_PREFIX}{random_part[:8]}"
 
-    # Look up by prefix
     db_key = await crud.get_api_key_by_prefix(db, key_prefix)
 
     if not db_key:
         return None
 
-    # Verify the full hash
-    if _verify_key_hash(api_key, db_key.key_hash):
+    async with _argon2_verify_semaphore:
+        verified = await asyncio.to_thread(_verify_key_hash, api_key, db_key.key_hash)
+
+    if verified:
+        # Verify-and-upgrade: the request session commits at teardown,
+        # persisting the backfill without an extra commit here
+        db_key.key_sha256 = digest
         return db_key
 
     return None

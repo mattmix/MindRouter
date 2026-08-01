@@ -977,7 +977,7 @@ async def create_api_key(
     expires_at = datetime.now(timezone.utc) + timedelta(days=expiry_days)
 
     # Generate new key
-    full_key, key_hash, key_prefix = generate_api_key()
+    full_key, key_hash, key_prefix, key_sha256 = generate_api_key()
 
     # Store in database
     await crud.create_api_key(
@@ -987,6 +987,7 @@ async def create_api_key(
         key_prefix=key_prefix,
         name=key_name,
         expires_at=expires_at,
+        key_sha256=key_sha256,
     )
     await db.commit()
 
