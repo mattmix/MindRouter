@@ -21,6 +21,7 @@ from datetime import datetime, timezone
 from typing import Any, AsyncIterator, Dict, Optional, Set, Tuple
 
 import httpx
+import orjson
 import tiktoken
 from fastapi import HTTPException, Request, status
 from opentelemetry import trace
@@ -39,15 +40,13 @@ from backend.app.core.canonical_schemas import (
     CanonicalMessage,
     CanonicalRerankRequest,
     CanonicalScoreRequest,
-    CanonicalStreamChunk,
-    CanonicalStreamChoice,
-    CanonicalStreamDelta,
     MessageRole,
     ResponseFormatType,
     UsageInfo,
 )
 from backend.app.core.scheduler.policy import get_scheduler
 from backend.app.core.scheduler.queue import Job, JobModality
+from backend.app.core.stream_coalesce import StreamCoalescer
 from backend.app.core.telemetry.registry import get_registry
 from backend.app.core.translators import DiffusionOutTranslator, OllamaOutTranslator, VLLMOutTranslator
 from backend.app.db import crud
@@ -389,8 +388,12 @@ class InferenceService:
         last_finish_reason = None
         inflight_chars = 0
         inflight_total_tokens = 0
-        real_usage = None  # populated from vLLM's include_usage chunk, if present
+        real_usage = None  # populated from the backend's usage chunk, if present
         completed = False
+        coalescer = StreamCoalescer(
+            self._settings.stream_coalesce_events,
+            self._settings.stream_coalesce_ms,
+        )
 
         try:
             async for chunk, backend in self._proxy_stream_with_retry(
@@ -398,32 +401,55 @@ class InferenceService:
             ):
                 routed_backend = backend
 
-                # vLLM's include_usage chunk carries real token counts with empty
-                # choices. Always capture it for accounting; forward it to the
-                # client only if they asked via stream_options.include_usage
-                # (otherwise the client-visible stream is unchanged).
-                if chunk.usage is not None and not chunk.choices:
-                    real_usage = chunk.usage
-                    if not getattr(request, "include_usage", False):
-                        continue  # internal-only; suppress from the client
+                # The vLLM translator yields wire-shaped dicts (hot path);
+                # the Ollama translator still yields Pydantic chunks.
+                if not isinstance(chunk, dict):
+                    chunk = chunk.model_dump(exclude_none=True, by_alias=True)
 
-                # Format as SSE (exclude_none to avoid tool_calls:null in chunks)
-                yield f"data: {chunk.model_dump_json(exclude_none=True, by_alias=True)}\n\n".encode()
+                usage = chunk.get("usage")
+                choices = chunk.get("choices") or []
+
+                # vLLM's include_usage chunk carries real token counts with
+                # empty choices; Ollama's final chunk has usage AND choices.
+                # Always capture usage for accounting; forward the usage-only
+                # chunk to the client only if they asked via
+                # stream_options.include_usage (otherwise the client-visible
+                # stream is unchanged).
+                if usage is not None:
+                    real_usage = UsageInfo(**usage)
+                    if not choices and not getattr(request, "include_usage", False):
+                        continue  # internal-only; suppress from the client
 
                 chunk_count += 1
 
                 # Accumulate content/reasoning and track finish reason
-                for choice in chunk.choices:
-                    if choice.delta.content:
-                        full_content += choice.delta.content
-                        inflight_chars += len(choice.delta.content)
-                    if choice.delta.reasoning:
-                        inflight_chars += len(choice.delta.reasoning)
-                    if choice.finish_reason:
-                        last_finish_reason = choice.finish_reason
+                force_flush = usage is not None
+                for choice in choices:
+                    delta = choice.get("delta") or {}
+                    content = delta.get("content")
+                    if content:
+                        full_content += content
+                        inflight_chars += len(content)
+                    reasoning = delta.get("reasoning_content")
+                    if reasoning:
+                        inflight_chars += len(reasoning)
+                    if choice.get("finish_reason"):
+                        last_finish_reason = choice["finish_reason"]
+                        force_flush = True
 
-                # Flush estimated tokens to Redis every 10 chunks
-                if chunk_count % 10 == 0 and inflight_chars > 0:
+                # Format as SSE (None keys already omitted, matching the old
+                # exclude_none serialization) and coalesce socket writes
+                event = b"data: " + orjson.dumps(chunk) + b"\n\n"
+                out = coalescer.add(event, force=force_flush)
+                if out is not None:
+                    yield out
+
+                # Flush estimated tokens to Redis at coalesce-flush
+                # boundaries (every 10 chunks when coalescing is disabled)
+                if (
+                    (out is not None if coalescer.enabled else chunk_count % 10 == 0)
+                    and inflight_chars > 0
+                ):
                     estimated = inflight_chars // 4
                     if estimated > 0:
                         await incr_inflight_tokens(estimated)
@@ -437,8 +463,10 @@ class InferenceService:
                     await incr_inflight_tokens(estimated)
                     inflight_total_tokens += estimated
 
-            # Send done signal
-            yield b"data: [DONE]\n\n"
+            # Send done signal (drains any coalesced events ahead of it)
+            out = coalescer.add(b"data: [DONE]\n\n", force=True)
+            if out is not None:
+                yield out
 
             # Update records — shield the entire completion path so that
             # CancelledError from client disconnect after [DONE] cannot
@@ -462,6 +490,10 @@ class InferenceService:
                 )
             except BaseException:
                 pass
+            # Drain coalesced events so they precede the error event
+            pending = coalescer.flush()
+            if pending is not None:
+                yield pending
             error_body = json.dumps({"error": {"message": str(e.detail), "type": "backend_error", "code": e.status_code}})
             yield f"data: {error_body}\n\ndata: [DONE]\n\n".encode()
         except BaseException as e:
@@ -708,13 +740,16 @@ class InferenceService:
         inflight_chars = 0
         inflight_total_tokens = 0
         last_finish_reason = None
+        coalescer = StreamCoalescer(
+            self._settings.stream_coalesce_events,
+            self._settings.stream_coalesce_ms,
+        )
 
         try:
             async for chunk_data, backend in self._proxy_stream_with_retry(
                 request, job, user, proxy_fn="_proxy_ollama_stream"
             ):
                 routed_backend = backend
-                yield (json.dumps(chunk_data) + "\n").encode()
                 chunk_count += 1
 
                 if "message" in chunk_data:
@@ -725,16 +760,35 @@ class InferenceService:
                     if thinking:
                         inflight_chars += len(thinking)
 
-                if chunk_data.get("done"):
+                done = bool(chunk_data.get("done"))
+                if done:
                     last_finish_reason = chunk_data.get("done_reason", "stop")
 
-                # Flush estimated tokens to Redis every 10 chunks
-                if chunk_count % 10 == 0 and inflight_chars > 0:
+                # Coalesce NDJSON line writes; the final (done) chunk
+                # always flushes
+                out = coalescer.add(
+                    (json.dumps(chunk_data) + "\n").encode(), force=done
+                )
+                if out is not None:
+                    yield out
+
+                # Flush estimated tokens to Redis at coalesce-flush
+                # boundaries (every 10 chunks when coalescing is disabled)
+                if (
+                    (out is not None if coalescer.enabled else chunk_count % 10 == 0)
+                    and inflight_chars > 0
+                ):
                     estimated = inflight_chars // 4
                     if estimated > 0:
                         await incr_inflight_tokens(estimated)
                         inflight_total_tokens += estimated
                         inflight_chars -= estimated * 4
+
+            # Drain any events still buffered (backend stream ended
+            # without a done chunk)
+            out = coalescer.flush()
+            if out is not None:
+                yield out
 
             # Flush remaining chars
             if inflight_chars > 0:
@@ -756,6 +810,10 @@ class InferenceService:
                 )
             except BaseException:
                 pass
+            # Drain coalesced events so they precede the error line
+            pending = coalescer.flush()
+            if pending is not None:
+                yield pending
             error_body = json.dumps({"error": str(e.detail)})
             yield (error_body + "\n").encode()
         except BaseException as e:
@@ -1649,8 +1707,13 @@ class InferenceService:
         self,
         request: CanonicalChatRequest,
         backend: Backend,
-    ) -> AsyncIterator[CanonicalStreamChunk]:
-        """Proxy streaming request to backend."""
+    ) -> AsyncIterator[Any]:
+        """Proxy streaming request to backend.
+
+        Yields wire-shaped chunk dicts for vLLM backends and
+        CanonicalStreamChunk models for Ollama backends; the consumer
+        normalizes.
+        """
         if backend.engine == BackendEngine.OLLAMA:
             payload = OllamaOutTranslator.translate_chat_request(request)
             url = f"{backend.url}/api/chat"

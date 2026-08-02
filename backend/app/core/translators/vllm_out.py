@@ -14,10 +14,11 @@
 
 """Canonical schema to vLLM (OpenAI-compatible) API format translator."""
 
-import json
 import re
 import time
 from typing import Any, AsyncIterator, Dict, List, Optional
+
+import orjson
 
 from backend.app.core.canonical_schemas import (
     CanonicalChatRequest,
@@ -34,10 +35,6 @@ from backend.app.core.canonical_schemas import (
     CanonicalScoreData,
     CanonicalScoreRequest,
     CanonicalScoreResponse,
-    CanonicalStreamChunk,
-    CanonicalStreamChoice,
-    CanonicalStreamDelta,
-    CanonicalStreamToolCallDelta,
     CanonicalToolCall,
     ImageBase64Content,
     ImageUrlContent,
@@ -374,7 +371,7 @@ class VLLMOutTranslator:
         request_id: str,
         model: str,
         thinking_enabled: bool = True,
-    ) -> AsyncIterator[CanonicalStreamChunk]:
+    ) -> AsyncIterator[Dict[str, Any]]:
         """Translate vLLM/OpenAI streaming response to canonical stream chunks.
 
         OpenAI streams Server-Sent Events:
@@ -387,11 +384,19 @@ class VLLMOutTranslator:
             model: Model name
 
         Yields:
-            CanonicalStreamChunk objects
+            Plain dicts shaped exactly like
+            ``CanonicalStreamChunk.model_dump(exclude_none=True, by_alias=True)``
+            (None keys omitted, ``reasoning`` emitted as ``reasoning_content``)
+            — the hot path skips per-chunk Pydantic model construction.
         """
         buffer = ""
-        # State for extracting <think> tags from streaming content
-        # when vLLM doesn't provide reasoning_content (e.g. Qwen3-32B)
+        # State for extracting <think> tags from streaming content when
+        # vLLM doesn't provide reasoning_content (e.g. Qwen3-32B).  The
+        # per-chunk state machine is gated: until "<think>" is actually
+        # seen, each chunk only pays for a substring probe, with a
+        # partial-prefix hold-back across chunk boundaries so a split
+        # tag can't slip past.
+        think_seen = False
         in_think = False
         think_tag_buf = ""  # buffer for partial tag matching
 
@@ -419,40 +424,74 @@ class VLLMOutTranslator:
                             return
 
                         try:
-                            data = json.loads(data_str)
+                            data = orjson.loads(data_str)
+                        except orjson.JSONDecodeError:
+                            continue
 
-                            choices = []
-                            for choice_data in data.get("choices", []):
-                                delta_data = choice_data.get("delta", {})
+                        choices = []
+                        for choice_data in data.get("choices", []):
+                            delta_data = choice_data.get("delta", {})
 
-                                # Parse tool_calls deltas
-                                tc_deltas = None
-                                if "tool_calls" in delta_data and delta_data["tool_calls"]:
-                                    tc_deltas = [
-                                        CanonicalStreamToolCallDelta(
-                                            index=tcd.get("index", 0),
-                                            id=tcd.get("id"),
-                                            type=tcd.get("type"),
-                                            function=tcd.get("function"),
-                                        )
-                                        for tcd in delta_data["tool_calls"]
-                                    ]
+                            # Parse tool_calls deltas (omit None keys to
+                            # match the old exclude_none serialization)
+                            tc_deltas = None
+                            if delta_data.get("tool_calls"):
+                                tc_deltas = []
+                                for tcd in delta_data["tool_calls"]:
+                                    tc: Dict[str, Any] = {"index": tcd.get("index", 0)}
+                                    if tcd.get("id") is not None:
+                                        tc["id"] = tcd["id"]
+                                    if tcd.get("type") is not None:
+                                        tc["type"] = tcd["type"]
+                                    if tcd.get("function") is not None:
+                                        tc["function"] = tcd["function"]
+                                    tc_deltas.append(tc)
 
-                                content_delta = delta_data.get("content")
-                                reasoning_delta = delta_data.get("reasoning_content") or delta_data.get("reasoning")
+                            content_delta = delta_data.get("content")
+                            reasoning_delta = delta_data.get("reasoning_content") or delta_data.get("reasoning")
 
-                                # Same Qwen 3.5 workaround as non-streaming:
-                                # if content is empty but reasoning has data,
-                                # promote reasoning to content.
-                                # Only when thinking was explicitly disabled.
-                                if not thinking_enabled and not content_delta and reasoning_delta and not tc_deltas:
-                                    content_delta = reasoning_delta
-                                    reasoning_delta = None
+                            # Same Qwen 3.5 workaround as non-streaming:
+                            # if content is empty but reasoning has data,
+                            # promote reasoning to content.
+                            # Only when thinking was explicitly disabled.
+                            if not thinking_enabled and not content_delta and reasoning_delta and not tc_deltas:
+                                content_delta = reasoning_delta
+                                reasoning_delta = None
 
-                                # Fallback: extract <think> tags from content
-                                # stream when vLLM doesn't provide
-                                # reasoning_content (e.g. Qwen3-32B)
-                                if content_delta and not reasoning_delta:
+                            # Fallback: extract <think> tags from content
+                            # stream when vLLM doesn't provide
+                            # reasoning_content (e.g. Qwen3-32B)
+                            if content_delta and not reasoning_delta:
+                                if not think_seen:
+                                    # Cheap gate: probe held-back tail +
+                                    # chunk for the opening tag before
+                                    # engaging the state machine.
+                                    probe = think_tag_buf + content_delta
+                                    if "<think>" in probe:
+                                        think_seen = True
+                                        # Run the machine over the held
+                                        # tail + this chunk
+                                        content_delta = probe
+                                        think_tag_buf = ""
+                                    elif "<" not in probe:
+                                        # Fast path: no possible tag start
+                                        content_delta = probe
+                                        think_tag_buf = ""
+                                    else:
+                                        # Hold back a trailing partial
+                                        # <think> prefix (same rule as the
+                                        # machine) so a tag split across
+                                        # chunks can't slip past the gate
+                                        partial = ""
+                                        for i in range(1, min(len("<think>"), len(probe) + 1)):
+                                            if probe.endswith("<think>"[:i]):
+                                                partial = probe[-i:]
+                                                break
+                                        think_tag_buf = partial
+                                        emitted = probe[: len(probe) - len(partial)]
+                                        content_delta = emitted if emitted else None
+
+                                if think_seen:
                                     think_tag_buf += content_delta
                                     content_delta = None
                                     emit_content = ""
@@ -495,46 +534,45 @@ class VLLMOutTranslator:
                                     content_delta = emit_content if emit_content else None
                                     reasoning_delta = emit_reasoning if emit_reasoning else None
 
-                                delta = CanonicalStreamDelta(
-                                    role=(
-                                        MessageRole(delta_data["role"])
-                                        if "role" in delta_data
-                                        else None
-                                    ),
-                                    content=content_delta,
-                                    reasoning=reasoning_delta,
-                                    tool_calls=tc_deltas,
-                                )
-                                choices.append(
-                                    CanonicalStreamChoice(
-                                        index=choice_data.get("index", 0),
-                                        delta=delta,
-                                        finish_reason=choice_data.get("finish_reason"),
-                                    )
-                                )
+                            delta: Dict[str, Any] = {}
+                            if delta_data.get("role") is not None:
+                                delta["role"] = delta_data["role"]
+                            if content_delta is not None:
+                                delta["content"] = content_delta
+                            if reasoning_delta is not None:
+                                delta["reasoning_content"] = reasoning_delta
+                            if tc_deltas is not None:
+                                delta["tool_calls"] = tc_deltas
 
-                            # Check for usage in final chunks
-                            usage = None
-                            if "usage" in data and data["usage"]:
-                                usage_data = data["usage"]
-                                usage = UsageInfo(
-                                    prompt_tokens=usage_data.get("prompt_tokens", 0),
-                                    completion_tokens=usage_data.get(
-                                        "completion_tokens", 0
-                                    ),
-                                    total_tokens=usage_data.get("total_tokens", 0),
-                                )
+                            choice: Dict[str, Any] = {
+                                "index": choice_data.get("index", 0),
+                                "delta": delta,
+                            }
+                            if choice_data.get("finish_reason") is not None:
+                                choice["finish_reason"] = choice_data["finish_reason"]
+                            choices.append(choice)
 
-                            yield CanonicalStreamChunk(
-                                id=data.get("id") or request_id or f"chatcmpl-{int(time.time())}",
-                                created=data.get("created") or int(time.time()),
-                                model=data.get("model") or model,
-                                choices=choices,
-                                usage=usage,
-                            )
+                        chunk: Dict[str, Any] = {
+                            "id": data.get("id") or request_id or f"chatcmpl-{int(time.time())}",
+                            "object": "chat.completion.chunk",
+                            "created": data.get("created") or int(time.time()),
+                            "model": data.get("model") or model,
+                            "choices": choices,
+                        }
 
-                        except json.JSONDecodeError:
-                            continue
+                        # Check for usage in final chunks
+                        if data.get("usage"):
+                            usage_data = data["usage"]
+                            chunk["usage"] = {
+                                "prompt_tokens": usage_data.get("prompt_tokens", 0),
+                                "completion_tokens": usage_data.get(
+                                    "completion_tokens", 0
+                                ),
+                                "total_tokens": usage_data.get("total_tokens", 0),
+                                "is_estimated": False,
+                            }
+
+                        yield chunk
 
     @staticmethod
     def translate_rerank_request(

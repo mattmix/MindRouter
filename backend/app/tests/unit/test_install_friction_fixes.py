@@ -42,11 +42,12 @@ def test_vllm_injects_include_usage_for_streaming():
 
 
 def test_streaming_loop_harvests_usage_and_completion_uses_it():
-    # #10b wiring: capture the empty-choices usage chunk, suppress it from the
-    # client, pass it to completion, and use it instead of the estimate.
+    # #10b wiring: capture usage whenever a chunk carries it (Ollama's final
+    # chunk has usage AND choices), suppress only the empty-choices chunk from
+    # the client, pass it to completion, and use it instead of the estimate.
     src = _read("backend/app/services/inference.py")
-    assert "if chunk.usage is not None and not chunk.choices:" in src
-    assert "real_usage = chunk.usage" in src
+    assert "real_usage = UsageInfo(**usage)" in src
+    assert 'if not choices and not getattr(request, "include_usage", False):' in src
     assert "usage=real_usage," in src
     comp = src[src.index("async def _complete_streaming_request"):]
     comp = comp[: comp.index("\n    async def ", 1)]

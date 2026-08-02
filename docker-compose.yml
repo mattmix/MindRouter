@@ -63,6 +63,9 @@ services:
       - OTEL_SERVICE_NAME=${OTEL_SERVICE_NAME:-mindrouter}
       - MCP_SERVER_URL=${MCP_SERVER_URL:-http://127.0.0.1:8001}
       - RESPONSES_API_ENABLED=${RESPONSES_API_ENABLED:-true}
+      # Streaming write coalescing (see backend/app/settings.py — keep in sync)
+      - STREAM_COALESCE_EVENTS=${STREAM_COALESCE_EVENTS:-8}
+      - STREAM_COALESCE_MS=${STREAM_COALESCE_MS:-50}
       # Video generation (see backend/app/settings.py — keep in sync)
       - VIDEO_STORAGE_PATH=${VIDEO_STORAGE_PATH:-/data/video}
       - VIDEO_RUNNER_ENABLED=${VIDEO_RUNNER_ENABLED:-true}
