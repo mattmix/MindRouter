@@ -1,7 +1,8 @@
 """Redis client for atomic token metrics across workers."""
 
 import asyncio
-from typing import Optional
+import uuid
+from typing import Iterable, Optional
 
 from backend.app.logging_config import get_logger
 from backend.app.settings import get_settings
@@ -273,6 +274,124 @@ async def seed_cluster_tokens(
         await pipe.execute()
     except Exception:
         logger.exception("redis_seed_cluster_tokens_failed")
+
+
+# ------------------------------------------------------------------
+# Per-backend admission slots (fleet-wide max_concurrent enforcement)
+# ------------------------------------------------------------------
+# Each worker owns its own subkey mr:adm:{backend_id}:{worker_id}, so no
+# worker ever decrements another worker's count.  A worker that dies stops
+# refreshing its TTLs and its subkeys expire — leaked slots self-heal
+# within _ADM_TTL_SECONDS.  The fleet-wide count is the sum of all live
+# subkeys for a backend.
+
+WORKER_ID = uuid.uuid4().hex
+_ADM_KEY_PREFIX = "mr:adm:"
+_ADM_TTL_SECONDS = 90  # ~3 missed 30s reconcile cycles before slots leak away
+
+# DECR with a floor of zero (a decrement can arrive after the subkey
+# expired or was reconciled down — never let the count go negative).
+_ADM_DECR_LUA = (
+    "local v = redis.call('decr', KEYS[1]) "
+    "if v < 0 then redis.call('set', KEYS[1], 0) v = 0 end "
+    "redis.call('expire', KEYS[1], ARGV[1]) "
+    "return v"
+)
+
+
+def _adm_key(backend_id: int, worker_id: str) -> str:
+    return f"{_ADM_KEY_PREFIX}{backend_id}:{worker_id}"
+
+
+async def incr_backend_inflight(
+    backend_id: int, worker_id: str = WORKER_ID
+) -> Optional[int]:
+    """Claim one admission slot on a backend for this worker.
+
+    Returns this worker's new subkey count, or None if Redis is
+    unavailable (caller falls back to per-worker admission).
+    """
+    if not _available or not _redis:
+        return None
+    try:
+        key = _adm_key(backend_id, worker_id)
+        pipe = _redis.pipeline(transaction=False)
+        pipe.incr(key)
+        pipe.expire(key, _ADM_TTL_SECONDS)
+        results = await pipe.execute()
+        return int(results[0])
+    except Exception:
+        logger.exception("redis_incr_backend_inflight_failed", backend_id=backend_id)
+        return None
+
+
+async def decr_backend_inflight(
+    backend_id: int, worker_id: str = WORKER_ID
+) -> Optional[int]:
+    """Release one admission slot on a backend for this worker (floor 0)."""
+    if not _available or not _redis:
+        return None
+    try:
+        key = _adm_key(backend_id, worker_id)
+        return int(await _redis.eval(_ADM_DECR_LUA, 1, key, _ADM_TTL_SECONDS))
+    except Exception:
+        logger.exception("redis_decr_backend_inflight_failed", backend_id=backend_id)
+        return None
+
+
+async def set_backend_inflight(
+    backend_id: int, count: int, worker_id: str = WORKER_ID
+) -> None:
+    """Reconcile this worker's slot count to its actual local in-flight count.
+
+    An absolute SET (not INCR) bounds drift from any missed decrements;
+    called periodically it also refreshes the subkey TTL.
+    """
+    if not _available or not _redis:
+        return
+    try:
+        key = _adm_key(backend_id, worker_id)
+        if count > 0:
+            await _redis.set(key, count, ex=_ADM_TTL_SECONDS)
+        else:
+            await _redis.delete(key)
+    except Exception:
+        logger.exception("redis_set_backend_inflight_failed", backend_id=backend_id)
+
+
+async def get_backend_inflight_snapshot(
+    backend_ids: Iterable[int],
+) -> Optional[dict[int, int]]:
+    """Sum live admission slots per backend across all workers.
+
+    Returns {backend_id: fleet_wide_inflight} covering every requested id
+    (0 when no worker holds slots), or None if Redis is unavailable —
+    callers must then fall back to their local per-worker counts.
+    """
+    if not _available or not _redis:
+        return None
+    try:
+        totals: dict[int, int] = {bid: 0 for bid in backend_ids}
+        keys = []
+        async for key in _redis.scan_iter(match=f"{_ADM_KEY_PREFIX}*", count=200):
+            keys.append(key)
+        if keys:
+            vals = await _redis.mget(keys)
+            for key, val in zip(keys, vals):
+                if val is None:
+                    continue  # expired between SCAN and MGET
+                try:
+                    # mr:adm:{backend_id}:{worker_id}
+                    bid = int(key.split(":")[2])
+                    count = int(val)
+                except (IndexError, ValueError):
+                    continue
+                if bid in totals and count > 0:
+                    totals[bid] += count
+        return totals
+    except Exception:
+        logger.exception("redis_backend_inflight_snapshot_failed")
+        return None
 
 
 # ------------------------------------------------------------------

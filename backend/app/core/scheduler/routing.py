@@ -19,6 +19,7 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Set, Tuple
 
+from backend.app.core import redis_client
 from backend.app.core.scheduler.queue import Job, RequestQueue
 from backend.app.core.scheduler.fairshare import FairShareManager
 from backend.app.core.scheduler.scoring import BackendScorer, BackendScore
@@ -175,7 +176,15 @@ class BackendRouter:
 
         async with self._lock:
             # Get current queue depths
-            queue_depths = dict(self._backend_queue_depths)
+            local_depths = dict(self._backend_queue_depths)
+
+        # Prefer the fleet-wide admission counts from Redis so max_concurrent
+        # is enforced across all workers; fall back to this worker's local
+        # counters (today's per-worker semantics) when Redis is unavailable.
+        shared_depths = await redis_client.get_backend_inflight_snapshot(
+            [b.id for b in backends]
+        )
+        queue_depths = shared_depths if shared_depths is not None else local_depths
 
         # Score and rank backends
         scores = self.scorer.rank_backends(
@@ -222,11 +231,16 @@ class BackendRouter:
 
         # Increment queue depth for selected backend and record the
         # assignment on the job so the GC can attribute it correctly.
+        # The local counter is always maintained — it is the fail-open
+        # fallback and feeds get_queue_stats.
         job.assigned_backend_id = selected_backend.id
         async with self._lock:
             self._backend_queue_depths[selected_backend.id] = (
                 self._backend_queue_depths.get(selected_backend.id, 0) + 1
             )
+        # Mirror the claim into the shared admission counter (no-op when
+        # Redis is down).
+        await redis_client.incr_backend_inflight(selected_backend.id)
 
         logger.info(
             "job_routed",
@@ -287,6 +301,7 @@ class BackendRouter:
                 depth = self._backend_queue_depths[backend_id]
             else:
                 depth = 0
+        await redis_client.decr_backend_inflight(backend_id)
 
         # Auto-complete drain when queue depth hits 0
         if depth == 0:
@@ -321,6 +336,7 @@ class BackendRouter:
                 depth = self._backend_queue_depths[backend_id]
             else:
                 depth = 0
+        await redis_client.decr_backend_inflight(backend_id)
 
         # Auto-complete drain when queue depth hits 0
         if depth == 0:
@@ -505,6 +521,15 @@ class BackendRouter:
                 # Recompute priorities for fairness
                 await self.recompute_priorities()
 
+                # Reconcile shared admission counters: pin this worker's
+                # Redis subkeys to its actual local in-flight counts (SET,
+                # not INCR) and refresh their TTLs.  Bounds drift from any
+                # missed decrements.
+                async with self._lock:
+                    local_depths = dict(self._backend_queue_depths)
+                for bid, depth in local_depths.items():
+                    await redis_client.set_backend_inflight(bid, depth)
+
                 # Record queue depth sample for trend analysis
                 queue_stats = await self.queue.get_queue_stats()
                 now = datetime.now(timezone.utc)
@@ -578,6 +603,9 @@ class BackendRouter:
                                 self._backend_queue_depths[bid] = max(
                                     0, self._backend_queue_depths[bid] - 1
                                 )
+                        await redis_client.decr_backend_inflight(
+                            job.assigned_backend_id
+                        )
 
                     evicted += 1
 
@@ -585,6 +613,7 @@ class BackendRouter:
             # they are entirely phantom.  Reset them.
             remaining_count = len(await self.queue.get_all_jobs())
             if remaining_count == 0:
+                stale_backend_ids: List[int] = []
                 async with self._lock:
                     stale_total = sum(self._backend_queue_depths.values())
                     if stale_total > 0:
@@ -592,7 +621,12 @@ class BackendRouter:
                             "gc_queue_depth_reset",
                             stale_total=stale_total,
                         )
+                        stale_backend_ids = list(self._backend_queue_depths)
                         self._backend_queue_depths.clear()
+                # Phantom slots — zero this worker's shared counters too
+                # rather than waiting for their TTLs to lapse.
+                for bid in stale_backend_ids:
+                    await redis_client.set_backend_inflight(bid, 0)
 
             self._gc_last_evicted = evicted
 
