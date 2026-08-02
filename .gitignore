@@ -135,3 +135,8 @@ UofI_BrandBook_2023.pdf
 # U of I source logo files (dropped locally; live on prod branding volume)
 UI_Main_horizontal_pms_3514.png
 UI_Main_stacked_4c.png
+
+# Capacity/benchmark reports — kept as local deliverables in ~/mindrouter-reports, not tracked
+docs/gemma4-31b-chat-capacity-report-*.pdf
+docs/campus-chat-capacity-executive-briefing.pdf
+bench_results/
