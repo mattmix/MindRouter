@@ -98,6 +98,48 @@ _MAX_OUTPUT_TOKENS = 65536
 _TOKEN_BUFFER = 1024
 
 
+def _estimate_input_tokens(request: "CanonicalChatRequest") -> int:
+    """Tiktoken estimate, memoized on the request so retries don't re-encode."""
+    est = getattr(request, "_est_input_tokens", None)
+    if est is None:
+        est = _tiktoken_estimate(request)
+        request._est_input_tokens = est
+    return est
+
+
+def _invalidate_token_memos(request: "CanonicalChatRequest") -> None:
+    """Drop memoized token counts (after messages change or a recount is forced)."""
+    request._est_input_tokens = None
+    request._exact_input_tokens = None
+
+
+def _is_context_length_error(detail: Any) -> bool:
+    """Detect a vLLM 400 caused by context-window overflow."""
+    text = detail if isinstance(detail, str) else json.dumps(detail, default=str)
+    text = text.lower()
+    return "context length" in text or "max_model_len" in text
+
+
+# ollama.enforce_num_ctx is read on every Ollama attempt — cache the DB config
+# value for a short TTL instead of opening a fresh session on the hot path.
+_ENFORCE_NUM_CTX_TTL_S = 30.0
+_enforce_num_ctx_cache: Optional[Tuple[bool, float]] = None
+
+
+async def _get_enforce_num_ctx() -> bool:
+    """Read the ollama.enforce_num_ctx config with a 30s TTL cache."""
+    global _enforce_num_ctx_cache
+    cached = _enforce_num_ctx_cache
+    now = time.monotonic()
+    if cached is not None and now - cached[1] < _ENFORCE_NUM_CTX_TTL_S:
+        return cached[0]
+    from backend.app.db.session import get_async_db_context
+    async with get_async_db_context() as cfg_db:
+        value = bool(await crud.get_config_json(cfg_db, "ollama.enforce_num_ctx", True))
+    _enforce_num_ctx_cache = (value, now)
+    return value
+
+
 class InferenceService:
     """
     Handles inference request processing.
@@ -190,11 +232,17 @@ class InferenceService:
         chat template (including tool-calling overhead). Falls back to tiktoken
         estimation on failure. For Ollama backends, uses tiktoken directly.
 
+        Counts are memoized on the request object so retry attempts don't
+        re-tokenize identical messages.
+
         Returns:
             (token_count, is_estimate) — is_estimate is False only when vLLM
             /tokenize returned an authoritative count.
         """
         if backend.engine == BackendEngine.VLLM:
+            cached = getattr(request, "_exact_input_tokens", None)
+            if cached is not None:
+                return cached, False
             try:
                 payload = VLLMOutTranslator.translate_chat_request(request)
                 payload.pop("stream", None)
@@ -206,6 +254,7 @@ class InferenceService:
                 )
                 resp.raise_for_status()
                 count = resp.json().get("count", 0)
+                request._exact_input_tokens = count
                 return count, False
             except Exception as e:
                 logger.warning(
@@ -215,21 +264,45 @@ class InferenceService:
                 )
                 # Fall through to tiktoken estimation
 
-        return _tiktoken_estimate(request), True
+        return _estimate_input_tokens(request), True
 
     async def cap_max_tokens(
         self,
         request: CanonicalChatRequest,
         backend: Backend,
         context_length: int,
+        force_exact: bool = False,
     ) -> None:
         """Cap max_tokens to fit within the model's context window.
 
-        Uses exact token counting for vLLM (via /tokenize) or tiktoken
-        estimation for Ollama, then applies:
+        Far from the context boundary a conservative tiktoken bound
+        (estimate * 1.3 + per-message overhead + buffer) is enough to prove
+        the request fits, so the backend /tokenize round-trip is skipped.
+        Near the boundary — or when exactness is required (auto_truncate,
+        or force_exact after a context-length 400) — uses exact counting
+        for vLLM (via /tokenize) or tiktoken estimation for Ollama, then
+        applies:
             remaining = context_length - input_tokens - buffer
             max_tokens = min(requested, remaining, hard_cap)
         """
+        if force_exact:
+            # A context-length 400 slipped past the gate — recount from scratch.
+            _invalidate_token_memos(request)
+        elif not request.auto_truncate:
+            est = _estimate_input_tokens(request)
+            bound = int(est * 1.3) + 16 * len(request.messages or []) + _TOKEN_BUFFER
+            room = context_length - bound
+            generous = (
+                room >= 4096
+                if request.max_tokens is None
+                else room >= 2048 and room >= request.max_tokens
+            )
+            if generous:
+                # Generous headroom — cap against the conservative bound.
+                requested = request.max_tokens if request.max_tokens is not None else _MAX_OUTPUT_TOKENS
+                request.max_tokens = min(requested, room, _MAX_OUTPUT_TOKENS)
+                return
+
         input_tokens, is_estimate = await self._count_input_tokens(request, backend)
 
         remaining = context_length - input_tokens - _TOKEN_BUFFER
@@ -247,6 +320,7 @@ class InferenceService:
                 lambda s: len(_tiktoken_encoder.encode(s)),
             )
             if dropped:
+                _invalidate_token_memos(request)
                 input_tokens, is_estimate = await self._count_input_tokens(
                     request, backend
                 )
@@ -1307,6 +1381,7 @@ class InferenceService:
         max_attempts = self._settings.backend_retry_max_attempts
         tried_backends: Set[int] = set()
         last_error: Optional[Exception] = None
+        context_recap_done = False
 
         for attempt in range(max_attempts):
             # First attempt waits normally for capacity; retries fail fast.
@@ -1335,10 +1410,12 @@ class InferenceService:
 
             # Cap max_tokens using actual token count (vLLM /tokenize) or
             # tiktoken estimate (Ollama / fallback).
+            cap_context_length = None
             if models and hasattr(request, 'max_tokens'):
                 _target = next((m for m in models if m.name == job.model), models[0])
                 if _target.context_length:
-                    await self.cap_max_tokens(request, backend, _target.context_length)
+                    cap_context_length = _target.context_length
+                    await self.cap_max_tokens(request, backend, cap_context_length)
 
             # Strip thinking mode for OLLAMA models that don't support it
             # (Ollama 400s if think is set on a non-thinking model). vLLM ignores
@@ -1372,9 +1449,7 @@ class InferenceService:
                 if _ctx_target.context_length:
                     if request.backend_options is None:
                         request.backend_options = {}
-                    from backend.app.db.session import get_async_db_context
-                    async with get_async_db_context() as cfg_db:
-                        enforce = await crud.get_config_json(cfg_db, "ollama.enforce_num_ctx", True)
+                    enforce = await _get_enforce_num_ctx()
                     if enforce:
                         request.backend_options["num_ctx"] = _ctx_target.context_length
                     else:
@@ -1432,6 +1507,25 @@ class InferenceService:
                     except Exception:
                         detail = e.response.text or str(e)
 
+                    # Safety net for the /tokenize gate: a vLLM 400 about
+                    # context length means the conservative estimate was too
+                    # low — recount exactly and retry once on the same backend.
+                    if (
+                        not context_recap_done
+                        and attempt < max_attempts - 1
+                        and cap_context_length
+                        and backend.engine == BackendEngine.VLLM
+                        and e.response.status_code == 400
+                        and _is_context_length_error(detail)
+                    ):
+                        context_recap_done = True
+                        await self.cap_max_tokens(
+                            request, backend, cap_context_length, force_exact=True,
+                        )
+                        tried_backends.discard(backend.id)
+                        last_error = e
+                        continue
+
                     logger.warning(
                         "backend_4xx",
                         backend_id=backend.id,
@@ -1484,6 +1578,7 @@ class InferenceService:
         max_attempts = self._settings.backend_retry_max_attempts
         tried_backends: Set[int] = set()
         last_error: Optional[Exception] = None
+        context_recap_done = False
 
         for attempt in range(max_attempts):
             # First attempt waits normally for capacity; retries fail fast.
@@ -1507,10 +1602,12 @@ class InferenceService:
                     raise
 
             # Cap max_tokens (same logic as non-streaming path).
+            cap_context_length = None
             if _models and hasattr(request, 'max_tokens'):
                 _target = next((m for m in _models if m.name == job.model), _models[0])
                 if _target.context_length:
-                    await self.cap_max_tokens(request, backend, _target.context_length)
+                    cap_context_length = _target.context_length
+                    await self.cap_max_tokens(request, backend, cap_context_length)
 
             # Strip thinking mode for OLLAMA models that don't support it
             # (see non-streaming path for rationale; never strip on vLLM).
@@ -1536,9 +1633,7 @@ class InferenceService:
                 if _ctx_target.context_length:
                     if request.backend_options is None:
                         request.backend_options = {}
-                    from backend.app.db.session import get_async_db_context
-                    async with get_async_db_context() as cfg_db:
-                        enforce = await crud.get_config_json(cfg_db, "ollama.enforce_num_ctx", True)
+                    enforce = await _get_enforce_num_ctx()
                     if enforce:
                         request.backend_options["num_ctx"] = _ctx_target.context_length
                     else:
@@ -1595,6 +1690,25 @@ class InferenceService:
                         detail = e.response.json()
                     except Exception:
                         detail = e.response.text or str(e)
+
+                    # Safety net for the /tokenize gate (see _proxy_with_retry).
+                    # 4xx always precedes the first chunk, so retry is safe.
+                    if (
+                        not context_recap_done
+                        and not first_chunk_received
+                        and attempt < max_attempts - 1
+                        and cap_context_length
+                        and backend.engine == BackendEngine.VLLM
+                        and e.response.status_code == 400
+                        and _is_context_length_error(detail)
+                    ):
+                        context_recap_done = True
+                        await self.cap_max_tokens(
+                            request, backend, cap_context_length, force_exact=True,
+                        )
+                        tried_backends.discard(backend.id)
+                        last_error = e
+                        continue
 
                     logger.warning(
                         "stream_backend_4xx",

@@ -64,9 +64,6 @@ class Job:
     priority: float = 0.0  # Computed by fair-share algorithm
     assigned_backend_id: Optional[int] = None
 
-    # Original request data
-    request_data: Optional[Dict[str, Any]] = None
-
     def __lt__(self, other: "Job") -> bool:
         """Compare jobs for priority queue ordering (higher priority first)."""
         return self.priority > other.priority
