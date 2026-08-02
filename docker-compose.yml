@@ -17,6 +17,11 @@ services:
       context: .
       dockerfile: Dockerfile
     network_mode: host
+    # Worker count is deployment-tunable (Dockerfile default: 2). With
+    # Redis-shared admission (mr:adm:* counters), backends.max_concurrent is a
+    # FLEET-WIDE cap independent of worker count. Size DATABASE_POOL_SIZE so
+    # workers x (async+sync pools) stays under MariaDB max_connections (512).
+    command: ["uvicorn", "backend.app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "${UVICORN_WORKERS:-2}", "--timeout-graceful-shutdown", "60"]
     environment:
       - DATABASE_URL=mysql+pymysql://mindrouter:${MYSQL_PASSWORD:-mindrouter_password}@127.0.0.1:3306/mindrouter
       - REDIS_URL=redis://127.0.0.1:6379/0
@@ -25,6 +30,8 @@ services:
       - CHAT_FILES_PATH=/data/chat_files
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - DEBUG=${DEBUG:-false}
+      - DATABASE_POOL_SIZE=${DATABASE_POOL_SIZE:-30}
+      - DATABASE_MAX_OVERFLOW=${DATABASE_MAX_OVERFLOW:-20}
       - AZURE_AD_CLIENT_ID=${AZURE_AD_CLIENT_ID:-}
       - AZURE_AD_CLIENT_SECRET=${AZURE_AD_CLIENT_SECRET:-}
       - AZURE_AD_TENANT_ID=${AZURE_AD_TENANT_ID:-}
