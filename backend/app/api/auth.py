@@ -14,7 +14,6 @@
 
 """API authentication and authorization."""
 
-from datetime import datetime, timezone
 from typing import Optional, Tuple
 
 from fastapi import Depends, HTTPException, Request, status
@@ -24,9 +23,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from itsdangerous import URLSafeTimedSerializer
 
 from backend.app.db import crud
-from backend.app.db.models import ApiKey, ApiKeyStatus, User, UserRole, Group
+from backend.app.db.models import ApiKey, User, UserRole, Group
 from backend.app.db.session import get_async_db
-from backend.app.security.api_keys import verify_api_key
+from backend.app.security.api_keys import api_key_rejection_reason, verify_api_key
 from backend.app.logging_config import get_logger
 from backend.app.settings import get_settings
 
@@ -99,48 +98,36 @@ async def authenticate_request(
             detail="Invalid API key",
         )
 
-    # Check key status
-    if api_key.status != ApiKeyStatus.ACTIVE:
-        logger.warning(
-            "inactive_api_key",
-            key_id=api_key.id,
-            status=api_key.status.value,
-        )
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=f"API key is {api_key.status.value}",
-        )
-
-    # Check expiration (MariaDB returns naive datetimes)
-    # Service keys never expire
-    if not api_key.is_service:
-        expires_at = api_key.expires_at
-        if expires_at and expires_at.tzinfo is None:
-            expires_at = expires_at.replace(tzinfo=timezone.utc)
-        if expires_at and expires_at < datetime.now(timezone.utc):
+    # Post-verify gate — one source of truth (security/api_keys.py) shared
+    # with every other verify_api_key caller (MCP SSE, admin-or-session
+    # wrappers, dashboard tts-voices) so status/expiry/user checks cannot
+    # drift between call sites.
+    rejection = api_key_rejection_reason(api_key)
+    if rejection is not None:
+        if rejection == "API key has expired":
             logger.warning("expired_api_key", key_id=api_key.id)
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="API key has expired",
+        elif rejection == "User account is inactive":
+            user = api_key.user
+            logger.warning(
+                "inactive_user",
+                key_id=api_key.id,
+                user_id=user.id if user else None,
             )
-
-    # Get user
-    user = api_key.user
-    if not user or not user.is_active or user.deleted_at:
-        logger.warning(
-            "inactive_user",
-            key_id=api_key.id,
-            user_id=user.id if user else None,
-        )
+        else:
+            logger.warning(
+                "inactive_api_key",
+                key_id=api_key.id,
+                status=api_key.status.value,
+            )
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="User account is inactive",
+            detail=rejection,
         )
 
     # NOTE: api_key usage update moved to request completion phase
     # to avoid holding a row lock for the entire request duration.
 
-    return user, api_key
+    return api_key.user, api_key
 
 
 async def require_role(
@@ -225,9 +212,11 @@ def require_admin_or_session():
             # API key path — delegate to standard auth
             from backend.app.security.api_keys import verify_api_key as _verify
             api_key = await _verify(db, api_key_str)
-            if api_key and api_key.status == ApiKeyStatus.ACTIVE:
+            # Shared post-verify gate: rejects revoked, expired, and
+            # inactive/deleted-user keys — same checks as authenticate_request
+            if api_key and api_key_rejection_reason(api_key) is None:
                 user = api_key.user
-                if user and user.is_active and user.group and user.group.is_admin:
+                if user.group and user.group.is_admin:
                     return user
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
@@ -275,9 +264,11 @@ def require_admin_read_or_session():
         if api_key_str:
             from backend.app.security.api_keys import verify_api_key as _verify
             api_key = await _verify(db, api_key_str)
-            if api_key and api_key.status == ApiKeyStatus.ACTIVE:
+            # Shared post-verify gate: rejects revoked, expired, and
+            # inactive/deleted-user keys — same checks as authenticate_request
+            if api_key and api_key_rejection_reason(api_key) is None:
                 user = api_key.user
-                if user and user.is_active and user.group and user.group.has_admin_read:
+                if user.group and user.group.has_admin_read:
                     return user
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,

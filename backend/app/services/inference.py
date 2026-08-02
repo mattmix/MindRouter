@@ -275,13 +275,15 @@ class InferenceService:
     ) -> None:
         """Cap max_tokens to fit within the model's context window.
 
-        Far from the context boundary a conservative tiktoken bound
-        (estimate * 1.3 + per-message overhead + buffer) is enough to prove
-        the request fits, so the backend /tokenize round-trip is skipped.
-        Near the boundary — or when exactness is required (auto_truncate,
-        or force_exact after a context-length 400) — uses exact counting
-        for vLLM (via /tokenize) or tiktoken estimation for Ollama, then
-        applies:
+        The backend /tokenize round-trip is skipped only when the
+        conservative tiktoken bound (estimate * 1.3 + per-message overhead
+        + buffer) proves the shortcut is exactly equivalent to exact
+        counting: an explicit max_tokens that provably fits, or an unset
+        max_tokens whose room reaches the hard cap either way.  Otherwise —
+        near the boundary, unset max_tokens without full-hard-cap room, or
+        when exactness is required (auto_truncate, or force_exact after a
+        context-length 400) — uses exact counting for vLLM (via /tokenize)
+        or tiktoken estimation for Ollama, then applies:
             remaining = context_length - input_tokens - buffer
             max_tokens = min(requested, remaining, hard_cap)
         """
@@ -292,16 +294,22 @@ class InferenceService:
             est = _estimate_input_tokens(request)
             bound = int(est * 1.3) + 16 * len(request.messages or []) + _TOKEN_BUFFER
             room = context_length - bound
-            generous = (
-                room >= 4096
-                if request.max_tokens is None
-                else room >= 2048 and room >= request.max_tokens
-            )
-            if generous:
-                # Generous headroom — cap against the conservative bound.
-                requested = request.max_tokens if request.max_tokens is not None else _MAX_OUTPUT_TOKENS
-                request.max_tokens = min(requested, room, _MAX_OUTPUT_TOKENS)
+            if request.max_tokens is not None:
+                # Explicit budget: if even the conservative bound leaves room
+                # for it, exact counting would return min(requested,
+                # remaining) = requested — skipping /tokenize is provably
+                # harmless.
+                if room >= 2048 and room >= request.max_tokens:
+                    request.max_tokens = min(request.max_tokens, _MAX_OUTPUT_TOKENS)
+                    return
+            elif room >= _MAX_OUTPUT_TOKENS:
+                # Unset budget: the exact path would also cap at the hard
+                # limit, so the shortcut yields an identical result.
+                request.max_tokens = _MAX_OUTPUT_TOKENS
                 return
+            # Near the boundary, or unset max_tokens without full-hard-cap
+            # room: fall through to exact counting so the default completion
+            # budget stays context_length - exact_input - _TOKEN_BUFFER.
 
         input_tokens, is_estimate = await self._count_input_tokens(request, backend)
 
@@ -581,6 +589,15 @@ class InferenceService:
                 )
             except BaseException:
                 pass
+            # Mid-stream backend failure: drain token events the backend
+            # already delivered so the client's truncated stream matches
+            # main's per-event write behavior. Never yield for
+            # CancelledError/GeneratorExit — the client is gone, and
+            # yielding after GeneratorExit raises RuntimeError.
+            if not isinstance(e, (asyncio.CancelledError, GeneratorExit)):
+                pending = coalescer.flush()
+                if pending is not None:
+                    yield pending
             raise
         finally:
             # Always clean up inflight counter — handles normal completion,
@@ -900,6 +917,15 @@ class InferenceService:
                 )
             except BaseException:
                 pass
+            # Mid-stream backend failure: drain token events the backend
+            # already delivered so the client's truncated stream matches
+            # main's per-event write behavior. Never yield for
+            # CancelledError/GeneratorExit — the client is gone, and
+            # yielding after GeneratorExit raises RuntimeError.
+            if not isinstance(e, (asyncio.CancelledError, GeneratorExit)):
+                pending = coalescer.flush()
+                if pending is not None:
+                    yield pending
             raise
         finally:
             # Always clean up inflight counter — handles normal completion,

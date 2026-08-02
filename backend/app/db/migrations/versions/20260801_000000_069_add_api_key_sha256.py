@@ -30,9 +30,14 @@ depends_on = None
 
 
 def upgrade() -> None:
-    op.add_column("api_keys", sa.Column("key_sha256", sa.CHAR(64), nullable=True))
+    # Type and index name deliberately match what Base.metadata renders for
+    # the model's String(64) + unique=True + index=True declaration, so a
+    # future `alembic revision --autogenerate` (compare_type=True) produces
+    # no drop/recreate churn on the uniqueness guarantee the fast path
+    # depends on.
+    op.add_column("api_keys", sa.Column("key_sha256", sa.String(64), nullable=True))
     op.create_index(
-        "uq_api_keys_key_sha256",
+        "ix_api_keys_key_sha256",
         "api_keys",
         ["key_sha256"],
         unique=True,
@@ -40,5 +45,5 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    op.drop_index("uq_api_keys_key_sha256", table_name="api_keys")
+    op.drop_index("ix_api_keys_key_sha256", table_name="api_keys")
     op.drop_column("api_keys", "key_sha256")

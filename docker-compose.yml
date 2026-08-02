@@ -102,6 +102,10 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
+    # Must exceed uvicorn's --timeout-graceful-shutdown 60 (Dockerfile) so
+    # the lifespan shutdown hook (Redis admission-slot cleanup, counter
+    # flush) actually runs before Docker's SIGKILL.
+    stop_grace_period: 75s
     restart: unless-stopped
 
   mariadb:

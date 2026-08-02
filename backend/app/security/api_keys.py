@@ -18,14 +18,18 @@ import asyncio
 import hashlib
 import hmac
 import secrets
+from datetime import datetime, timezone
 from typing import Optional, Tuple
 
 from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError
+from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import set_committed_value
 
 from backend.app.db import crud
-from backend.app.db.models import ApiKey
+from backend.app.db.models import ApiKey, ApiKeyStatus
+from backend.app.db.session import get_async_db_context
 
 # API key format: mr2_<random_string>
 API_KEY_PREFIX = "mr2_"
@@ -42,6 +46,12 @@ _hasher = PasswordHasher(
 # (argon2-cffi releases the GIL); the cap keeps a flood of unknown keys
 # from blowing up worker RSS.
 _argon2_verify_semaphore = asyncio.Semaphore(4)
+
+# Bound the queue in front of the semaphore: waiters hold an open DB
+# transaction (a pooled connection) while queued, so an unbounded queue
+# converts an auth flood into SQLAlchemy pool exhaustion for the whole
+# worker. Fast-reject instead.
+_ARGON2_QUEUE_TIMEOUT_SECONDS = 2.0
 
 
 def generate_api_key() -> Tuple[str, str, str, str]:
@@ -120,6 +130,39 @@ def _verify_key_hash(api_key: str, key_hash: str) -> bool:
         return False
 
 
+def api_key_rejection_reason(db_key: ApiKey) -> Optional[str]:
+    """Post-verify gate: why a possession-verified key must still be rejected.
+
+    verify_api_key only proves key possession; every caller must then apply
+    this shared predicate so the status/expiry/user checks cannot drift
+    between call sites (authenticate_request, MCP SSE, admin-or-session
+    wrappers, dashboard tts-voices).
+
+    Args:
+        db_key: The ApiKey row returned by verify_api_key
+
+    Returns:
+        A human-readable rejection reason, or None if the key may be used.
+    """
+    if db_key.status != ApiKeyStatus.ACTIVE:
+        return f"API key is {db_key.status.value}"
+
+    # Check expiration (MariaDB returns naive datetimes)
+    # Service keys never expire
+    if not db_key.is_service:
+        expires_at = db_key.expires_at
+        if expires_at and expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        if expires_at and expires_at < datetime.now(timezone.utc):
+            return "API key has expired"
+
+    user = db_key.user
+    if not user or not user.is_active or user.deleted_at:
+        return "User account is inactive"
+
+    return None
+
+
 async def verify_api_key(db: AsyncSession, api_key: str) -> Optional[ApiKey]:
     """
     Verify an API key and return the ApiKey record if valid.
@@ -160,13 +203,49 @@ async def verify_api_key(db: AsyncSession, api_key: str) -> Optional[ApiKey]:
     if not db_key:
         return None
 
-    async with _argon2_verify_semaphore:
+    # The unique key_sha256 lookup above already missed, so a row that has
+    # ALREADY been upgraded cannot match this key. Reject without paying for
+    # Argon2 — this leaves the expensive path reachable only via genuinely
+    # legacy (pre-069, never-yet-verified) rows.
+    if db_key.key_sha256:
+        return None
+
+    try:
+        await asyncio.wait_for(
+            _argon2_verify_semaphore.acquire(),
+            timeout=_ARGON2_QUEUE_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        # Shed load rather than pin this request's pooled DB connection.
+        # Legacy-key holders may see a spurious 401 during a flood; that is
+        # strictly better than stalling every endpoint on pool_timeout.
+        return None
+    try:
         verified = await asyncio.to_thread(_verify_key_hash, api_key, db_key.key_hash)
+    finally:
+        _argon2_verify_semaphore.release()
 
     if verified:
-        # Verify-and-upgrade: the request session commits at teardown,
-        # persisting the backfill without an extra commit here
-        db_key.key_sha256 = digest
+        # Verify-and-upgrade: persist the backfill in its OWN session so it
+        # survives the request outcome. authenticate_request raises 401 for
+        # revoked/expired keys, which rolls back the request session and
+        # would discard a merely-staged backfill — keeping exactly those
+        # keys on the expensive Argon2 path forever.
+        try:
+            async with get_async_db_context() as bf_db:
+                await bf_db.execute(
+                    update(ApiKey)
+                    .where(ApiKey.id == db_key.id)
+                    .values(key_sha256=digest)
+                )
+            # Reflect the persisted value on the already-loaded row WITHOUT
+            # marking it dirty: no redundant UPDATE at request-session commit,
+            # and a later request-session rollback cannot un-stage it.
+            set_committed_value(db_key, "key_sha256", digest)
+        except Exception:
+            # The backfill is an optimization — never fail a valid verify
+            # because the backfill write failed.
+            pass
         return db_key
 
     return None

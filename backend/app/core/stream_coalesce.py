@@ -23,6 +23,10 @@ Latency-sensitive events are never delayed: the first event of a stream
 (TTFT), any event carrying finish_reason/usage, errors, and [DONE] all
 flush immediately, joined with whatever is buffered ahead of them so
 ordering is preserved.
+
+The max-delay bound is checked only as events arrive — there is no idle
+timer, so during a backend stall buffered events flush on the next
+arrival or at end of stream, not after ``max_delay_ms``.
 """
 
 import time

@@ -222,20 +222,32 @@ class TestTokenizeGate:
         assert request.max_tokens == 1000  # generous room — cap is a no-op
 
     @pytest.mark.asyncio
-    async def test_far_from_boundary_no_max_tokens_caps_to_bound(self):
+    async def test_far_from_boundary_no_max_tokens_hits_hard_cap(self):
+        # Unset budget with room >= the hard cap: the exact path would also
+        # cap at 65536, so the shortcut is provably equivalent to main.
         svc, client = _make_service()
         request = _make_request()
-        expected_room = 32768 - _conservative_bound(_make_request())
-        await svc.cap_max_tokens(request, _vllm_backend(), 32768)
+        assert 131072 - _conservative_bound(_make_request()) >= inf._MAX_OUTPUT_TOKENS
+        await svc.cap_max_tokens(request, _vllm_backend(), 131072)
         assert client.calls == 0
-        assert request.max_tokens == min(expected_room, inf._MAX_OUTPUT_TOKENS)
-        assert request.max_tokens >= 4096
+        assert request.max_tokens == inf._MAX_OUTPUT_TOKENS
+
+    @pytest.mark.asyncio
+    async def test_no_max_tokens_below_hard_cap_room_counts_exactly(self):
+        # Unset budget without full-hard-cap room must NOT be shrunk by the
+        # conservative bound — fall through to exact counting so the default
+        # completion budget stays context - exact_input - buffer, as on main.
+        svc, client = _make_service(tokenize_count=100)
+        request = _make_request()
+        await svc.cap_max_tokens(request, _vllm_backend(), 32768)
+        assert client.calls == 1
+        assert request.max_tokens == 32768 - 100 - inf._TOKEN_BUFFER
 
     @pytest.mark.asyncio
     async def test_near_boundary_calls_tokenize(self):
         svc, client = _make_service(tokenize_count=100)
         request = _make_request()
-        # room = 2048 - bound (~1050) < 4096 → exact counting required
+        # room = 2048 - bound (~1050) « hard cap → exact counting required
         await svc.cap_max_tokens(request, _vllm_backend(), 2048)
         assert client.calls == 1
         assert request.max_tokens == 2048 - 100 - inf._TOKEN_BUFFER
@@ -365,6 +377,134 @@ class TestContextRecapSafetyNet:
         force_flags = [c.kwargs.get("force_exact", False)
                        for c in svc.cap_max_tokens.await_args_list]
         assert force_flags.count(True) == 1
+
+
+# ----------------------------------------------------------------------
+# Coalescer drain on mid-stream backend failure
+# ----------------------------------------------------------------------
+
+def _make_stream_service(monkeypatch, chunks, error, ollama=False):
+    """Service wired for stream_chat_completion / stream_ollama_chat with a
+    proxy that yields `chunks` then raises `error`. Coalescing is enabled
+    with a huge delay so intermediate chunks stay buffered until failure."""
+    svc, _client = _make_service()
+    svc._settings = SimpleNamespace(
+        stream_coalesce_events=8,
+        stream_coalesce_ms=50_000,
+    )
+    svc._check_quota = AsyncMock()
+    svc._create_request_record = AsyncMock(
+        return_value=SimpleNamespace(request_uuid="req-uuid-1", id=1)
+    )
+    svc._scheduler = MagicMock()
+    job = SimpleNamespace(request_id=None)
+    svc._scheduler.create_job_from_chat_request = MagicMock(return_value=job)
+    calls = []
+    svc._fail_request = AsyncMock(side_effect=lambda *a, **k: calls.append("fail"))
+    svc._complete_streaming_request = AsyncMock()
+    backend = _vllm_backend()
+
+    async def _proxy(*args, **kwargs):
+        for chunk in chunks:
+            yield chunk, backend
+        raise error
+
+    svc._proxy_stream_with_retry = _proxy
+    monkeypatch.setattr(inf, "incr_inflight_tokens", AsyncMock())
+    monkeypatch.setattr(inf, "decr_inflight_tokens", AsyncMock())
+    return svc, calls
+
+
+def _sse_chunk(content):
+    return {
+        "id": "chatcmpl-1",
+        "object": "chat.completion.chunk",
+        "created": 1700000000,
+        "model": "m",
+        "choices": [{"index": 0, "delta": {"content": content}, "finish_reason": None}],
+    }
+
+
+class TestCoalescerDrainOnFailure:
+    @pytest.mark.asyncio
+    async def test_sse_buffered_chunks_drained_before_raise(self, monkeypatch):
+        # First chunk flushes (TTFT); chunks 2-3 sit in the coalescer when
+        # the backend dies — they were already delivered and must reach the
+        # client before the exception propagates (main wrote them per-event).
+        svc, calls = _make_stream_service(
+            monkeypatch,
+            [_sse_chunk("Hello"), _sse_chunk("world"), _sse_chunk("!!")],
+            httpx.RemoteProtocolError("peer closed connection"),
+        )
+        outputs = []
+        with pytest.raises(httpx.RemoteProtocolError):
+            async for out in svc.stream_chat_completion(
+                _make_request(), MagicMock(), MagicMock(), MagicMock()
+            ):
+                outputs.append(out)
+        assert len(outputs) == 2
+        assert b"Hello" in outputs[0]
+        assert b"world" in outputs[1] and b"!!" in outputs[1]
+        # Scheduler slot released before the drain yield (handler ordering)
+        assert calls == ["fail"]
+
+    @pytest.mark.asyncio
+    async def test_sse_cancelled_yields_nothing_after_buffer(self, monkeypatch):
+        # CancelledError means the client is gone — never yield the buffer
+        svc, calls = _make_stream_service(
+            monkeypatch,
+            [_sse_chunk("Hello"), _sse_chunk("world")],
+            asyncio.CancelledError(),
+        )
+        outputs = []
+        with pytest.raises(asyncio.CancelledError):
+            async for out in svc.stream_chat_completion(
+                _make_request(), MagicMock(), MagicMock(), MagicMock()
+            ):
+                outputs.append(out)
+        assert len(outputs) == 1  # only the TTFT flush
+        assert calls == ["fail"]
+
+    @pytest.mark.asyncio
+    async def test_ollama_buffered_chunks_drained_before_raise(self, monkeypatch):
+        svc, calls = _make_stream_service(
+            monkeypatch,
+            [
+                {"message": {"content": "Hello"}, "done": False},
+                {"message": {"content": "world"}, "done": False},
+                {"message": {"content": "!!"}, "done": False},
+            ],
+            httpx.ReadTimeout("stalled"),
+        )
+        outputs = []
+        with pytest.raises(httpx.ReadTimeout):
+            async for out in svc.stream_ollama_chat(
+                _make_request(), MagicMock(), MagicMock(), MagicMock()
+            ):
+                outputs.append(out)
+        assert len(outputs) == 2
+        assert b"Hello" in outputs[0]
+        assert b"world" in outputs[1] and b"!!" in outputs[1]
+        assert calls == ["fail"]
+
+    @pytest.mark.asyncio
+    async def test_ollama_cancelled_yields_nothing_after_buffer(self, monkeypatch):
+        svc, calls = _make_stream_service(
+            monkeypatch,
+            [
+                {"message": {"content": "Hello"}, "done": False},
+                {"message": {"content": "world"}, "done": False},
+            ],
+            asyncio.CancelledError(),
+        )
+        outputs = []
+        with pytest.raises(asyncio.CancelledError):
+            async for out in svc.stream_ollama_chat(
+                _make_request(), MagicMock(), MagicMock(), MagicMock()
+            ):
+                outputs.append(out)
+        assert len(outputs) == 1
+        assert calls == ["fail"]
 
 
 # ----------------------------------------------------------------------

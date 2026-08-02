@@ -67,6 +67,16 @@ for _name in _added:
     sys.modules.pop(_name, None)
 
 
+@pytest.fixture(autouse=True)
+def stub_inference(monkeypatch):
+    """_append_round_messages lazily imports the inference module to drop
+    token-count memos; stub it so the db import chain never loads (see
+    MEMORY.md "Import Chain Gotcha")."""
+    inf_stub = MagicMock()
+    monkeypatch.setitem(sys.modules, "backend.app.services.inference", inf_stub)
+    return inf_stub
+
+
 def _ctx(**overrides):
     body = {"model": "m", "input": "hi", "stream": True}
     body.update(overrides)
@@ -353,3 +363,20 @@ class TestStreamingLoop:
         ]
         events = _parse(frames)
         assert events[-1][0] == "response.failed"
+
+
+class TestTokenMemoInvalidation:
+    def test_append_round_messages_drops_token_memos(self, stub_inference):
+        # Round 2+ re-invokes cap_max_tokens on the SAME canonical object;
+        # without invalidation the round-1 memoized counts are stale-small
+        # and near the context boundary guarantee an avoidable 400/retry.
+        canonical = _canonical()
+        calls = [{
+            "call_id": "call_s1",
+            "name": "web_search",
+            "arguments": json.dumps({"query": "idaho news"}),
+        }]
+        _mod._append_round_messages(
+            canonical, "text", calls, ["results for idaho news"]
+        )
+        stub_inference._invalidate_token_memos.assert_called_once_with(canonical)

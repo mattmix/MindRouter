@@ -27,6 +27,7 @@ from fastapi.staticfiles import StaticFiles
 
 from backend.app.api import api_router
 from backend.app.core.redis_client import (
+    clear_backend_inflight,
     close_redis,
     get_all_token_keys,
     init_redis,
@@ -504,6 +505,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
                 logger.info("redis_final_sync", users=len(token_map))
         except Exception:
             logger.exception("redis_final_sync_failed")
+    # Delete this worker's admission subkeys so replacement workers don't
+    # see phantom in-flight slots for the 90s TTL after a rolling deploy.
+    # Must run BEFORE close_redis (the helper no-ops once _available flips).
+    await clear_backend_inflight()
     await close_redis()
     # Close archive DB engine if initialized
     try:

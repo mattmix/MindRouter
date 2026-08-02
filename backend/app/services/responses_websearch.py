@@ -256,6 +256,14 @@ def _append_round_messages(
             )
         )
 
+    # The message list just grew — drop the inference layer's memoized
+    # token counts so the next round's cap_max_tokens recounts.  Local
+    # import: inference is already in sys.modules at runtime (responses_api
+    # imports it), and a module-level import would drag the db chain into
+    # unit tests (see MEMORY.md "Import Chain Gotcha").
+    from backend.app.services.inference import _invalidate_token_memos
+    _invalidate_token_memos(canonical)
+
 
 def _remove_synthetic_tool(canonical: CanonicalChatRequest) -> None:
     canonical.tools = [

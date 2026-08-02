@@ -1,6 +1,7 @@
 """Redis client for atomic token metrics across workers."""
 
 import asyncio
+import time
 import uuid
 from typing import Iterable, Optional
 
@@ -31,10 +32,17 @@ async def init_redis() -> None:
     try:
         import redis.asyncio as aioredis
 
+        # socket_timeout bounds EVERY command, not just connects: a wedged
+        # Redis (VM pause, partition without RST) raises redis.TimeoutError
+        # instead of blocking forever, so all callers' except-Exception
+        # handlers fail open as designed. redis-py's retry_on_timeout
+        # defaults to False, so timeouts fail fast without retry
+        # multiplication.
         _redis = aioredis.from_url(
             settings.redis_url,
             decode_responses=True,
-            socket_connect_timeout=5,
+            socket_connect_timeout=2,
+            socket_timeout=2,
         )
         await _redis.ping()
         _available = True
@@ -289,6 +297,33 @@ WORKER_ID = uuid.uuid4().hex
 _ADM_KEY_PREFIX = "mr:adm:"
 _ADM_TTL_SECONDS = 90  # ~3 missed 30s reconcile cycles before slots leak away
 
+# Cooldown breaker for the admission helpers, which sit on the routing
+# critical path: after a failure, skip Redis for a short window so an
+# outage costs at most one bounded failure per worker per window (routing
+# instantly falls back to local per-worker counters) instead of a
+# connect-timeout plus log flood on every request. The 30s maintenance
+# reconcile naturally re-probes Redis after cooldown and restores the
+# shared counters via absolute SET.
+_ADM_COOLDOWN_S = 15.0
+_adm_down_until = 0.0
+
+# Per-worker micro-cache of the admission snapshot: the full-keyspace SCAN
+# is O(total keys) and route_job runs on every routing attempt (amplified
+# by the capacity-waiter thundering herd), so back-to-back attempts reuse
+# one fetch. 250ms staleness is dwarfed by the existing 90s key-TTL / 30s
+# reconcile drift bounds.
+_ADM_SNAPSHOT_TTL = 0.25  # seconds
+_adm_snapshot: Optional[tuple[float, dict[int, int]]] = None
+
+
+def _adm_ready() -> bool:
+    return _available and _redis is not None and time.monotonic() >= _adm_down_until
+
+
+def _adm_trip() -> None:
+    global _adm_down_until
+    _adm_down_until = time.monotonic() + _ADM_COOLDOWN_S
+
 # DECR with a floor of zero (a decrement can arrive after the subkey
 # expired or was reconciled down — never let the count go negative).
 _ADM_DECR_LUA = (
@@ -311,7 +346,7 @@ async def incr_backend_inflight(
     Returns this worker's new subkey count, or None if Redis is
     unavailable (caller falls back to per-worker admission).
     """
-    if not _available or not _redis:
+    if not _adm_ready():
         return None
     try:
         key = _adm_key(backend_id, worker_id)
@@ -319,9 +354,13 @@ async def incr_backend_inflight(
         pipe.incr(key)
         pipe.expire(key, _ADM_TTL_SECONDS)
         results = await pipe.execute()
+        # Keep the snapshot micro-cache honest for this worker's own claims
+        if _adm_snapshot is not None:
+            _adm_snapshot[1][backend_id] = _adm_snapshot[1].get(backend_id, 0) + 1
         return int(results[0])
     except Exception:
         logger.exception("redis_incr_backend_inflight_failed", backend_id=backend_id)
+        _adm_trip()
         return None
 
 
@@ -329,13 +368,20 @@ async def decr_backend_inflight(
     backend_id: int, worker_id: str = WORKER_ID
 ) -> Optional[int]:
     """Release one admission slot on a backend for this worker (floor 0)."""
-    if not _available or not _redis:
+    if not _adm_ready():
         return None
     try:
         key = _adm_key(backend_id, worker_id)
-        return int(await _redis.eval(_ADM_DECR_LUA, 1, key, _ADM_TTL_SECONDS))
+        result = int(await _redis.eval(_ADM_DECR_LUA, 1, key, _ADM_TTL_SECONDS))
+        # Mirror the release into the snapshot micro-cache (floor 0)
+        if _adm_snapshot is not None:
+            _adm_snapshot[1][backend_id] = max(
+                0, _adm_snapshot[1].get(backend_id, 0) - 1
+            )
+        return result
     except Exception:
         logger.exception("redis_decr_backend_inflight_failed", backend_id=backend_id)
+        _adm_trip()
         return None
 
 
@@ -347,7 +393,7 @@ async def set_backend_inflight(
     An absolute SET (not INCR) bounds drift from any missed decrements;
     called periodically it also refreshes the subkey TTL.
     """
-    if not _available or not _redis:
+    if not _adm_ready():
         return
     try:
         key = _adm_key(backend_id, worker_id)
@@ -357,6 +403,7 @@ async def set_backend_inflight(
             await _redis.delete(key)
     except Exception:
         logger.exception("redis_set_backend_inflight_failed", backend_id=backend_id)
+        _adm_trip()
 
 
 async def get_backend_inflight_snapshot(
@@ -367,11 +414,21 @@ async def get_backend_inflight_snapshot(
     Returns {backend_id: fleet_wide_inflight} covering every requested id
     (0 when no worker holds slots), or None if Redis is unavailable —
     callers must then fall back to their local per-worker counts.
+
+    The unfiltered per-backend sums are micro-cached per worker for
+    _ADM_SNAPSHOT_TTL and projected onto the requested ids per call, so
+    waiter storms and back-to-back routing attempts reuse one SCAN+MGET.
     """
-    if not _available or not _redis:
+    global _adm_snapshot
+    if not _adm_ready():
         return None
+    ids = list(backend_ids)
+    now = time.monotonic()
+    if _adm_snapshot is not None and now - _adm_snapshot[0] < _ADM_SNAPSHOT_TTL:
+        sums = _adm_snapshot[1]
+        return {bid: sums.get(bid, 0) for bid in ids}
     try:
-        totals: dict[int, int] = {bid: 0 for bid in backend_ids}
+        sums: dict[int, int] = {}
         keys = []
         async for key in _redis.scan_iter(match=f"{_ADM_KEY_PREFIX}*", count=200):
             keys.append(key)
@@ -386,12 +443,37 @@ async def get_backend_inflight_snapshot(
                     count = int(val)
                 except (IndexError, ValueError):
                     continue
-                if bid in totals and count > 0:
-                    totals[bid] += count
-        return totals
+                if count > 0:
+                    sums[bid] = sums.get(bid, 0) + count
+        _adm_snapshot = (now, sums)
+        return {bid: sums.get(bid, 0) for bid in ids}
     except Exception:
         logger.exception("redis_backend_inflight_snapshot_failed")
-        return None
+        _adm_trip()
+        return None  # never cache failures — fail-open stays instant
+
+
+async def clear_backend_inflight(worker_id: str = WORKER_ID) -> None:
+    """Delete this worker's admission subkeys (graceful-shutdown cleanup).
+
+    Without this, requests still in flight when a worker is stopped die
+    without decrementing, and replacement workers see the dead worker's
+    phantom slots until the 90s TTL expires. Only self-owned keys match
+    (WORKER_ID is a uuid4 hex, no glob metachars), so this is safe with
+    concurrent workers; the TTL remains the crash-only backstop.
+    """
+    if not _available or not _redis:
+        return
+    try:
+        keys = []
+        async for key in _redis.scan_iter(
+            match=f"{_ADM_KEY_PREFIX}*:{worker_id}", count=200
+        ):
+            keys.append(key)
+        if keys:
+            await _redis.delete(*keys)
+    except Exception:
+        logger.exception("redis_clear_backend_inflight_failed")
 
 
 # ------------------------------------------------------------------

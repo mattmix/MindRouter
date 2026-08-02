@@ -795,13 +795,15 @@ async def api_tts_voices(
     """
     user_id = get_session_user_id(request)
     if not user_id:
-        from backend.app.security.api_keys import verify_api_key
+        from backend.app.security.api_keys import api_key_rejection_reason, verify_api_key
         api_key_str = request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
         if not api_key_str:
             api_key_str = request.headers.get("X-API-Key", "").strip()
         if api_key_str:
             api_key = await verify_api_key(db, api_key_str)
-            if api_key and api_key.status == ApiKeyStatus.ACTIVE and api_key.user and api_key.user.is_active:
+            # Shared post-verify gate: rejects revoked, expired, and
+            # inactive/deleted-user keys — same checks as authenticate_request
+            if api_key and api_key_rejection_reason(api_key) is None:
                 user_id = api_key.user.id
     if not user_id:
         return JSONResponse({"error": "Not authenticated"}, status_code=401)

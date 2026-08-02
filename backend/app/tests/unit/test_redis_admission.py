@@ -22,21 +22,30 @@ Covers:
 - incr/decr symmetry on a worker's subkey
 - snapshot summing across workers, zero-fill for idle backends,
   foreign/malformed keys ignored
+- snapshot micro-cache: SCAN reused within the TTL, per-call projection,
+  incr/decr touch-ups keep it honest, failures never cached
 - negative-count guard (decr never goes below zero)
 - TTL refresh call shape on incr, decr, and reconcile-set
 - reconcile set: absolute SET with TTL, delete at zero
 - fail-open: unavailable or raising Redis returns None / no-ops
+- cooldown breaker: a failure trips a skip window so an outage costs one
+  bounded failure per window instead of per-request timeouts
+- graceful-shutdown cleanup: clear_backend_inflight deletes only this
+  worker's subkeys
 - route_job prefers the global snapshot, falls back to local per-worker
   depths when the snapshot is None (routing spec-imported with
   backend.app.db* pre-mocked — see MEMORY.md "Import Chain Gotcha")
 - claim/release paths mirror into the shared counter
 - source contracts: GC eviction decrements, phantom reset zeroes,
-  maintenance loop reconciles
+  maintenance loop reconciles, socket_timeout bounds every command,
+  lifespan cleanup ordering, compose stop_grace_period
 """
 
+import fnmatch
 import importlib
 import importlib.util
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -45,6 +54,7 @@ import pytest
 
 _CORE_DIR = Path(__file__).resolve().parents[2] / "core"
 _ROUTING_PY = _CORE_DIR / "scheduler" / "routing.py"
+_PROJECT_ROOT = Path(__file__).resolve().parents[4]
 
 
 def _load_rc():
@@ -118,10 +128,11 @@ class FakeRedis:
             self.ttls[key] = ex
         return True
 
-    async def delete(self, key):
-        self.store.pop(key, None)
-        self.ttls.pop(key, None)
-        return 1
+    async def delete(self, *keys):
+        for key in keys:
+            self.store.pop(key, None)
+            self.ttls.pop(key, None)
+        return len(keys)
 
     async def eval(self, script, numkeys, key, *args):
         # Only the admission DECR-with-floor script is exercised here
@@ -137,9 +148,8 @@ class FakeRedis:
         return [self.store.get(k) for k in keys]
 
     async def scan_iter(self, match=None, count=None):
-        prefix = match.rstrip("*") if match else ""
         for key in list(self.store):
-            if key.startswith(prefix):
+            if match is None or fnmatch.fnmatch(key, match):
                 yield key
 
 
@@ -167,6 +177,9 @@ def fake(monkeypatch):
     r = FakeRedis()
     monkeypatch.setattr(rc, "_redis", r)
     monkeypatch.setattr(rc, "_available", True)
+    # Reset breaker + micro-cache state leaked by earlier tests
+    monkeypatch.setattr(rc, "_adm_down_until", 0.0)
+    monkeypatch.setattr(rc, "_adm_snapshot", None)
     return r
 
 
@@ -250,6 +263,8 @@ async def test_snapshot_ignores_foreign_and_malformed_keys(fake):
 async def test_fail_open_when_unavailable(monkeypatch):
     monkeypatch.setattr(rc, "_redis", None)
     monkeypatch.setattr(rc, "_available", False)
+    monkeypatch.setattr(rc, "_adm_down_until", 0.0)
+    monkeypatch.setattr(rc, "_adm_snapshot", None)
     assert await rc.incr_backend_inflight(1, "wA") is None
     assert await rc.decr_backend_inflight(1, "wA") is None
     assert await rc.get_backend_inflight_snapshot([1]) is None
@@ -260,10 +275,117 @@ async def test_fail_open_when_unavailable(monkeypatch):
 async def test_fail_open_when_client_raises(monkeypatch):
     monkeypatch.setattr(rc, "_redis", RaisingRedis())
     monkeypatch.setattr(rc, "_available", True)
+    monkeypatch.setattr(rc, "_adm_snapshot", None)
+    # Reset the breaker before each helper so every one exercises its own
+    # raise path rather than the cooldown skip
+    monkeypatch.setattr(rc, "_adm_down_until", 0.0)
+    assert await rc.incr_backend_inflight(1, "wA") is None
+    monkeypatch.setattr(rc, "_adm_down_until", 0.0)
+    assert await rc.decr_backend_inflight(1, "wA") is None
+    monkeypatch.setattr(rc, "_adm_down_until", 0.0)
+    assert await rc.get_backend_inflight_snapshot([1]) is None
+    monkeypatch.setattr(rc, "_adm_down_until", 0.0)
+    await rc.set_backend_inflight(1, 2, "wA")  # no raise
+
+
+# ===================================================================
+# Cooldown breaker
+# ===================================================================
+
+
+@pytest.mark.asyncio
+async def test_failure_trips_cooldown(monkeypatch):
+    monkeypatch.setattr(rc, "_redis", RaisingRedis())
+    monkeypatch.setattr(rc, "_available", True)
+    monkeypatch.setattr(rc, "_adm_down_until", 0.0)
+    monkeypatch.setattr(rc, "_adm_snapshot", None)
+    assert await rc.incr_backend_inflight(1, "wA") is None
+    assert rc._adm_down_until > time.monotonic()
+
+
+@pytest.mark.asyncio
+async def test_cooldown_skips_redis_until_expiry(fake, monkeypatch):
+    monkeypatch.setattr(rc, "_adm_down_until", time.monotonic() + 30)
     assert await rc.incr_backend_inflight(1, "wA") is None
     assert await rc.decr_backend_inflight(1, "wA") is None
     assert await rc.get_backend_inflight_snapshot([1]) is None
-    await rc.set_backend_inflight(1, 2, "wA")  # no raise
+    await rc.set_backend_inflight(1, 2, "wA")
+    assert fake.store == {}  # Redis never touched while tripped
+    # Cooldown expired → normal operation resumes
+    monkeypatch.setattr(rc, "_adm_down_until", 0.0)
+    assert await rc.incr_backend_inflight(1, "wA") == 1
+
+
+# ===================================================================
+# Snapshot micro-cache
+# ===================================================================
+
+
+@pytest.mark.asyncio
+async def test_snapshot_micro_cache_reuses_scan(fake):
+    await rc.incr_backend_inflight(1, "wA")
+    assert await rc.get_backend_inflight_snapshot([1]) == {1: 1}
+    # A foreign worker's new slots are invisible within the cache TTL...
+    fake.store["mr:adm:1:wB"] = 5
+    assert await rc.get_backend_inflight_snapshot([1]) == {1: 1}
+    # ...and visible once the cached stamp ages out
+    stamp, sums = rc._adm_snapshot
+    rc._adm_snapshot = (stamp - rc._ADM_SNAPSHOT_TTL - 1, sums)
+    assert await rc.get_backend_inflight_snapshot([1]) == {1: 6}
+
+
+@pytest.mark.asyncio
+async def test_snapshot_projects_cached_sums_per_call(fake):
+    await rc.incr_backend_inflight(1, "wA")
+    assert await rc.get_backend_inflight_snapshot([1]) == {1: 1}
+    # Different backend list within the TTL still zero-fills correctly
+    assert await rc.get_backend_inflight_snapshot([1, 2, 3]) == {1: 1, 2: 0, 3: 0}
+
+
+@pytest.mark.asyncio
+async def test_incr_decr_keep_cached_snapshot_honest(fake):
+    await rc.incr_backend_inflight(1, "wA")
+    assert await rc.get_backend_inflight_snapshot([1]) == {1: 1}  # primes cache
+    # This worker's own claims/releases are reflected without a rescan
+    await rc.incr_backend_inflight(1, "wA")
+    assert await rc.get_backend_inflight_snapshot([1]) == {1: 2}
+    await rc.decr_backend_inflight(1, "wA")
+    assert await rc.get_backend_inflight_snapshot([1]) == {1: 1}
+
+
+@pytest.mark.asyncio
+async def test_snapshot_failure_not_cached(fake, monkeypatch):
+    monkeypatch.setattr(rc, "_redis", RaisingRedis())
+    assert await rc.get_backend_inflight_snapshot([1]) is None
+    assert rc._adm_snapshot is None  # failures never cached
+
+
+# ===================================================================
+# Graceful-shutdown cleanup
+# ===================================================================
+
+
+@pytest.mark.asyncio
+async def test_clear_backend_inflight_deletes_only_own_keys(fake):
+    await rc.incr_backend_inflight(1, "wA")
+    await rc.incr_backend_inflight(2, "wA")
+    await rc.incr_backend_inflight(1, "wB")
+    fake.store["quota:tokens:1"] = 99
+    await rc.clear_backend_inflight("wA")
+    assert "mr:adm:1:wA" not in fake.store
+    assert "mr:adm:2:wA" not in fake.store
+    assert fake.store["mr:adm:1:wB"] == 1  # other workers untouched
+    assert fake.store["quota:tokens:1"] == 99
+
+
+@pytest.mark.asyncio
+async def test_clear_backend_inflight_fail_open(monkeypatch):
+    monkeypatch.setattr(rc, "_redis", None)
+    monkeypatch.setattr(rc, "_available", False)
+    await rc.clear_backend_inflight("wA")  # no raise
+    monkeypatch.setattr(rc, "_redis", RaisingRedis())
+    monkeypatch.setattr(rc, "_available", True)
+    await rc.clear_backend_inflight("wA")  # no raise
 
 
 # ===================================================================
@@ -409,3 +531,30 @@ def test_gc_and_reconcile_source_contract():
     loop = src.split("async def _maintenance_loop")[1].split("async def ")[0]
     # 30s reconcile: absolute SET of local in-flight counts (TTL refresh)
     assert "set_backend_inflight" in loop
+
+
+def test_socket_timeout_bounds_every_command():
+    # A wedged Redis must raise (fail open) rather than block routing forever;
+    # socket_timeout is the only mechanism that bounds established-connection
+    # reads (socket_connect_timeout only bounds connects).
+    src = (_CORE_DIR / "redis_client.py").read_text()
+    init = src.split("async def init_redis")[1].split("async def ")[0]
+    assert "socket_timeout=2" in init
+    assert "socket_connect_timeout=2" in init
+
+
+def test_lifespan_clears_admission_slots_before_close():
+    # Graceful shutdown must delete this worker's mr:adm subkeys BEFORE
+    # close_redis flips _available (after which the helper no-ops), so
+    # replacement workers don't see phantom slots for the 90s TTL.
+    src = (_PROJECT_ROOT / "backend" / "app" / "main.py").read_text()
+    assert src.index("await clear_backend_inflight()") < src.index("await close_redis()")
+
+
+def test_compose_stop_grace_period_exceeds_uvicorn_timeout():
+    # Docker's default 10s SIGKILL would fire before uvicorn's 60s graceful
+    # shutdown, so the lifespan cleanup would never run on a busy deploy.
+    compose = (_PROJECT_ROOT / "docker-compose.yml").read_text()
+    assert "stop_grace_period: 75s" in compose
+    prod = (_PROJECT_ROOT / "docker-compose.prod.yml").read_text()
+    assert "stop_grace_period" in prod
