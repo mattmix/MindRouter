@@ -1115,7 +1115,10 @@ client.conversations.delete(conv.id)               # delete state anytime</code>
                         <tr><td>POST</td><td><code>/api/admin/users</code></td><td>Create a new user with group-based quota defaults</td></tr>
                         <tr><td>GET</td><td><code>/api/admin/users/{id}</code></td><td>User detail with usage stats, API keys, monthly usage</td></tr>
                         <tr><td>PATCH</td><td><code>/api/admin/users/{id}</code></td><td>Update user profile, group, and quota overrides</td></tr>
-                        <tr><td>DELETE</td><td><code>/api/admin/users/{id}</code></td><td>Hard-delete a user and all associated data</td></tr>
+                        <tr><td>DELETE</td><td><code>/api/admin/users/{id}</code></td><td>Hard-delete a user: keys, requests, chats, images, videos, stored responses (and files) removed; blog posts, email log, and admin-audit entries kept with the user reference detached. 409 if a dependent record cannot be removed; self-deletion blocked. Also available from the user detail page (type the username to confirm)</td></tr>
+                        <tr><td>POST</td><td><code>/api/admin/users/{id}/reset-password</code></td><td>Set a new password on a local account (min 8 chars; SSO accounts rejected). Also available from the user detail page</td></tr>
+                        <tr><td>POST</td><td><code>/api/admin/api-keys/{id}/revoke</code></td><td>Revoke any user's API key (personal or service). Idempotent. Also available as Revoke buttons on Admin &rarr; API Keys and the user detail page</td></tr>
+                        <tr><td>DELETE</td><td><code>/api/admin/api-keys/{id}</code></td><td>Hard-delete a never-used API key row (409 when audit rows reference it — revoke instead)</td></tr>
                         <tr><td>POST</td><td><code>/api/admin/users/{id}/api-keys</code></td><td>Create an API key for a user</td></tr>
                     </tbody>
                 </table>
@@ -1557,7 +1560,7 @@ client.conversations.delete(conv.id)               # delete state anytime</code>
                 <p>MindRouter uses a <strong>database-driven group system</strong> for authorization, quota defaults, and scheduler weights. Each user belongs to exactly one group. Groups are fully manageable via the admin UI at <code>/admin/groups</code>.</p>
                 <p>Each group has two privilege flags:</p>
                 <ul>
-                    <li><strong><code>is_admin</code></strong> &mdash; Full admin access. Users can view all admin pages and perform all administrative actions (create, edit, delete users/groups/backends/nodes, approve quotas, change settings, etc.).</li>
+                    <li><strong><code>is_admin</code></strong> &mdash; Full admin access. Users can view all admin pages and perform all administrative actions: create, edit, deactivate, and delete users (Account Management on each user's detail page — deletion requires typing the username; deactivation immediately disables the user's API keys and dashboard sessions), reset local-account passwords, revoke API keys, manage groups (a group must be emptied by reassigning its members before it can be deleted), manage backends/nodes, approve quotas, run or purge data retention, and change settings.</li>
                     <li><strong><code>is_auditor</code></strong> &mdash; Read-only admin access. Users can view all admin pages (dashboard, users, backends, nodes, metrics, audit logs, conversations, settings, etc.) but cannot make any changes. Mutating controls are hidden in the dashboard, and mutating API endpoints return HTTP 403.</li>
                 </ul>
                 <p>A group can have <code>is_admin</code>, <code>is_auditor</code>, or neither. Admin groups implicitly have auditor-level read access, so setting both flags is unnecessary (though harmless). The auditor role is intended for oversight, compliance review, or stakeholders who need visibility into system operations without the ability to modify state.</p>
@@ -1707,7 +1710,7 @@ curl -X PATCH https://mindrouter.example.edu/api/admin/users/42 \
                 <p>If denied, the key remains a regular personal key with its original expiration.</p>
 
                 <h3>Revocation</h3>
-                <p>Service keys cannot be self-revoked by users. To revoke a service key:</p>
+                <p><strong>This two-step flow applies to service keys only</strong> — regular personal keys are revoked by their owner in one step, immediately, from the dashboard (or by an administrator from Admin &rarr; API Keys). Service keys cannot be self-revoked by users (enforced server-side). To revoke a service key:</p>
                 <ol>
                     <li>The key owner submits a <strong>Revocation Request</strong> from the dashboard, providing a reason.</li>
                     <li>An administrator reviews the request and executes the revocation from the admin panel.</li>
@@ -2609,8 +2612,8 @@ ARCHIVE_DATABASE_URL=mysql+pymysql://mindrouter_archive:&lt;secure-password&gt;@
                 <ul>
                     <li>Max upload size: 10 MB (configurable via <code>CHAT_UPLOAD_MAX_SIZE_MB</code>)</li>
                     <li>Artifact storage path: <code>/data/artifacts</code> (configurable via <code>ARTIFACT_STORAGE_PATH</code>)</li>
-                    <li>Artifact max size: 50 MB (configurable via <code>ARTIFACT_MAX_SIZE_MB</code>)</li>
-                    <li>Artifact retention: 365 days</li>
+                    <li>Artifact writes have no application-level size cap (request-body limits come from the reverse proxy)</li>
+                    <li>Artifact rows and files are removed with their parent request by the Requests retention policy (Admin &rarr; Retention)</li>
                 </ul>
 
                 <p><strong>Storage layout:</strong></p>
@@ -2635,7 +2638,7 @@ ARCHIVE_DATABASE_URL=mysql+pymysql://mindrouter_archive:&lt;secure-password&gt;@
                 </ul>
 
                 <h3>Conversation Retention</h3>
-                <p>Conversations older than <code>CONVERSATION_RETENTION_DAYS</code> (default 730 days / 2 years) are automatically purged by a background task that runs every <code>CONVERSATION_CLEANUP_INTERVAL</code> seconds (default 86400 / once per day). Associated messages and attachments are deleted along with the conversation.</p>
+                <p>Chat retention is governed by the runtime-editable policies at <strong>Admin &rarr; Retention</strong>: conversations idle past <code>retention.chat.tier1_days</code> (seeded default 90) are archived (when an archive database is configured) and removed from the live database, and archive copies are purged after <code>retention.chat.tier2_days</code> (seeded default 730). The retention cycle runs hourly; setting a tier to 0 disables that sweep. Associated messages and attachments are deleted along with the conversation, and users can delete their own conversations at any time.</p>
             </section>
 
             <hr>
@@ -3311,8 +3314,9 @@ Hello from MindRouter!</code></pre>
                         <tr><th>Variable</th><th>Type</th><th>Default</th><th>Description</th></tr>
                     </thead>
                     <tbody>
-                        <tr><td><code>CONVERSATION_RETENTION_DAYS</code></td><td>int</td><td><code>730</code></td><td>Conversation retention period (2 years)</td></tr>
-                        <tr><td><code>CONVERSATION_CLEANUP_INTERVAL</code></td><td>int</td><td><code>86400</code></td><td>Cleanup interval in seconds (24 hours)</td></tr>
+                        <tr><td><code>AUDIT_LOG_ENABLED</code></td><td>bool</td><td><code>true</code></td><td>Master switch for prompt AND response content capture into the audit tables (metadata always recorded). Note: DLP scans stored content, so disabling capture disables DLP scanning of it</td></tr>
+                        <tr><td><code>AUDIT_LOG_PROMPTS</code></td><td>bool</td><td><code>true</code></td><td>Capture request messages/prompt text and offloaded request images</td></tr>
+                        <tr><td><code>AUDIT_LOG_RESPONSES</code></td><td>bool</td><td><code>true</code></td><td>Capture response content</td></tr>
                     </tbody>
                 </table>
 
@@ -3323,8 +3327,6 @@ Hello from MindRouter!</code></pre>
                     </thead>
                     <tbody>
                         <tr><td><code>ARTIFACT_STORAGE_PATH</code></td><td>str</td><td><code>/data/artifacts</code></td><td>File storage directory</td></tr>
-                        <tr><td><code>ARTIFACT_MAX_SIZE_MB</code></td><td>int</td><td><code>50</code></td><td>Max artifact file size</td></tr>
-                        <tr><td><code>ARTIFACT_RETENTION_DAYS</code></td><td>int</td><td><code>365</code></td><td>Artifact retention period</td></tr>
                     </tbody>
                 </table>
 

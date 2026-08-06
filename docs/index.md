@@ -986,8 +986,11 @@ These endpoints are mounted under `/api/admin/`. Authorization is not uniform:
 | POST | `/api/admin/users` | Create a new user with group-based quota defaults |
 | GET | `/api/admin/users/{id}` | Get user detail including quotas, API keys, and group |
 | PATCH | `/api/admin/users/{id}` | Update user properties (group, quotas, etc.) |
-| DELETE | `/api/admin/users/{id}` | Hard-delete a user and all associated data |
+| DELETE | `/api/admin/users/{id}` | Hard-delete a user: removes their keys, requests/responses, chats, images, videos, and stored responses (including files on disk); blog posts, the email log, and admin-audit entries are kept with the user reference detached. Returns 409 (never deletes partially) if a dependent record cannot be removed. Self-deletion is blocked |
+| POST | `/api/admin/users/{id}/reset-password` | Set a new password on a **local** account (`{"new_password": "..."}`, min 8 chars; SSO accounts are rejected — they have no local password) |
 | POST | `/api/admin/users/{id}/api-keys` | Create an API key for a user |
+| POST | `/api/admin/api-keys/{id}/revoke` | Revoke any user's API key (personal or service). Idempotent |
+| DELETE | `/api/admin/api-keys/{id}` | Hard-delete an API key row. Refused (409) when audit rows reference the key — revoke instead; deletion is for keys that were never used |
 | GET | `/api/admin/top-users` | Top 10 users by token usage in a window (`window` = `1m`, `1h`, `4h`, `12h`, or `24h`; default `1h`) |
 
 #### Group Management
@@ -1265,7 +1268,7 @@ Users with local (non-SSO) accounts can change their password from the user dash
 5. **Revocation** -- Keys can be revoked (soft-delete) without deleting the audit trail.
 6. **Usage tracking** -- `last_used_at` and `usage_count` updated atomically on each request.
 
-> API keys can become unusable through two distinct mechanisms: **expiration** (automatic -- the key's `expires_at` timestamp has passed) or **revocation** (admin action -- the key's status is set to `REVOKED`). In both cases, authentication fails and the key's audit trail is preserved.
+> API keys can become unusable through two distinct mechanisms: **expiration** (automatic -- the key's `expires_at` timestamp has passed) or **revocation** (the key's status is set to `REVOKED`). Personal keys are revoked by their owner from the dashboard (one step, immediate) or by an admin (`POST /api/admin/api-keys/{id}/revoke` or the Revoke button on Admin → API Keys). Service keys use the two-step flow: the owner submits a revocation request, an admin executes it. In all cases, authentication fails from the next request and the key's audit trail is preserved. Deactivating a user (`is_active=false`) immediately disables all of that user's keys and their dashboard sessions.
 
 ### Quota System
 
@@ -1627,7 +1630,7 @@ MindRouter includes a built-in chat interface at `/chat` with full conversation 
 - Conversations store: title, selected model, creation/update timestamps
 - Users can rename, switch models, or delete conversations
 - Up to 50 conversations shown in the sidebar (most recent first)
-- Conversations older than `CONVERSATION_RETENTION_DAYS` (default 730 days / 2 years) are automatically purged by a background cleanup task
+- Chat retention is governed by the runtime-editable policies at **Admin → Retention** (`retention.chat.tier1_days`, seeded default 90 days in the live DB, then archived if an archive DB is configured; archive copies are purged after `retention.chat.tier2_days`, seeded default 730 days). Setting a tier to 0 disables that sweep. The retention cycle runs hourly. Users can also delete their own conversations at any time.
 
 ### Messages
 
@@ -1651,9 +1654,9 @@ Supported file types and processing:
 
 **Limits:**
 - Chat file uploads are limited to `CHAT_UPLOAD_MAX_SIZE_MB` (default 10 MB)
-- System artifact uploads allow up to `ARTIFACT_MAX_SIZE_MB` (default 50 MB)
+- System artifact writes have no application-level size cap (`ARTIFACT_MAX_SIZE_MB` was removed in 2.9.5 — nothing read it); request-body limits come from the reverse proxy
 - Artifact storage path: `/data/artifacts` (configurable via `ARTIFACT_STORAGE_PATH`)
-- Artifact retention: 365 days
+- Artifact DB rows are deleted together with their parent request by the retention cycle's **Requests** policy (there is no separate artifact retention clock)
 
 **Storage layout:**
 ```
@@ -2006,8 +2009,12 @@ All providers share the same semantics. On login, MindRouter looks up `(provider
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
 | `ARTIFACT_STORAGE_PATH` | str | `/data/artifacts` | File storage directory. Also the root for audit-offloaded request images and Responses API image offload |
-| `ARTIFACT_MAX_SIZE_MB` | int | `50` | Defined in `settings.py`, but **nothing in the application reads it** -- no artifact size cap is enforced from this value |
-| `ARTIFACT_RETENTION_DAYS` | int | `365` | Defined in `settings.py`, but **nothing in the application reads it**. Actual reaping is driven by `app_config` keys -- `retention.request_images_days` (default 180) and `retention.responses_store_days` (default 30) |
+
+> `ARTIFACT_MAX_SIZE_MB` and `ARTIFACT_RETENTION_DAYS` were removed in 2.9.5 —
+> they were never read by the application. Reaping is driven by the Admin →
+> Retention policies (`retention.request_images_days`, default 180;
+> `retention.responses_store_days`, default 30; artifacts die with their
+> parent request under the requests policy).
 
 ### Video Generation
 
@@ -2133,9 +2140,9 @@ Colors, organization name, and logo selections are `branding.*` rows in `app_con
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
-| `AUDIT_LOG_ENABLED` | bool | `true` | Enable audit logging |
-| `AUDIT_LOG_PROMPTS` | bool | `true` | Log user prompts |
-| `AUDIT_LOG_RESPONSES` | bool | `true` | Log LLM responses |
+| `AUDIT_LOG_ENABLED` | bool | `true` | Master switch for prompt AND response content capture into the audit tables — metadata (model, tokens, timings) is always recorded. Disabling capture also disables DLP scanning of that content (DLP reads the stored copy) |
+| `AUDIT_LOG_PROMPTS` | bool | `true` | Capture request messages/prompt text and offloaded request images |
+| `AUDIT_LOG_RESPONSES` | bool | `true` | Capture response content |
 
 ### Telemetry & GPU
 
@@ -2173,12 +2180,24 @@ Colors, organization name, and logo selections are `branding.*` rows in `app_con
 
 Default allowed extensions: `.txt`, `.md`, `.csv`, `.json`, `.html`, `.htm`, `.log`, `.docx`, `.xlsx`, `.pptx`, `.pdf`, `.jpg`, `.jpeg`, `.png`, `.gif`, `.webp`
 
-### Conversation Retention
+### Data Retention & Audit Capture
+
+Retention periods are **not** environment variables: they are runtime-editable
+policies stored in the `app_config` table and managed at **Admin → Retention**
+(categories: requests, chat, telemetry, request images, stored responses,
+Conversations API; `0` = keep forever). The retention cycle runs hourly.
+
+Audit content capture IS environment-configurable:
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
-| `CONVERSATION_RETENTION_DAYS` | int | `730` | Conversation retention period (days, default 2 years) |
-| `CONVERSATION_CLEANUP_INTERVAL` | int | `86400` | Cleanup interval in seconds (default 24 hours) |
+| `AUDIT_LOG_ENABLED` | bool | `true` | Master switch for prompt AND response content capture into the audit tables (metadata is always recorded) |
+| `AUDIT_LOG_PROMPTS` | bool | `true` | Capture request messages/prompt text (and offloaded request images) |
+| `AUDIT_LOG_RESPONSES` | bool | `true` | Capture response content |
+
+> **Note:** the DLP scanner reads the *stored* audit content — disabling
+> capture also disables DLP scanning of that content. Web-chat conversation
+> storage is user-facing state, not audit, and is unaffected by these flags.
 
 ### Web Search (Brave)
 
@@ -2247,9 +2266,9 @@ During streaming responses, tokens are estimated at **1 token per 4 characters**
 
 A background sync loop flushes Redis token usage counters to the database every **60 seconds**. On startup, counters are seeded from the database. A final flush runs on graceful shutdown to prevent token count drift.
 
-### Conversation Cleanup
+### Retention Cycle
 
-A background task automatically deletes expired conversations every **24 hours** (configurable via `CONVERSATION_CLEANUP_INTERVAL`). The default retention period is 2 years (`CONVERSATION_RETENTION_DAYS=730`).
+A background task runs the data-retention cycle every **hour** (configurable via the `retention.cleanup_interval` policy at Admin → Retention). The requests, chat, and telemetry day values are seeded into `app_config` by migration 029; the request-images, stored-responses, and Conversations-API values fall back to built-in defaults (180 / 30 / 0 days) until first saved. All six are runtime-editable on the same page. An admin can also trigger a cycle immediately with **Run Retention Now**, or purge a single category on demand from the **Purge** tab (type-`PURGE` confirmation required).
 
 ### Backend Options Passthrough
 

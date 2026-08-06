@@ -35,18 +35,24 @@ from backend.app.logging_config import get_logger
 logger = get_logger(__name__)
 
 # Default retention config values
+# Fallbacks used when an app_config row is missing.  The requests/chat/
+# telemetry/interval/batch keys MUST match migration 029's seeds so the
+# documented defaults hold on every install (the three-way docs/seed/code
+# disagreement was a confirmed 2.9.4-audit doc bug); request_images,
+# responses_store, and conversations are seeded nowhere and take their
+# defaults from here until an admin saves the Retention page.
 _DEFAULTS: dict[str, Any] = {
-    "retention.requests.tier1_days": 30,
+    "retention.requests.tier1_days": 90,
     "retention.requests.tier2_days": 730,
-    "retention.chat.tier1_days": 30,
+    "retention.chat.tier1_days": 90,
     "retention.chat.tier2_days": 730,
     "retention.telemetry.tier1_days": 30,
-    "retention.telemetry.tier2_days": 730,
+    "retention.telemetry.tier2_days": 0,
     "retention.request_images_days": 180,
     "retention.responses_store_days": 30,
     "retention.conversations_days": 0,
     "retention.cleanup_interval": 3600,
-    "retention.batch_size": 5000,
+    "retention.batch_size": 500,
 }
 
 

@@ -1020,15 +1020,24 @@ class InferenceService:
         prompt = None
         parameters = {}
 
-        if hasattr(request, "messages"):
-            messages = [m.model_dump() for m in request.messages]
-            # Extract inline base64 images to filesystem to avoid exceeding
-            # DB packet limits and bloating audit logs.  Each image is saved
-            # under /data/artifacts/request_images/<request_uuid>/ and the
-            # audit record stores a lightweight reference instead.
-            messages = self._extract_images_from_messages(messages)
-        if hasattr(request, "prompt"):
-            prompt = request.prompt if isinstance(request.prompt, str) else str(request.prompt)
+        # Content capture is policy-gated: with prompt capture off, the
+        # audit row keeps metadata (model, tokens, timings) but no
+        # message/prompt text and no offloaded image files.  Note the
+        # DLP worker scans the STORED content, so disabling capture also
+        # disables DLP scanning of that content.
+        capture_prompts = (
+            self._settings.audit_log_enabled and self._settings.audit_log_prompts
+        )
+        if capture_prompts:
+            if hasattr(request, "messages"):
+                messages = [m.model_dump() for m in request.messages]
+                # Extract inline base64 images to filesystem to avoid exceeding
+                # DB packet limits and bloating audit logs.  Each image is saved
+                # under /data/artifacts/request_images/<request_uuid>/ and the
+                # audit record stores a lightweight reference instead.
+                messages = self._extract_images_from_messages(messages)
+            if hasattr(request, "prompt"):
+                prompt = request.prompt if isinstance(request.prompt, str) else str(request.prompt)
 
         # Extract parameters
         for param in ["temperature", "top_p", "max_tokens", "stop"]:
@@ -2282,6 +2291,11 @@ class InferenceService:
             if "choices" in response and response["choices"]:
                 msg = response["choices"][0].get("message", {})
                 content = msg.get("content")
+            if not (
+                self._settings.audit_log_enabled
+                and self._settings.audit_log_responses
+            ):
+                content = None
 
             await crud.create_response(
                 self.db, db_request.id,
@@ -2368,6 +2382,11 @@ class InferenceService:
                 backend_id=backend_id,
             )
 
+            if not (
+                self._settings.audit_log_enabled
+                and self._settings.audit_log_responses
+            ):
+                content = None
             await crud.create_response(
                 self.db, db_request.id,
                 content=content,

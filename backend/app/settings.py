@@ -125,10 +125,10 @@ class Settings(BaseSettings):
     saml_attr_name: str = "displayName"
     saml_attr_username: str = "eduPersonPrincipalName"
 
-    # Artifact Storage
+    # Artifact Storage.  Artifact rows/files are reaped with their parent
+    # request by the retention cycle (Admin -> Retention) — retention/size
+    # caps were never enforced from settings, so no such knobs exist here.
     artifact_storage_path: str = "/data/artifacts"
-    artifact_max_size_mb: int = 50
-    artifact_retention_days: int = 365
 
     # Video Generation
     # Every value here MUST also be added to docker-compose.yml as
@@ -259,7 +259,13 @@ class Settings(BaseSettings):
     log_format: str = "json"
     log_file: Optional[str] = None
 
-    # Audit Logging
+    # Audit Logging — content capture into the requests/responses audit
+    # tables. audit_log_enabled=False disables BOTH prompt and response
+    # capture; the finer flags gate each side individually. Metadata
+    # (model, tokens, timings, status) is always recorded. NOTE: the DLP
+    # worker scans the stored content, so disabling capture also disables
+    # DLP scanning of that content. Web-chat conversation storage is
+    # user-facing state, not audit, and is unaffected.
     audit_log_enabled: bool = True
     audit_log_prompts: bool = True
     audit_log_responses: bool = True
@@ -288,9 +294,8 @@ class Settings(BaseSettings):
         ".jpg", ".jpeg", ".png", ".gif", ".webp",
     ]
 
-    # Conversation Retention
-    conversation_retention_days: int = 730  # 2 years
-    conversation_cleanup_interval: int = 86400  # seconds (24 hours)
+    # (Chat retention lives in the runtime-editable app_config policies
+    # at Admin -> Retention, not in environment settings.)
 
     # Web Search (Brave)
     brave_search_api_key: Optional[str] = None

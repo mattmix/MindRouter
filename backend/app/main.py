@@ -429,6 +429,18 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
     from backend.app.services.dlp_worker import dlp_worker_loop
     _dlp_task = asyncio.create_task(dlp_worker_loop())
 
+    # DLP scans STORED audit content — with capture disabled it has
+    # nothing to scan, which an operator should hear about once.
+    _cap = get_settings()
+    if not (_cap.audit_log_enabled and _cap.audit_log_prompts and _cap.audit_log_responses):
+        logger.warning(
+            "audit_capture_disabled",
+            audit_log_enabled=_cap.audit_log_enabled,
+            audit_log_prompts=_cap.audit_log_prompts,
+            audit_log_responses=_cap.audit_log_responses,
+            note="prompt/response content is not persisted; DLP scanning of unstored content is inert",
+        )
+
     # Keep the branding cache fresh so an admin save propagates across workers
     _branding_task = asyncio.create_task(branding_service.branding_refresh_loop())
 
@@ -584,6 +596,12 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    # Session deactivation guard — raw ASGI; refuses session-cookie
+    # requests from deactivated/deleted users (cookies live 7 days and
+    # login-boundary checks alone don't cover existing sessions).
+    from backend.app.core.session_guard import SessionDeactivationMiddleware
+    app.add_middleware(SessionDeactivationMiddleware)
 
     # Request ID middleware — raw ASGI to avoid BaseHTTPMiddleware's task
     # cancellation behavior which corrupts DB sessions on client disconnect.

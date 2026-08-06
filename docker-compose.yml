@@ -30,6 +30,11 @@ services:
       - CHAT_FILES_PATH=/data/chat_files
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - DEBUG=${DEBUG:-false}
+      # Audit content capture (see backend/app/settings.py — keep in sync).
+      # Disabling capture also disables DLP scanning of that content.
+      - AUDIT_LOG_ENABLED=${AUDIT_LOG_ENABLED:-true}
+      - AUDIT_LOG_PROMPTS=${AUDIT_LOG_PROMPTS:-true}
+      - AUDIT_LOG_RESPONSES=${AUDIT_LOG_RESPONSES:-true}
       - DATABASE_POOL_SIZE=${DATABASE_POOL_SIZE:-30}
       - DATABASE_MAX_OVERFLOW=${DATABASE_MAX_OVERFLOW:-20}
       - AZURE_AD_CLIENT_ID=${AZURE_AD_CLIENT_ID:-}

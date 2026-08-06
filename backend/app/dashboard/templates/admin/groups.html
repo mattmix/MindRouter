@@ -75,7 +75,8 @@
                                 </button>
                             </form>
                             {% else %}
-                            <button class="btn btn-sm btn-outline-danger" disabled title="Cannot delete group with users">
+                            <button class="btn btn-sm btn-outline-danger" disabled
+                                    title="Cannot delete a group that has members — reassign each member to another group first (Users → filter by this group → edit)">
                                 <i class="bi bi-trash"></i> Delete
                             </button>
                             {% endif %}
