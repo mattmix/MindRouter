@@ -14,6 +14,19 @@
                 <span class="text-muted">{{ total }} key{{ 's' if total != 1 else '' }}</span>
             </div>
 
+            {% if success %}
+            <div class="alert alert-success alert-dismissible fade show" role="alert">
+                {% if success == 'key_revoked' %}Key revoked.{% else %}{{ success }}{% endif %}
+                <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
+            </div>
+            {% endif %}
+            {% if error %}
+            <div class="alert alert-danger alert-dismissible fade show" role="alert">
+                Error: {{ error }}
+                <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
+            </div>
+            {% endif %}
+
             <!-- Search and Filter -->
             <div class="card mb-4">
                 <div class="card-body">
@@ -286,6 +299,14 @@
                                         {% if k.is_service and k.status.value == 'active' %}
                                         <form method="POST" action="/admin/service-keys/{{ k.id }}/revoke" style="display: inline;">
                                             <button type="submit" class="btn btn-sm btn-outline-danger" onclick="return confirm('Revoke this service key? This cannot be undone.')">
+                                                <i class="bi bi-x-lg"></i> Revoke
+                                            </button>
+                                        </form>
+                                        {% elif not k.is_service and k.status.value == 'active' %}
+                                        <form method="POST" action="/admin/api-keys/{{ k.id }}/revoke" style="display: inline;">
+                                            {# Username via |tojson in a single-quoted attribute — never raw text in a JS string. #}
+                                            <button type="submit" class="btn btn-sm btn-outline-danger"
+                                                    onclick='return confirm("Revoke key {{ k.key_prefix }}... belonging to " + {{ (k.user.username if k.user else "this user")|tojson }} + "? This cannot be undone.")'>
                                                 <i class="bi bi-x-lg"></i> Revoke
                                             </button>
                                         </form>

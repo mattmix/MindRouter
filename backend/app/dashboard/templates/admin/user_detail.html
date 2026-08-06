@@ -26,7 +26,7 @@
 
             {% if success %}
             <div class="alert alert-success alert-dismissible fade show" role="alert">
-                User {{ success }} successfully.
+                {% if success == 'key_revoked' %}Key revoked.{% else %}User {{ success }} successfully.{% endif %}
                 <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
             </div>
             {% endif %}
@@ -230,6 +230,7 @@
                                     <th scope="col">Last Used</th>
                                     <th scope="col">Usage Count</th>
                                     <th scope="col">Created</th>
+                                    {% if not is_read_only %}<th scope="col">Actions</th>{% endif %}
                                 </tr>
                             </thead>
                             <tbody>
@@ -241,6 +242,19 @@
                                     <td>{{ k.last_used_at|localtime if k.last_used_at else 'Never' }}</td>
                                     <td>{{ "{:,}".format(k.usage_count) }}</td>
                                     <td>{{ k.created_at|localtime('%Y-%m-%d') }}</td>
+                                    {% if not is_read_only %}
+                                    <td>
+                                        {% if k.status.value == 'active' %}
+                                        <form method="POST" action="/admin/api-keys/{{ k.id }}/revoke" class="d-inline">
+                                            <input type="hidden" name="redirect_to" value="/admin/users/{{ detail_user.id }}">
+                                            <button type="submit" class="btn btn-sm btn-outline-danger"
+                                                    onclick="return confirm('Revoke key {{ k.key_prefix }}...? This cannot be undone.')">
+                                                <i class="bi bi-x-lg"></i> Revoke
+                                            </button>
+                                        </form>
+                                        {% endif %}
+                                    </td>
+                                    {% endif %}
                                 </tr>
                                 {% endfor %}
                             </tbody>
@@ -291,6 +305,118 @@
                 </div>
             </div>
             {% endif %}
+
+            {% if not is_read_only %}
+            <!-- Account Management -->
+            <div class="card border-danger mb-4">
+                <div class="card-header text-danger"><i class="bi bi-shield-exclamation"></i> Account Management</div>
+                <div class="card-body">
+                    <div class="d-flex flex-wrap gap-2">
+                        {# Gate on the credential: local accounts (even in
+                           admin groups, where account_type is 'admin')
+                           always have a password_hash; SSO accounts never do. #}
+                        {% if detail_user.password_hash %}
+                        <button type="button" class="btn btn-outline-primary" data-bs-toggle="modal" data-bs-target="#resetPasswordModal">
+                            <i class="bi bi-key"></i> Reset Password
+                        </button>
+                        {% endif %}
+
+                        {% if detail_user.id != user.id %}
+                        <form method="POST" action="/admin/users/{{ detail_user.id }}/set-active" class="d-inline">
+                            <input type="hidden" name="active" value="{{ '0' if detail_user.is_active else '1' }}">
+                            {# Username goes through |tojson inside a
+                               single-quoted attribute: never raw text in
+                               a JS string context. #}
+                            {% if detail_user.is_active %}
+                            <button type="submit" class="btn btn-outline-warning"
+                                    onclick='return confirm("Deactivate " + {{ detail_user.username|tojson }} + "? All their API keys stop working immediately.")'>
+                                <i class="bi bi-person-dash"></i> Deactivate
+                            </button>
+                            {% else %}
+                            <button type="submit" class="btn btn-outline-success"
+                                    onclick='return confirm("Reactivate " + {{ detail_user.username|tojson }} + "? Their API keys start working again.")'>
+                                <i class="bi bi-person-check"></i> Reactivate
+                            </button>
+                            {% endif %}
+                        </form>
+
+                        <button type="button" class="btn btn-outline-danger" data-bs-toggle="modal" data-bs-target="#deleteUserModal">
+                            <i class="bi bi-trash3"></i> Delete User
+                        </button>
+                        {% endif %}
+                    </div>
+                    <p class="text-muted small mb-0 mt-2">
+                        Deactivation is reversible and immediately disables the user's API keys.
+                        Deletion permanently removes the account, its keys, requests, chats,
+                        images, and videos; blog posts and audit records are kept (detached).
+                    </p>
+                </div>
+            </div>
+
+            {% if detail_user.password_hash %}
+            <!-- Reset Password Modal -->
+            <div class="modal fade" id="resetPasswordModal" tabindex="-1" aria-labelledby="resetPasswordLabel" aria-hidden="true">
+                <div class="modal-dialog">
+                    <div class="modal-content">
+                        <form method="POST" action="/admin/users/{{ detail_user.id }}/reset-password">
+                            <div class="modal-header">
+                                <h5 class="modal-title" id="resetPasswordLabel"><i class="bi bi-key"></i> Reset Password for {{ detail_user.username }}</h5>
+                                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                            </div>
+                            <div class="modal-body">
+                                <div class="mb-3">
+                                    <label for="new_password" class="form-label">New Password</label>
+                                    <input type="password" class="form-control" id="new_password" name="new_password"
+                                           minlength="8" required autocomplete="new-password">
+                                    <div class="form-text">Minimum 8 characters.</div>
+                                </div>
+                                <div class="mb-3">
+                                    <label for="confirm_password" class="form-label">Confirm New Password</label>
+                                    <input type="password" class="form-control" id="confirm_password" name="confirm_password"
+                                           minlength="8" required autocomplete="new-password">
+                                </div>
+                            </div>
+                            <div class="modal-footer">
+                                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                                <button type="submit" class="btn btn-primary">Set New Password</button>
+                            </div>
+                        </form>
+                    </div>
+                </div>
+            </div>
+            {% endif %}
+
+            {% if detail_user.id != user.id %}
+            <!-- Delete User Modal (type username to confirm) -->
+            <div class="modal fade" id="deleteUserModal" tabindex="-1" aria-labelledby="deleteUserLabel" aria-hidden="true">
+                <div class="modal-dialog">
+                    <div class="modal-content">
+                        <form method="POST" action="/admin/users/{{ detail_user.id }}/delete">
+                            <div class="modal-header bg-danger text-white">
+                                <h5 class="modal-title" id="deleteUserLabel"><i class="bi bi-exclamation-triangle"></i> Delete {{ detail_user.username }}</h5>
+                                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button>
+                            </div>
+                            <div class="modal-body">
+                                <p>This permanently deletes the account and all of its data:
+                                   API keys, request history, chats, images, videos, and stored
+                                   responses. Blog posts and audit-log entries are kept but
+                                   detached from the account. <strong>This cannot be undone.</strong></p>
+                                <p class="mb-2">Type <code>{{ detail_user.username }}</code> to confirm:</p>
+                                <input type="text" class="form-control" id="deleteUserConfirm" name="confirm_username"
+                                       autocomplete="off" required placeholder="{{ detail_user.username }}">
+                            </div>
+                            <div class="modal-footer">
+                                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                                <button type="submit" class="btn btn-danger" id="deleteUserSubmit" disabled>
+                                    <i class="bi bi-trash3"></i> Delete Permanently
+                                </button>
+                            </div>
+                        </form>
+                    </div>
+                </div>
+            </div>
+            {% endif %}
+            {% endif %}
         </div>
     </div>
 </div>
@@ -298,6 +424,15 @@
 
 {% block extra_js %}
 <script>
+(function () {
+    const confirmInput = document.getElementById('deleteUserConfirm');
+    const submitBtn = document.getElementById('deleteUserSubmit');
+    if (confirmInput && submitBtn) {
+        confirmInput.addEventListener('input', function () {
+            submitBtn.disabled = confirmInput.value !== {{ detail_user.username|tojson }};
+        });
+    }
+})();
 </script>
 {% if monthly_usage %}
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>

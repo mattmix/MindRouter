@@ -1264,7 +1264,8 @@ class BlogPost(Base, TimestampMixin, SoftDeleteMixin):
     slug: Mapped[str] = mapped_column(String(255), unique=True, nullable=False, index=True)
     content: Mapped[str] = mapped_column(MEDIUMTEXT, nullable=False)
     excerpt: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
-    author_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), nullable=False)
+    # Nullable: user deletion detaches the reference, keeping the post.
+    author_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("users.id"), nullable=True)
     is_published: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     published_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
@@ -1277,7 +1278,7 @@ class BlogPost(Base, TimestampMixin, SoftDeleteMixin):
     website_commit_sha: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
 
     # Relationships
-    author: Mapped["User"] = relationship("User")
+    author: Mapped[Optional["User"]] = relationship("User")
 
 
 class EmailStatus(str, PyEnum):
@@ -1299,7 +1300,8 @@ class EmailLog(Base):
     recipient_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
     success_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
     fail_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
-    sent_by: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), nullable=False)
+    # Nullable: user deletion detaches the reference, keeping the log row.
+    sent_by: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("users.id"), nullable=True)
     blog_post_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("blog_posts.id"), nullable=True)
     status: Mapped[EmailStatus] = mapped_column(
         Enum(EmailStatus, values_callable=_enum_values), nullable=False, server_default="pending"
@@ -1309,7 +1311,7 @@ class EmailLog(Base):
     completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
     # Relationships
-    sender: Mapped["User"] = relationship("User", foreign_keys=[sent_by])
+    sender: Mapped[Optional["User"]] = relationship("User", foreign_keys=[sent_by])
     blog_post: Mapped[Optional["BlogPost"]] = relationship("BlogPost")
 
 
@@ -1320,7 +1322,9 @@ class AdminAuditLog(Base):
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
-    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), nullable=False)
+    # Nullable: audit rows outlive their actor (retained permanently);
+    # user deletion detaches the reference instead of dropping the row.
+    user_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("users.id"), nullable=True)
     action: Mapped[str] = mapped_column(String(100), nullable=False)
     entity_type: Mapped[str] = mapped_column(String(50), nullable=False)
     entity_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
@@ -1329,7 +1333,7 @@ class AdminAuditLog(Base):
     ip_address: Mapped[Optional[str]] = mapped_column(String(45), nullable=True)
     detail: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
-    user: Mapped["User"] = relationship("User", foreign_keys=[user_id])
+    user: Mapped[Optional["User"]] = relationship("User", foreign_keys=[user_id])
 
     __table_args__ = (
         Index("ix_admin_audit_timestamp", "timestamp"),

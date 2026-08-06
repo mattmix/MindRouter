@@ -24,6 +24,7 @@ import httpx
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.requests import Request
 
@@ -31,7 +32,7 @@ from backend.app.api.auth import require_admin, require_admin_or_session, requir
 from backend.app.core.scheduler.policy import get_scheduler
 from backend.app.core.telemetry.registry import get_registry
 from backend.app.db import crud
-from backend.app.db.models import BackendEngine, BackendStatus, Group, RequestStatus, User, UserRole
+from backend.app.db.models import ApiKeyStatus, BackendEngine, BackendStatus, Group, RequestStatus, User, UserRole
 from backend.app.db.session import get_async_db, get_async_db_context
 from backend.app.logging_config import get_logger
 from backend.app.security.api_keys import generate_api_key
@@ -1568,6 +1569,170 @@ async def create_user_api_key(
     )
 
 
+@router.post("/api-keys/{key_id}/revoke")
+async def revoke_api_key_admin(
+    key_id: int,
+    http_request: Request,
+    admin: User = Depends(require_admin()),
+    db: AsyncSession = Depends(get_async_db),
+):
+    """Revoke any user's API key (personal or service). Idempotent."""
+    api_key = await crud.get_api_key_by_id(db, key_id)
+    if not api_key:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="API key not found",
+        )
+
+    already_revoked = api_key.status == ApiKeyStatus.REVOKED
+    if not already_revoked:
+        await crud.revoke_api_key(db, key_id)
+        await crud.log_admin_action(
+            db,
+            user_id=admin.id,
+            action="apikey.revoke",
+            entity_type="api_key",
+            entity_id=str(key_id),
+            before_value={
+                "key_prefix": api_key.key_prefix,
+                "target_user_id": api_key.user_id,
+                "is_service": api_key.is_service,
+            },
+            ip_address=_get_client_ip(http_request),
+        )
+        await db.commit()
+
+        logger.info(
+            "api_key_revoked_by_admin",
+            admin_id=admin.id,
+            api_key_id=key_id,
+            target_user_id=api_key.user_id,
+        )
+
+    return {
+        "status": "revoked",
+        "api_key_id": key_id,
+        "already_revoked": already_revoked,
+    }
+
+
+@router.delete("/api-keys/{key_id}")
+async def delete_api_key_admin(
+    key_id: int,
+    http_request: Request,
+    admin: User = Depends(require_admin()),
+    db: AsyncSession = Depends(get_async_db),
+):
+    """Hard-delete an API key row.
+
+    Refused (409) when audit rows reference the key — revoke instead;
+    deletion is for keys that were never used.
+    """
+    api_key = await crud.get_api_key_by_id(db, key_id)
+    if not api_key:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="API key not found",
+        )
+
+    references = await crud.count_api_key_references(db, key_id)
+    if references:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "Key has usage history and cannot be deleted "
+                f"(referencing rows: {references}). Revoke it instead."
+            ),
+        )
+
+    try:
+        await crud.delete_api_key(db, key_id)
+        await crud.log_admin_action(
+            db,
+            user_id=admin.id,
+            action="apikey.delete",
+            entity_type="api_key",
+            entity_id=str(key_id),
+            before_value={
+                "key_prefix": api_key.key_prefix,
+                "target_user_id": api_key.user_id,
+                "is_service": api_key.is_service,
+            },
+            ip_address=_get_client_ip(http_request),
+        )
+        await db.commit()
+    except IntegrityError:
+        # Race: the key acquired a referencing row between the check
+        # above and the delete.  Never echo DB error text.
+        await db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Key has usage history and cannot be deleted. Revoke it instead.",
+        )
+
+    logger.info(
+        "api_key_deleted_by_admin",
+        admin_id=admin.id,
+        api_key_id=key_id,
+        target_user_id=api_key.user_id,
+    )
+
+    return {"status": "deleted", "api_key_id": key_id}
+
+
+class ResetPasswordRequest(BaseModel):
+    """Admin request to set a new password on a local account."""
+    new_password: str = Field(..., min_length=8, max_length=128)
+
+
+@router.post("/users/{user_id}/reset-password")
+async def reset_user_password(
+    user_id: int,
+    http_request: Request,
+    request: ResetPasswordRequest,
+    admin: User = Depends(require_admin()),
+    db: AsyncSession = Depends(get_async_db),
+):
+    """Set a new password for a local user account.
+
+    SSO accounts have no local password and are rejected — they
+    authenticate with the identity provider.
+    """
+    user = await crud.get_user_by_id(db, user_id)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found",
+        )
+    # Gate on the credential, not account_type: a local user in an
+    # admin group reports account_type "admin" but still has a password.
+    if user.password_hash is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Only local accounts have a password; this account uses SSO",
+        )
+
+    user.password_hash = hash_password(request.new_password)
+    await crud.log_admin_action(
+        db,
+        user_id=admin.id,
+        action="user.password_reset",
+        entity_type="user",
+        entity_id=str(user_id),
+        after_value={"username": user.username},
+        ip_address=_get_client_ip(http_request),
+    )
+    await db.commit()
+
+    logger.info(
+        "user_password_reset_by_admin",
+        admin_id=admin.id,
+        target_user_id=user_id,
+    )
+
+    return {"status": "password_reset", "user_id": user_id}
+
+
 @router.delete("/users/{user_id}")
 async def delete_user(
     user_id: int,
@@ -1591,7 +1756,22 @@ async def delete_user(
             detail="User not found",
         )
 
-    deleted = await crud.delete_user(db, user_id)
+    try:
+        deleted = await crud.delete_user(db, user_id)
+    except IntegrityError:
+        # A table referencing users.id was missed by the cascade (new
+        # feature table?) — surface a clean conflict, not a 500.  Never
+        # echo the DB error text: DBAPIError messages embed statement
+        # parameters.
+        await db.rollback()
+        logger.exception("user_delete_integrity_error", target_user_id=user_id)
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "User still has dependent records that could not be removed; "
+                "see server logs. Deactivate the account instead."
+            ),
+        )
     if not deleted:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

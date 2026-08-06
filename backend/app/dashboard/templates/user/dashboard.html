@@ -84,6 +84,10 @@
                     <div class="alert alert-warning" role="alert">
                         You have reached the maximum of {{ max_keys }} active API keys. Revoke an existing key to create a new one.
                     </div>
+                    {% elif key_error == 'not_found' %}
+                    <div class="alert alert-warning" role="alert">
+                        Key not found or not revocable — service keys need a revocation request instead.
+                    </div>
                     {% endif %}
                     {% if api_keys %}
                     <div class="table-responsive">

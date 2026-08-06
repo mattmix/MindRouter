@@ -1008,15 +1008,70 @@ async def revoke_key(
     key_id: int,
     db: AsyncSession = Depends(get_async_db),
 ):
-    """Revoke an API key."""
+    """Self-service revocation of the caller's own personal API key.
+
+    Scoped to the session user and to non-service keys: service keys go
+    through the request/approve flow, and nobody can revoke another
+    user's key from here (admins use /admin/api-keys/{id}/revoke).
+    """
     user_id = get_session_user_id(request)
     if not user_id:
         return RedirectResponse(url="/login", status_code=302)
 
-    await crud.revoke_api_key(db, key_id)
+    revoked = await crud.revoke_api_key(
+        db, key_id, owner_user_id=user_id, allow_service=False
+    )
+    if not revoked:
+        # key_error is the param the dashboard template actually renders
+        return RedirectResponse(
+            url="/dashboard?key_error=not_found", status_code=302
+        )
     await db.commit()
 
     return RedirectResponse(url="/dashboard", status_code=302)
+
+
+@dashboard_router.post("/admin/api-keys/{key_id}/revoke")
+async def admin_revoke_api_key(
+    request: Request,
+    key_id: int,
+    redirect_to: str = Form("/admin/api-keys"),
+    db: AsyncSession = Depends(get_async_db),
+):
+    """Admin revocation of any user's API key (personal or service)."""
+    user_id = get_session_user_id(request)
+    if not user_id:
+        return RedirectResponse(url="/login", status_code=302)
+
+    user = await crud.get_user_by_id(db, user_id)
+    if not user or (not user.group or not user.group.is_admin):
+        return RedirectResponse(url="/dashboard", status_code=302)
+
+    # Only allow redirects back into the admin area (no open redirect).
+    if not redirect_to.startswith("/admin/"):
+        redirect_to = "/admin/api-keys"
+
+    revoked = await crud.revoke_api_key(db, key_id)
+    if not revoked:
+        return RedirectResponse(
+            url=f"{redirect_to}?error=Key+not+found", status_code=302
+        )
+
+    await crud.log_admin_action(
+        db, user_id=user_id, action="apikey.revoke",
+        entity_type="api_key", entity_id=str(key_id),
+        before_value={
+            "key_prefix": revoked.key_prefix,
+            "target_user_id": revoked.user_id,
+            "is_service": revoked.is_service,
+        },
+        ip_address=get_client_ip(request),
+    )
+    await db.commit()
+
+    return RedirectResponse(
+        url=f"{redirect_to}?success=key_revoked", status_code=302
+    )
 
 
 @dashboard_router.get("/dashboard/request-quota", response_class=HTMLResponse)
@@ -3175,6 +3230,173 @@ async def delete_group(
         )
 
 
+async def _require_dashboard_admin(request: Request, db: AsyncSession):
+    """Resolve the session user and require an admin group.
+
+    Returns (user, None) on success or (None, redirect_response) when
+    the caller must be bounced.
+    """
+    user_id = get_session_user_id(request)
+    if not user_id:
+        return None, RedirectResponse(url="/login", status_code=302)
+    user = await crud.get_user_by_id(db, user_id)
+    # is_active: a deactivated admin's surviving session cookie must not
+    # keep working these privileged endpoints.
+    if not user or not user.is_active or (not user.group or not user.group.is_admin):
+        return None, RedirectResponse(url="/dashboard", status_code=302)
+    return user, None
+
+
+@dashboard_router.post("/admin/users/{user_id}/reset-password")
+async def admin_reset_user_password(
+    request: Request,
+    user_id: int,
+    new_password: str = Form(...),
+    confirm_password: str = Form(...),
+    db: AsyncSession = Depends(get_async_db),
+):
+    """Admin sets a new password on a local account."""
+    admin, bounce = await _require_dashboard_admin(request, db)
+    if bounce:
+        return bounce
+
+    detail_url = f"/admin/users/{user_id}"
+    target = await crud.get_user_by_id(db, user_id)
+    if not target:
+        return RedirectResponse(url="/admin/users?error=User+not+found", status_code=302)
+    # Gate on the credential, not account_type: a local user in an
+    # admin group reports account_type "admin" but still has a password.
+    if target.password_hash is None:
+        return RedirectResponse(
+            url=f"{detail_url}?error=SSO+accounts+have+no+local+password", status_code=302
+        )
+    if new_password != confirm_password:
+        return RedirectResponse(
+            url=f"{detail_url}?error=Passwords+do+not+match", status_code=302
+        )
+    if len(new_password) < 8:
+        return RedirectResponse(
+            url=f"{detail_url}?error=Password+must+be+at+least+8+characters", status_code=302
+        )
+
+    from backend.app.security.password_hash import hash_password
+
+    target.password_hash = hash_password(new_password)
+    await crud.log_admin_action(
+        db, user_id=admin.id, action="user.password_reset",
+        entity_type="user", entity_id=str(user_id),
+        after_value={"username": target.username},
+        ip_address=get_client_ip(request),
+    )
+    await db.commit()
+    return RedirectResponse(url=f"{detail_url}?success=password+reset", status_code=302)
+
+
+@dashboard_router.post("/admin/users/{user_id}/set-active")
+async def admin_set_user_active(
+    request: Request,
+    user_id: int,
+    active: str = Form(...),
+    db: AsyncSession = Depends(get_async_db),
+):
+    """Admin activates or deactivates an account.
+
+    Deactivation immediately disables all the user's API keys (auth
+    re-checks is_active per request); reactivation restores them.
+    """
+    admin, bounce = await _require_dashboard_admin(request, db)
+    if bounce:
+        return bounce
+
+    detail_url = f"/admin/users/{user_id}"
+    make_active = active == "1"
+    if user_id == admin.id and not make_active:
+        return RedirectResponse(
+            url=f"{detail_url}?error=Cannot+deactivate+your+own+account", status_code=302
+        )
+
+    target = await crud.get_user_by_id(db, user_id)
+    if not target:
+        return RedirectResponse(url="/admin/users?error=User+not+found", status_code=302)
+
+    before = target.is_active
+    target.is_active = make_active
+    await crud.log_admin_action(
+        db, user_id=admin.id,
+        action="user.activate" if make_active else "user.deactivate",
+        entity_type="user", entity_id=str(user_id),
+        before_value={"is_active": before},
+        after_value={"is_active": make_active},
+        ip_address=get_client_ip(request),
+    )
+    await db.commit()
+    return RedirectResponse(
+        url=f"{detail_url}?success={'activated' if make_active else 'deactivated'}",
+        status_code=302,
+    )
+
+
+@dashboard_router.post("/admin/users/{user_id}/delete")
+async def admin_delete_user(
+    request: Request,
+    user_id: int,
+    confirm_username: str = Form(...),
+    db: AsyncSession = Depends(get_async_db),
+):
+    """Admin hard-deletes a user after typing the username to confirm.
+
+    Server-side verification: the typed username must match exactly.
+    Self-deletion is blocked. Content that must survive (blog posts,
+    email log, admin audit trail) is detached, everything else is
+    removed — see crud.delete_user.
+    """
+    from sqlalchemy.exc import IntegrityError
+
+    admin, bounce = await _require_dashboard_admin(request, db)
+    if bounce:
+        return bounce
+
+    detail_url = f"/admin/users/{user_id}"
+    if user_id == admin.id:
+        return RedirectResponse(
+            url=f"{detail_url}?error=Cannot+delete+your+own+account", status_code=302
+        )
+
+    target = await crud.get_user_by_id(db, user_id)
+    if not target:
+        return RedirectResponse(url="/admin/users?error=User+not+found", status_code=302)
+    if confirm_username != target.username:
+        return RedirectResponse(
+            url=f"{detail_url}?error=Username+confirmation+did+not+match", status_code=302
+        )
+
+    username, email = target.username, target.email
+    try:
+        deleted = await crud.delete_user(db, user_id)
+    except IntegrityError:
+        # Never echo DB error text — DBAPIError messages embed
+        # statement parameters.
+        await db.rollback()
+        logger.exception("user_delete_integrity_error", target_user_id=user_id)
+        return RedirectResponse(
+            url=f"{detail_url}?error=User+has+dependent+records+that+could+not+be+removed",
+            status_code=302,
+        )
+    if not deleted:
+        return RedirectResponse(
+            url=f"{detail_url}?error=Delete+failed", status_code=302
+        )
+
+    await crud.log_admin_action(
+        db, user_id=admin.id, action="user.delete",
+        entity_type="user", entity_id=str(user_id),
+        before_value={"username": username, "email": email},
+        ip_address=get_client_ip(request),
+    )
+    await db.commit()
+    return RedirectResponse(url="/admin/users?success=User+deleted", status_code=302)
+
+
 # User detail route
 @dashboard_router.get("/admin/users/{user_id}", response_class=HTMLResponse)
 async def admin_user_detail(
@@ -3435,6 +3657,8 @@ async def admin_api_keys(
     sort: Optional[str] = None,
     dir: Optional[str] = None,
     page: int = 1,
+    success: Optional[str] = None,
+    error: Optional[str] = None,
     db: AsyncSession = Depends(get_async_db),
 ):
     """Admin API key listing with sort and IP tracking."""
@@ -3487,6 +3711,8 @@ async def admin_api_keys(
             "dir": sort_dir,
             "key_last_ips": key_last_ips,
             "now_utc": datetime.now(timezone.utc),
+            "success": success,
+            "error": error,
         },
     )
 
@@ -5161,6 +5387,64 @@ async def admin_retention_post(
             await audit_db.commit()
         return RedirectResponse(
             url="/admin/retention?success=retention_triggered", status_code=302
+        )
+
+    elif action == "purge":
+        import asyncio
+        from backend.app.services.retention import (
+            PURGE_CATEGORIES,
+            is_retention_running,
+            try_run_purge_with_lock,
+        )
+
+        # Server-side verification step: the GUI modal requires typing
+        # PURGE; re-check here so the modal cannot be bypassed.
+        if form.get("confirm_text") != "PURGE":
+            return RedirectResponse(
+                url="/admin/retention?tab=purge&error=Confirmation+text+did+not+match",
+                status_code=302,
+            )
+        category = form.get("purge_category", "")
+        if category not in PURGE_CATEGORIES:
+            return RedirectResponse(
+                url="/admin/retention?tab=purge&error=Unknown+purge+category",
+                status_code=302,
+            )
+        try:
+            days = int(form.get("purge_days", ""))
+        except ValueError:
+            days = -1
+        if days < 0:
+            return RedirectResponse(
+                url="/admin/retention?tab=purge&error=Days+must+be+0+or+more",
+                status_code=302,
+            )
+
+        if await is_retention_running():
+            return RedirectResponse(
+                url="/admin/retention?tab=purge&error=retention_already_running",
+                status_code=302,
+            )
+
+        async def _run_manual_purge() -> None:
+            try:
+                await try_run_purge_with_lock(category, days, "manual_purge")
+            except Exception:
+                logger.exception("retention_manual_purge_error")
+
+        task = asyncio.create_task(_run_manual_purge())
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)
+        async with get_async_db_context() as audit_db:
+            await crud.log_admin_action(
+                audit_db, user_id=user_id, action="retention.purge",
+                entity_type="config",
+                after_value={"category": category, "older_than_days": days},
+                ip_address=get_client_ip(request),
+            )
+            await audit_db.commit()
+        return RedirectResponse(
+            url="/admin/retention?tab=purge&success=purge_triggered", status_code=302
         )
 
     return RedirectResponse(

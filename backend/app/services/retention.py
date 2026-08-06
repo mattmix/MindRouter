@@ -27,7 +27,7 @@ from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Optional
 
-from sqlalchemy import bindparam, delete, func, select, text
+from sqlalchemy import bindparam, delete, func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.logging_config import get_logger
@@ -376,6 +376,39 @@ async def _snapshot_request_aggregates_inner(
 # ------------------------------------------------------------------
 
 
+async def _detach_request_references(
+    app_db: AsyncSession, request_ids: list[int]
+) -> None:
+    """SET NULL the nullable audit back-references to requests about to
+    be deleted (user_images, video_jobs, stored_responses, dlp_alerts).
+    Their FKs are RESTRICT with no cascade, so deleting a referenced
+    request would otherwise raise IntegrityError."""
+    if not request_ids:
+        return
+    from backend.app.db.models import DlpAlert, StoredResponse, UserImage, VideoJob
+
+    await app_db.execute(
+        update(UserImage)
+        .where(UserImage.request_id.in_(request_ids))
+        .values(request_id=None)
+    )
+    await app_db.execute(
+        update(VideoJob)
+        .where(VideoJob.request_id.in_(request_ids))
+        .values(request_id=None)
+    )
+    await app_db.execute(
+        update(StoredResponse)
+        .where(StoredResponse.request_id.in_(request_ids))
+        .values(request_id=None)
+    )
+    await app_db.execute(
+        update(DlpAlert)
+        .where(DlpAlert.request_id.in_(request_ids))
+        .values(request_id=None)
+    )
+
+
 async def archive_expired_requests(
     app_db: AsyncSession,
     archive_db: AsyncSession,
@@ -513,6 +546,10 @@ async def archive_expired_requests(
 
         # Snapshot per-user and per-model aggregates before deletion
         await _snapshot_request_aggregates(app_db, safe_ids)
+
+        # Detach nullable audit back-references before deleting the
+        # requests they point at (RESTRICT FKs, no cascade).
+        await _detach_request_references(app_db, safe_ids)
 
         # Delete from app DB in FK order
         await app_db.execute(
@@ -1093,7 +1130,7 @@ async def try_run_retention_with_lock(trigger: str) -> dict[str, Any]:
 
 
 async def cleanup_expired_request_images(
-    artifact_storage_path: str, days: int
+    artifact_storage_path: str, days: int, force_all: bool = False
 ) -> dict[str, Any]:
     """Delete ``request_images/<uuid>/`` directories older than ``days``.
 
@@ -1101,13 +1138,14 @@ async def cleanup_expired_request_images(
     extracted from multimodal (OCR/vision) requests so the DB audit record
     stays small. Nothing reads them back -- they exist only for forensic
     inspection -- so they are reaped by directory mtime. A value of 0
-    disables cleanup (keep forever).
+    disables cleanup (keep forever) unless ``force_all`` is set (manual
+    purge of everything).
     """
     import shutil
     from pathlib import Path
 
     base = Path(artifact_storage_path) / "request_images"
-    if days <= 0 or not base.is_dir():
+    if (days <= 0 and not force_all) or not base.is_dir():
         return {"deleted_dirs": 0, "skipped": True}
 
     cutoff_ts = (
@@ -1247,6 +1285,191 @@ async def cleanup_expired_conversations(
     return {"deleted": deleted_convs, "items_deleted": deleted_items}
 
 
+async def delete_expired_requests_no_archive(
+    app_db: AsyncSession, cutoff: datetime, batch_size: int
+) -> dict[str, int]:
+    """Delete requests (and children) older than cutoff without
+    archiving, snapshotting aggregates first.  Shared by the retention
+    cycle (archive DB unconfigured) and manual purge."""
+    from backend.app.db.models import (
+        Artifact, Request, Response,
+        SchedulerDecision,
+    )
+
+    total = 0
+    while True:
+        result = await app_db.execute(
+            select(Request.id)
+            .where(Request.created_at < cutoff)
+            .limit(batch_size)
+        )
+        ids = [r[0] for r in result.all()]
+        if not ids:
+            break
+        # Snapshot aggregates before deletion
+        await _snapshot_request_aggregates(app_db, ids)
+        await _detach_request_references(app_db, ids)
+        await app_db.execute(
+            delete(SchedulerDecision).where(
+                SchedulerDecision.request_id.in_(ids)
+            )
+        )
+        await app_db.execute(
+            delete(Response).where(Response.request_id.in_(ids))
+        )
+        await app_db.execute(
+            delete(Artifact).where(Artifact.request_id.in_(ids))
+        )
+        await app_db.execute(
+            delete(Request).where(Request.id.in_(ids))
+        )
+        await app_db.flush()
+        await app_db.commit()
+        total += len(ids)
+        logger.info(
+            "retention_requests_batch_no_archive",
+            deleted=len(ids),
+            total=total,
+        )
+    return {"deleted_without_archive": total}
+
+
+# Categories an admin may purge on demand.  admin_audit_log is
+# deliberately absent: the admin audit trail is retained permanently.
+PURGE_CATEGORIES = (
+    "requests",
+    "chat",
+    "telemetry",
+    "request_images",
+    "responses_store",
+    "conversations",
+)
+
+
+async def run_purge(category: str, older_than_days: int) -> dict[str, Any]:
+    """Purge one category of records older than a cutoff, immediately.
+
+    Runs the same archive-then-delete pipeline the retention cycle
+    uses, just with an explicit cutoff — so an archive DB (when
+    configured) still receives requests/chat/telemetry rows before they
+    leave the app DB, and file artifacts are removed with their rows.
+    older_than_days=0 purges everything in the category.
+    """
+    if category not in PURGE_CATEGORIES:
+        raise ValueError(f"Unknown purge category: {category}")
+
+    from backend.app.db.session import get_archive_db_context, get_async_db_context
+    from backend.app.settings import get_settings
+
+    settings = get_settings()
+    cutoff = datetime.now(timezone.utc) - timedelta(days=older_than_days)
+
+    async with get_async_db_context() as app_db:
+        config = await get_retention_config(app_db)
+    batch = config.get("retention.batch_size", 500) or 500
+    archive_configured = settings.archive_database_url is not None
+
+    summary: dict[str, Any] = {"category": category, "older_than_days": older_than_days}
+
+    if category == "requests":
+        if archive_configured:
+            async with get_async_db_context() as app_db:
+                async with get_archive_db_context() as archive_db:
+                    summary["result"] = await archive_expired_requests(
+                        app_db, archive_db, cutoff, batch
+                    )
+        else:
+            async with get_async_db_context() as app_db:
+                summary["result"] = await delete_expired_requests_no_archive(
+                    app_db, cutoff, batch
+                )
+    elif category == "chat":
+        if archive_configured:
+            async with get_async_db_context() as app_db:
+                async with get_archive_db_context() as archive_db:
+                    summary["result"] = await archive_expired_chats(
+                        app_db, archive_db, cutoff, batch
+                    )
+        else:
+            from backend.app.db import chat_crud
+
+            async with get_async_db_context() as app_db:
+                deleted = await chat_crud.delete_expired_conversations(
+                    app_db, older_than_days,
+                )
+                orphans = await chat_crud.delete_all_orphan_attachments(app_db)
+                await app_db.commit()
+                summary["result"] = {
+                    "conversations_deleted": deleted,
+                    "orphan_attachments": orphans,
+                }
+    elif category == "telemetry":
+        async with get_async_db_context() as app_db:
+            summary["result"] = await cleanup_expired_telemetry(app_db, cutoff)
+    elif category == "request_images":
+        summary["result"] = await cleanup_expired_request_images(
+            settings.artifact_storage_path, older_than_days,
+            force_all=(older_than_days == 0),
+        )
+    elif category == "responses_store":
+        async with get_async_db_context() as app_db:
+            summary["result"] = await cleanup_expired_stored_responses(
+                app_db, cutoff, batch
+            )
+    elif category == "conversations":
+        async with get_async_db_context() as app_db:
+            summary["result"] = await cleanup_expired_conversations(
+                app_db, cutoff, batch
+            )
+
+    return summary
+
+
+async def try_run_purge_with_lock(
+    category: str, older_than_days: int, trigger: str
+) -> dict[str, Any]:
+    """Run ``run_purge`` under the shared retention advisory lock, so a
+    purge never overlaps a retention cycle (or another purge)."""
+    from backend.app.db.session import AsyncSessionLocal
+
+    lock_session = AsyncSessionLocal()
+    try:
+        acquired = await lock_session.scalar(
+            text("SELECT GET_LOCK(:name, 0)"),
+            {"name": _RETENTION_LOCK_NAME},
+        )
+        if acquired != 1:
+            logger.info("purge_skipped_lock_held", trigger=trigger)
+            return {
+                "skipped": True,
+                "reason": "already_running",
+                "trigger": trigger,
+            }
+        try:
+            logger.info(
+                "purge_start", category=category,
+                older_than_days=older_than_days, trigger=trigger,
+            )
+            summary = await run_purge(category, older_than_days)
+            logger.info("purge_complete", trigger=trigger, summary=summary)
+            summary["trigger"] = trigger
+            return summary
+        finally:
+            try:
+                await lock_session.execute(
+                    text("SELECT RELEASE_LOCK(:name)"),
+                    {"name": _RETENTION_LOCK_NAME},
+                )
+                await lock_session.commit()
+            except Exception:
+                logger.exception("retention_lock_release_failed")
+    finally:
+        try:
+            await lock_session.close()
+        except Exception:
+            pass
+
+
 async def run_retention_cycle() -> dict[str, Any]:
     """Execute one full retention cycle.
 
@@ -1280,47 +1503,11 @@ async def run_retention_cycle() -> dict[str, Any]:
                     )
         else:
             # No archive DB — just delete
-            from backend.app.db.models import (
-                Artifact, Request, Response,
-                SchedulerDecision,
-            )
             async with get_async_db_context() as app_db:
-                effective_batch = config.get("retention.batch_size", 500) or 500
-                total = 0
-                while True:
-                    result = await app_db.execute(
-                        select(Request.id)
-                        .where(Request.created_at < cutoff)
-                        .limit(effective_batch)
-                    )
-                    ids = [r[0] for r in result.all()]
-                    if not ids:
-                        break
-                    # Snapshot aggregates before deletion
-                    await _snapshot_request_aggregates(app_db, ids)
-                    await app_db.execute(
-                        delete(SchedulerDecision).where(
-                            SchedulerDecision.request_id.in_(ids)
-                        )
-                    )
-                    await app_db.execute(
-                        delete(Response).where(Response.request_id.in_(ids))
-                    )
-                    await app_db.execute(
-                        delete(Artifact).where(Artifact.request_id.in_(ids))
-                    )
-                    await app_db.execute(
-                        delete(Request).where(Request.id.in_(ids))
-                    )
-                    await app_db.flush()
-                    await app_db.commit()
-                    total += len(ids)
-                    logger.info(
-                        "retention_requests_batch_no_archive",
-                        deleted=len(ids),
-                        total=total,
-                    )
-                summary["requests"] = {"deleted_without_archive": total}
+                summary["requests"] = await delete_expired_requests_no_archive(
+                    app_db, cutoff,
+                    config.get("retention.batch_size", 500) or 500,
+                )
 
     chat_tier1 = config.get("retention.chat.tier1_days", 90)
     if chat_tier1 > 0:

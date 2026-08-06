@@ -546,26 +546,162 @@ async def get_model_token_totals(
 
 
 async def delete_user(db: AsyncSession, user_id: int) -> bool:
-    """Hard-delete a user and all child rows (no CASCADE on FKs).
+    """Hard-delete a user and every row that references them.
 
-    Deletion order matters due to foreign key constraints:
-    1. scheduler_decisions (FK -> requests)
-    2. responses (FK -> requests)
-    3. artifacts (FK -> requests)
-    4. requests (FK -> users, api_keys)
-    5. api_keys (FK -> users)
-    6. quotas (FK -> users)
-    7. quota_requests (FK -> users)
-    8. users
+    No FK in the schema cascades, so each dependent table is handled
+    explicitly, children before parents.  Content that must outlive its
+    author — blog posts, the email log, and the admin audit trail
+    (retained permanently by policy) — is detached (SET NULL) instead
+    of deleted.
+
+    On-disk files (chat attachments, gallery images, video assets,
+    offloaded response/conversation artifacts) are removed best-effort
+    after the DB deletes flush; a crash between flush and commit leaves
+    rows gone on rollback but files already unlinked, which the readers
+    tolerate (missing-file reads are best-effort everywhere).
     """
-    # Get request IDs for this user (needed for child tables of requests)
+    from backend.app.db.models import ChatAttachment, ChatConversation, ChatMessage
+
+    file_paths: list[str] = []
+
+    # --- Chat (conversations -> messages -> attachments + files) ---
+    conv_result = await db.execute(
+        select(ChatConversation.id).where(ChatConversation.user_id == user_id)
+    )
+    conv_ids = [c for (c,) in conv_result.all()]
+    att_result = await db.execute(
+        select(ChatAttachment).where(ChatAttachment.user_id == user_id)
+    )
+    for att in att_result.scalars().all():
+        if att.storage_path:
+            file_paths.append(att.storage_path)
+            file_paths.append(att.storage_path.replace(".jpg", "_medium.jpg"))
+        if att.thumbnail_path:
+            file_paths.append(att.thumbnail_path)
+    await db.execute(delete(ChatAttachment).where(ChatAttachment.user_id == user_id))
+    if conv_ids:
+        await db.execute(
+            delete(ChatMessage).where(ChatMessage.conversation_id.in_(conv_ids))
+        )
+        await db.execute(
+            delete(ChatConversation).where(ChatConversation.id.in_(conv_ids))
+        )
+
+    # --- Video (shots -> jobs -> assets -> projects + files) ---
+    asset_result = await db.execute(
+        select(VideoAsset.storage_path, VideoAsset.poster_path).where(
+            VideoAsset.user_id == user_id
+        )
+    )
+    for storage_path, poster_path in asset_result.all():
+        if storage_path:
+            file_paths.append(storage_path)
+        if poster_path:
+            file_paths.append(poster_path)
+    job_result = await db.execute(
+        select(VideoJob.id).where(VideoJob.user_id == user_id)
+    )
+    job_ids = [j for (j,) in job_result.all()]
+    if job_ids:
+        await db.execute(delete(VideoShot).where(VideoShot.job_id.in_(job_ids)))
+        await db.execute(delete(VideoJob).where(VideoJob.id.in_(job_ids)))
+    await db.execute(delete(VideoAsset).where(VideoAsset.user_id == user_id))
+    await db.execute(delete(VideoProject).where(VideoProject.user_id == user_id))
+
+    # --- Image gallery (paths are relative to the artifact store) ---
+    img_result = await db.execute(
+        select(UserImage.storage_path).where(UserImage.user_id == user_id)
+    )
+    image_storage_paths = [p for (p,) in img_result.all() if p]
+    await db.execute(delete(UserImage).where(UserImage.user_id == user_id))
+
+    # --- Responses store (+ offloaded artifact dirs) ---
+    from backend.app.services.responses_store import remove_artifacts
+
+    sr_result = await db.execute(
+        select(StoredResponse.response_id).where(
+            StoredResponse.user_id == user_id,
+            StoredResponse.offloaded_images.is_not(None),
+        )
+    )
+    offloaded_response_ids = [r for (r,) in sr_result.all()]
+    await db.execute(delete(StoredResponse).where(StoredResponse.user_id == user_id))
+
+    # --- Conversations API (items -> conversations + artifact dirs) ---
+    from backend.app.services.conversations_store import remove_conversation_artifacts
+
+    capi_result = await db.execute(
+        select(Conversation.id, Conversation.conversation_id).where(
+            Conversation.user_id == user_id
+        )
+    )
+    capi_rows = capi_result.all()
+    if capi_rows:
+        capi_pks = [pk for pk, _ in capi_rows]
+        await db.execute(
+            delete(ConversationItem).where(
+                ConversationItem.conversation_pk.in_(capi_pks)
+            )
+        )
+        await db.execute(delete(Conversation).where(Conversation.id.in_(capi_pks)))
+
+    # --- Service-key promotion requests ---
+    await db.execute(
+        delete(ServiceKeyRequest).where(ServiceKeyRequest.user_id == user_id)
+    )
+
+    # --- Detach references that must survive the user ---
+    await db.execute(
+        update(BlogPost)
+        .where(BlogPost.author_id == user_id)
+        .values(author_id=None)
+    )
+    await db.execute(
+        update(EmailLog).where(EmailLog.sent_by == user_id).values(sent_by=None)
+    )
+    await db.execute(
+        update(AdminAuditLog)
+        .where(AdminAuditLog.user_id == user_id)
+        .values(user_id=None)
+    )
+    await db.execute(
+        update(DlpAlert).where(DlpAlert.user_id == user_id).values(user_id=None)
+    )
+    await db.execute(
+        update(DlpAlert)
+        .where(DlpAlert.acknowledged_by == user_id)
+        .values(acknowledged_by=None)
+    )
+    # Reviewer/actor references on OTHER users' rows: rows where this
+    # user was the approving admin, not the owner.
+    await db.execute(
+        update(ApiKey)
+        .where(ApiKey.promoted_by == user_id)
+        .values(promoted_by=None)
+    )
+    await db.execute(
+        update(QuotaRequest)
+        .where(QuotaRequest.reviewed_by == user_id)
+        .values(reviewed_by=None)
+    )
+    await db.execute(
+        update(ServiceKeyRequest)
+        .where(ServiceKeyRequest.reviewed_by == user_id)
+        .values(reviewed_by=None)
+    )
+
+    # --- Inference audit trail (children of requests, then requests) ---
     req_result = await db.execute(
         select(Request.id).where(Request.user_id == user_id)
     )
     request_ids = [r for (r,) in req_result.all()]
-
     if request_ids:
-        # Delete children of requests
+        # DLP alerts are audit records: keep them, drop the request ref.
+        await db.execute(
+            update(DlpAlert)
+            .where(DlpAlert.request_id.in_(request_ids))
+            .values(request_id=None)
+        )
         await db.execute(
             delete(SchedulerDecision).where(
                 SchedulerDecision.request_id.in_(request_ids)
@@ -577,26 +713,46 @@ async def delete_user(db: AsyncSession, user_id: int) -> bool:
         await db.execute(
             delete(Artifact).where(Artifact.request_id.in_(request_ids))
         )
+    await db.execute(delete(Request).where(Request.user_id == user_id))
 
-    # Delete direct children of user
-    await db.execute(
-        delete(Request).where(Request.user_id == user_id)
-    )
-    await db.execute(
-        delete(ApiKey).where(ApiKey.user_id == user_id)
-    )
-    await db.execute(
-        delete(Quota).where(Quota.user_id == user_id)
-    )
-    await db.execute(
-        delete(QuotaRequest).where(QuotaRequest.user_id == user_id)
-    )
+    # --- Keys, quotas, the user row ---
+    await db.execute(delete(ApiKey).where(ApiKey.user_id == user_id))
+    await db.execute(delete(Quota).where(Quota.user_id == user_id))
+    await db.execute(delete(QuotaRequest).where(QuotaRequest.user_id == user_id))
 
-    # Delete the user
-    result = await db.execute(
-        delete(User).where(User.id == user_id)
-    )
+    result = await db.execute(delete(User).where(User.id == user_id))
     await db.flush()
+
+    if result.rowcount > 0:
+        # Best-effort file cleanup once the DB deletes have flushed.
+        import os
+
+        for path in file_paths:
+            try:
+                if path and os.path.exists(path):
+                    os.remove(path)
+            except OSError:
+                pass
+        if image_storage_paths:
+            from backend.app.storage.artifacts import get_artifact_storage
+
+            storage = get_artifact_storage()
+            for rel_path in image_storage_paths:
+                try:
+                    await storage.delete(rel_path)
+                except OSError:
+                    pass
+        for response_id in offloaded_response_ids:
+            try:
+                remove_artifacts(response_id)
+            except OSError:
+                pass
+        for _, conversation_id in capi_rows:
+            try:
+                remove_conversation_artifacts(conversation_id)
+            except OSError:
+                pass
+
     return result.rowcount > 0
 
 
@@ -654,9 +810,30 @@ async def get_user_api_keys(
     return list(result.scalars().all())
 
 
-async def revoke_api_key(db: AsyncSession, api_key_id: int) -> Optional[ApiKey]:
-    """Revoke an API key."""
-    result = await db.execute(select(ApiKey).where(ApiKey.id == api_key_id))
+async def revoke_api_key(
+    db: AsyncSession,
+    api_key_id: int,
+    *,
+    owner_user_id: Optional[int] = None,
+    allow_service: bool = True,
+) -> Optional[ApiKey]:
+    """Revoke an API key, optionally scoped to an owner.
+
+    owner_user_id: when set, only a key belonging to that user is
+        revoked (self-service callers MUST pass this — it is the
+        ownership check).
+    allow_service: when False, service keys are excluded (self-service
+        revocation of service keys goes through the two-step
+        request/approve flow instead).
+
+    Returns the revoked key, or None if no key matched the scope.
+    """
+    query = select(ApiKey).where(ApiKey.id == api_key_id)
+    if owner_user_id is not None:
+        query = query.where(ApiKey.user_id == owner_user_id)
+    if not allow_service:
+        query = query.where(ApiKey.is_service.is_(False))
+    result = await db.execute(query)
     api_key = result.scalar_one_or_none()
     if api_key:
         api_key.status = ApiKeyStatus.REVOKED
@@ -668,6 +845,43 @@ async def get_api_key_by_id(db: AsyncSession, api_key_id: int) -> Optional[ApiKe
     """Get an API key by its primary key ID."""
     result = await db.execute(select(ApiKey).where(ApiKey.id == api_key_id))
     return result.scalar_one_or_none()
+
+
+async def count_api_key_references(db: AsyncSession, api_key_id: int) -> Dict[str, int]:
+    """Count audit/state rows that reference an API key.
+
+    A key with any such rows cannot be hard-deleted without destroying
+    audit history — callers should revoke instead.
+    """
+    counts: Dict[str, int] = {}
+    for label, model, column in (
+        ("requests", Request, Request.api_key_id),
+        ("stored_responses", StoredResponse, StoredResponse.api_key_id),
+        ("conversations", Conversation, Conversation.api_key_id),
+        ("video_jobs", VideoJob, VideoJob.api_key_id),
+    ):
+        result = await db.execute(
+            select(func.count()).select_from(model).where(column == api_key_id)
+        )
+        n = result.scalar() or 0
+        if n:
+            counts[label] = n
+    return counts
+
+
+async def delete_api_key(db: AsyncSession, api_key_id: int) -> bool:
+    """Hard-delete an API key row (caller must have checked references).
+
+    Promotion-request rows are key-lifecycle metadata and go with the
+    key; audit rows (requests etc.) must be absent — see
+    count_api_key_references.
+    """
+    await db.execute(
+        delete(ServiceKeyRequest).where(ServiceKeyRequest.api_key_id == api_key_id)
+    )
+    result = await db.execute(delete(ApiKey).where(ApiKey.id == api_key_id))
+    await db.flush()
+    return result.rowcount > 0
 
 
 async def update_api_key_usage(db: AsyncSession, api_key_id: int) -> None:

@@ -46,6 +46,7 @@
             <div class="alert alert-success alert-dismissible fade show" role="alert">
                 {% if success == 'policies_updated' %}Retention policies saved.
                 {% elif success == 'retention_triggered' %}Retention cycle triggered in background. Check logs for progress.
+                {% elif success == 'purge_triggered' %}Purge started in background. Check logs for progress.
                 {% else %}{{ success }}{% endif %}
                 <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
             </div>
@@ -75,6 +76,13 @@
                         <i class="bi bi-search"></i> Browse Archive
                     </a>
                 </li>
+                {% if not is_read_only %}
+                <li class="nav-item">
+                    <a class="nav-link {% if tab == 'purge' %}active{% endif %} text-danger" href="/admin/retention?tab=purge">
+                        <i class="bi bi-trash3"></i> Purge
+                    </a>
+                </li>
+                {% endif %}
             </ul>
 
             <!-- Tab: Policies -->
@@ -409,7 +417,112 @@
             {% endif %}
             {% endif %}
 
+            <!-- Tab: Purge -->
+            {% if tab == 'purge' and not is_read_only %}
+            <div class="card border-danger">
+                <div class="card-header bg-danger text-white">
+                    <h5 class="mb-0"><i class="bi bi-trash3"></i> Manual Purge</h5>
+                </div>
+                <div class="card-body">
+                    <p>
+                        Immediately remove records in one category older than a cutoff,
+                        using the same pipeline as the retention cycle: when an archive
+                        database is configured, requests/chat rows are archived before
+                        they leave the app database; file artifacts are removed with
+                        their rows.
+                    </p>
+                    <p class="text-danger mb-4">
+                        <i class="bi bi-exclamation-triangle"></i>
+                        This cannot be undone. The admin audit log is never purged.
+                    </p>
+                    <form id="purgeForm" method="post" action="/admin/retention">
+                        <input type="hidden" name="action" value="purge">
+                        <input type="hidden" name="confirm_text" id="purgeConfirmHidden" value="">
+                        <div class="row g-3 align-items-end">
+                            <div class="col-md-4">
+                                <label for="purge_category" class="form-label">Category</label>
+                                <select class="form-select" id="purge_category" name="purge_category" required>
+                                    <option value="requests">Requests (audit log + responses + artifacts)</option>
+                                    <option value="chat">Chat conversations</option>
+                                    <option value="telemetry">Telemetry</option>
+                                    <option value="request_images">Request images (audit offload)</option>
+                                    <option value="responses_store">Stored responses (Responses API)</option>
+                                    <option value="conversations">Conversations API</option>
+                                </select>
+                            </div>
+                            <div class="col-md-4">
+                                <label for="purge_days" class="form-label">Older than (days)</label>
+                                <input type="number" class="form-control" id="purge_days" name="purge_days" min="0" value="365" required>
+                                <div class="form-text">0 = purge everything in the category.</div>
+                            </div>
+                            <div class="col-md-4">
+                                <button type="button" class="btn btn-danger" data-bs-toggle="modal" data-bs-target="#purgeConfirmModal"
+                                        {% if retention_running %}disabled title="A retention cycle is running"{% endif %}>
+                                    <i class="bi bi-trash3"></i> Purge…
+                                </button>
+                            </div>
+                        </div>
+                    </form>
+                </div>
+            </div>
+
+            <!-- Purge verification modal -->
+            <div class="modal fade" id="purgeConfirmModal" tabindex="-1" aria-labelledby="purgeConfirmLabel" aria-hidden="true">
+                <div class="modal-dialog">
+                    <div class="modal-content">
+                        <div class="modal-header bg-danger text-white">
+                            <h5 class="modal-title" id="purgeConfirmLabel"><i class="bi bi-exclamation-triangle"></i> Confirm Purge</h5>
+                            <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button>
+                        </div>
+                        <div class="modal-body">
+                            <p>You are about to permanently remove <strong id="purgeSummaryCategory"></strong> records
+                               older than <strong id="purgeSummaryDays"></strong> day(s).</p>
+                            <p class="mb-2">Type <code>PURGE</code> to confirm:</p>
+                            <input type="text" class="form-control" id="purgeConfirmInput" autocomplete="off" placeholder="PURGE">
+                        </div>
+                        <div class="modal-footer">
+                            <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                            <button type="button" class="btn btn-danger" id="purgeConfirmSubmit" disabled>
+                                <i class="bi bi-trash3"></i> Purge Now
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            {% endif %}
+
         </div>
     </div>
 </div>
+{% endblock %}
+
+{% block extra_js %}
+{% if tab == 'purge' and not is_read_only %}
+<script>
+(function () {
+    const input = document.getElementById('purgeConfirmInput');
+    const submit = document.getElementById('purgeConfirmSubmit');
+    const form = document.getElementById('purgeForm');
+    const hidden = document.getElementById('purgeConfirmHidden');
+    const modal = document.getElementById('purgeConfirmModal');
+
+    modal.addEventListener('show.bs.modal', function () {
+        const sel = document.getElementById('purge_category');
+        document.getElementById('purgeSummaryCategory').textContent =
+            sel.options[sel.selectedIndex].text;
+        document.getElementById('purgeSummaryDays').textContent =
+            document.getElementById('purge_days').value;
+        input.value = '';
+        submit.disabled = true;
+    });
+    input.addEventListener('input', function () {
+        submit.disabled = input.value !== 'PURGE';
+    });
+    submit.addEventListener('click', function () {
+        hidden.value = input.value;
+        form.submit();
+    });
+})();
+</script>
+{% endif %}
 {% endblock %}
