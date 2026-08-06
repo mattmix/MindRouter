@@ -2,7 +2,7 @@
 #
 # mindrouter - LLM Inference Translator and Load Balancer
 #
-# 069: make historical user references nullable
+# 070: make historical user references nullable
 #
 ############################################################
 
@@ -15,15 +15,15 @@ delete_user now detaches these references (SET NULL) instead, which
 requires the columns to be nullable.  MariaDB keeps the existing FK
 constraints intact across a MODIFY that only changes nullability.
 
-Revision ID: 069
-Revises: 068
+Revision ID: 070
+Revises: 069
 """
 
 import sqlalchemy as sa
 from alembic import op
 
-revision = "069"
-down_revision = "068"
+revision = "070"
+down_revision = "069"
 branch_labels = None
 depends_on = None
 

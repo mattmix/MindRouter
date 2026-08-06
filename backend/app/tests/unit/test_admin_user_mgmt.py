@@ -288,8 +288,8 @@ class TestDeleteUserCascade:
         assert "IntegrityError" in fn
         assert "str(e)" not in fn
 
-    def test_migration_069_exists(self):
-        migration = next(_MIGRATIONS_DIR.glob("*069_nullable_user_refs.py"))
+    def test_migration_070_exists(self):
+        migration = next(_MIGRATIONS_DIR.glob("*070_nullable_user_refs.py"))
         src = migration.read_text()
         for table, col in (
             ("blog_posts", "author_id"),
