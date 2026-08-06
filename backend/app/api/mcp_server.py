@@ -171,7 +171,7 @@ def _extract_api_key(request: Request) -> Optional[str]:
 
 async def _handle_sse(request: Request) -> Response:
     """SSE connection endpoint with MindRouter API key authentication."""
-    from backend.app.security.api_keys import verify_api_key
+    from backend.app.security.api_keys import api_key_rejection_reason, verify_api_key
 
     api_key_str = _extract_api_key(request)
     if not api_key_str:
@@ -189,11 +189,12 @@ async def _handle_sse(request: Request) -> Response:
         api_key = await verify_api_key(db, api_key_str)
         if not api_key:
             return JSONResponse({"error": "Invalid API key"}, status_code=401)
+        # Shared post-verify gate: rejects revoked, expired, and
+        # inactive/deleted-user keys — same checks as authenticate_request
+        reason = api_key_rejection_reason(api_key)
+        if reason:
+            return JSONResponse({"error": reason}, status_code=401)
         user = api_key.user
-        if not user or not user.is_active:
-            return JSONResponse(
-                {"error": "User account is inactive"}, status_code=401
-            )
         _auth_info.set({"user_id": user.id, "api_key_id": api_key.id})
         logger.info("mcp_sse_connect", user_id=user.id)
 

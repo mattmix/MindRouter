@@ -777,6 +777,16 @@ async def get_api_key_by_prefix(db: AsyncSession, key_prefix: str) -> Optional[A
     return result.scalar_one_or_none()
 
 
+async def get_api_key_by_sha256(db: AsyncSession, key_sha256: str) -> Optional[ApiKey]:
+    """Get API key by SHA-256 digest with user and group eagerly loaded."""
+    result = await db.execute(
+        select(ApiKey)
+        .options(selectinload(ApiKey.user).selectinload(User.group))
+        .where(ApiKey.key_sha256 == key_sha256)
+    )
+    return result.scalar_one_or_none()
+
+
 async def create_api_key(
     db: AsyncSession,
     user_id: int,
@@ -784,11 +794,13 @@ async def create_api_key(
     key_prefix: str,
     name: str,
     expires_at: Optional[datetime] = None,
+    key_sha256: Optional[str] = None,
 ) -> ApiKey:
     """Create a new API key."""
     api_key = ApiKey(
         user_id=user_id,
         key_hash=key_hash,
+        key_sha256=key_sha256,
         key_prefix=key_prefix,
         name=name,
         expires_at=expires_at,

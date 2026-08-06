@@ -149,7 +149,12 @@ class TestOllamaStreamParsing:
 
 
 class TestVLLMSSEParsing:
-    """Parse vLLM/OpenAI SSE stream -> CanonicalStreamChunks."""
+    """Parse vLLM/OpenAI SSE stream -> wire-shaped chunk dicts.
+
+    The vLLM translator yields plain dicts shaped like
+    CanonicalStreamChunk.model_dump(exclude_none=True, by_alias=True)
+    (hot path skips per-chunk Pydantic construction).
+    """
 
     @pytest.mark.asyncio
     async def test_basic_sse_stream(self, vllm_sse_chunks):
@@ -172,7 +177,7 @@ class TestVLLMSSEParsing:
         )
         # Stream should end before [DONE] — [DONE] is not a chunk
         for c in chunks:
-            assert c.id  # all chunks have an id
+            assert c["id"]  # all chunks have an id
 
     @pytest.mark.asyncio
     async def test_sse_with_role_delta(self, vllm_sse_chunks):
@@ -183,7 +188,7 @@ class TestVLLMSSEParsing:
             )
         )
         first = chunks[0]
-        assert first.choices[0].delta.role == MessageRole.ASSISTANT
+        assert first["choices"][0]["delta"]["role"] == MessageRole.ASSISTANT.value
 
     @pytest.mark.asyncio
     async def test_sse_usage_in_final_chunk(self, vllm_sse_chunks):
@@ -194,9 +199,9 @@ class TestVLLMSSEParsing:
             )
         )
         final = chunks[-1]
-        assert final.usage is not None
-        assert final.usage.prompt_tokens == 10
-        assert final.usage.completion_tokens == 2
+        assert final.get("usage") is not None
+        assert final["usage"]["prompt_tokens"] == 10
+        assert final["usage"]["completion_tokens"] == 2
 
     @pytest.mark.asyncio
     async def test_sse_comment_lines(self):
@@ -219,7 +224,7 @@ class TestVLLMSSEParsing:
             )
         )
         assert len(chunks) == 1
-        assert chunks[0].choices[0].delta.content == "Hi"
+        assert chunks[0]["choices"][0]["delta"]["content"] == "Hi"
 
     @pytest.mark.asyncio
     async def test_sse_crlf_endings(self):
@@ -241,7 +246,7 @@ class TestVLLMSSEParsing:
             )
         )
         assert len(chunks) == 1
-        assert chunks[0].choices[0].delta.content == "Hi"
+        assert chunks[0]["choices"][0]["delta"]["content"] == "Hi"
 
     @pytest.mark.asyncio
     async def test_sse_partial_chunks(self):
@@ -268,7 +273,7 @@ class TestVLLMSSEParsing:
             )
         )
         assert len(chunks) == 1
-        assert chunks[0].choices[0].delta.content == "Hello"
+        assert chunks[0]["choices"][0]["delta"]["content"] == "Hello"
 
     @pytest.mark.asyncio
     async def test_sse_finish_reason(self):
@@ -289,7 +294,7 @@ class TestVLLMSSEParsing:
                 _async_iter([raw]), "req-1", "llama3.2"
             )
         )
-        assert chunks[0].choices[0].finish_reason == "stop"
+        assert chunks[0]["choices"][0]["finish_reason"] == "stop"
 
 
 def _openai_chunk_to_ollama(openai_chunk: dict) -> dict:
@@ -440,8 +445,8 @@ class TestStreamingWithStructuredOutput:
         )
         assert len(chunks) == 2
         content_chunks = [
-            c.choices[0].delta.content
+            c["choices"][0]["delta"].get("content")
             for c in chunks
-            if c.choices[0].delta.content
+            if c["choices"][0]["delta"].get("content")
         ]
         assert json.loads("".join(content_chunks)) == {"age": 30}

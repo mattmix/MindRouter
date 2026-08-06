@@ -255,7 +255,7 @@ async def ensure_internal_api_key(db) -> Optional[int]:
 
     # Generate a proper API key
     from backend.app.security.api_keys import generate_api_key
-    full_key, key_hash, key_prefix = generate_api_key()
+    full_key, key_hash, key_prefix, key_sha256 = generate_api_key()
 
     # Find a system user (user_id=1 is typically admin)
     from backend.app.db.models import User
@@ -269,6 +269,7 @@ async def ensure_internal_api_key(db) -> Optional[int]:
         key_hash=key_hash,
         key_prefix=key_prefix,
         name="DLP Internal Scanner",
+        key_sha256=key_sha256,
     )
     await crud.set_config(db, "dlp.internal_api_key_id", api_key.id)
     # Store raw key in config so LLM scanner can authenticate

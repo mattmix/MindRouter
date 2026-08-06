@@ -1,0 +1,781 @@
+{
+  "scenarios": [
+    {
+      "name": "plain",
+      "thinking_enabled": true,
+      "include_usage": false,
+      "input_chunks": [
+        "data: {\"id\": \"chatcmpl-golden\", \"object\": \"chat.completion.chunk\", \"created\": 1700000000, \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"role\": \"assistant\", \"content\": \"\"}, \"finish_reason\": null}]}\n\n",
+        "data: {\"id\": \"chatcmpl-golden\", \"object\": \"chat.completion.chunk\", \"created\": 1700000000, \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \"Hello\"}, \"finish_reason\": null}]}\n\n",
+        "data: {\"id\": \"chatcmpl-golden\", \"object\": \"chat.completion.chunk\", \"created\": 1700000000, \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \" world\"}, \"finish_reason\": null}]}\n\n",
+        "data: {not-json\n\n",
+        "data: {\"id\": \"chatcmpl-golden\", \"object\": \"chat.completion.chunk\", \"created\": 1700000000, \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {}, \"finish_reason\": \"stop\"}]}\n\n",
+        "data: {\"id\": \"chatcmpl-golden\", \"object\": \"chat.completion.chunk\", \"created\": 1700000000, \"model\": \"test-model\", \"choices\": [], \"usage\": {\"prompt_tokens\": 10, \"completion_tokens\": 2, \"total_tokens\": 12}}\n\n",
+        "data: [DONE]\n\n"
+      ],
+      "expected_events": [
+        {
+          "id": "chatcmpl-golden",
+          "object": "chat.completion.chunk",
+          "created": 1700000000,
+          "model": "test-model",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "role": "assistant",
+                "content": ""
+              }
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-golden",
+          "object": "chat.completion.chunk",
+          "created": 1700000000,
+          "model": "test-model",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "content": "Hello"
+              }
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-golden",
+          "object": "chat.completion.chunk",
+          "created": 1700000000,
+          "model": "test-model",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "content": " world"
+              }
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-golden",
+          "object": "chat.completion.chunk",
+          "created": 1700000000,
+          "model": "test-model",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {},
+              "finish_reason": "stop"
+            }
+          ]
+        },
+        "[DONE]"
+      ],
+      "expected_full_content": "Hello world",
+      "expected_finish_reason": "stop",
+      "expected_real_usage": {
+        "prompt_tokens": 10,
+        "completion_tokens": 2,
+        "total_tokens": 12,
+        "is_estimated": false
+      }
+    },
+    {
+      "name": "plain_include_usage",
+      "thinking_enabled": true,
+      "include_usage": true,
+      "input_chunks": [
+        "data: {\"id\": \"chatcmpl-golden\", \"object\": \"chat.completion.chunk\", \"created\": 1700000000, \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"role\": \"assistant\", \"content\": \"\"}, \"finish_reason\": null}]}\n\n",
+        "data: {\"id\": \"chatcmpl-golden\", \"object\": \"chat.completion.chunk\", \"created\": 1700000000, \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \"Hello\"}, \"finish_reason\": null}]}\n\n",
+        "data: {\"id\": \"chatcmpl-golden\", \"object\": \"chat.completion.chunk\", \"created\": 1700000000, \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \" world\"}, \"finish_reason\": null}]}\n\n",
+        "data: {\"id\": \"chatcmpl-golden\", \"object\": \"chat.completion.chunk\", \"created\": 1700000000, \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {}, \"finish_reason\": \"stop\"}]}\n\n",
+        "data: {\"id\": \"chatcmpl-golden\", \"object\": \"chat.completion.chunk\", \"created\": 1700000000, \"model\": \"test-model\", \"choices\": [], \"usage\": {\"prompt_tokens\": 10, \"completion_tokens\": 2, \"total_tokens\": 12}}\n\n",
+        "data: [DONE]\n\n"
+      ],
+      "expected_events": [
+        {
+          "id": "chatcmpl-golden",
+          "object": "chat.completion.chunk",
+          "created": 1700000000,
+          "model": "test-model",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "role": "assistant",
+                "content": ""
+              }
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-golden",
+          "object": "chat.completion.chunk",
+          "created": 1700000000,
+          "model": "test-model",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "content": "Hello"
+              }
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-golden",
+          "object": "chat.completion.chunk",
+          "created": 1700000000,
+          "model": "test-model",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "content": " world"
+              }
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-golden",
+          "object": "chat.completion.chunk",
+          "created": 1700000000,
+          "model": "test-model",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {},
+              "finish_reason": "stop"
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-golden",
+          "object": "chat.completion.chunk",
+          "created": 1700000000,
+          "model": "test-model",
+          "choices": [],
+          "usage": {
+            "prompt_tokens": 10,
+            "completion_tokens": 2,
+            "total_tokens": 12,
+            "is_estimated": false
+          }
+        },
+        "[DONE]"
+      ],
+      "expected_full_content": "Hello world",
+      "expected_finish_reason": "stop",
+      "expected_real_usage": {
+        "prompt_tokens": 10,
+        "completion_tokens": 2,
+        "total_tokens": 12,
+        "is_estimated": false
+      }
+    },
+    {
+      "name": "think",
+      "thinking_enabled": true,
+      "include_usage": false,
+      "input_chunks": [
+        "data: {\"id\": \"chatcmpl-golden\", \"object\": \"chat.completion.chunk\", \"created\": 1700000000, \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"role\": \"assistant\", \"content\": \"\"}, \"finish_reason\": null}]}\n\n",
+        "data: {\"id\": \"chatcmpl-golden\", \"object\": \"chat.completion.chunk\", \"created\": 1700000000, \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \"<think>\"}, \"finish_reason\": null}]}\n\n",
+        "data: {\"id\": \"chatcmpl-golden\", \"object\": \"chat.completion.chunk\", \"created\": 1700000000, \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \"I reason\"}, \"finish_reason\": null}]}\n\n",
+        "data: {\"id\": \"chatcmpl-golden\", \"object\": \"chat.completion.chunk\", \"created\": 1700000000, \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \"</think>\"}, \"finish_reason\": null}]}\n\n",
+        "data: {\"id\": \"chatcmpl-golden\", \"object\": \"chat.completion.chunk\", \"created\": 1700000000, \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \"Answer\"}, \"finish_reason\": null}]}\n\n",
+        "data: {\"id\": \"chatcmpl-golden\", \"object\": \"chat.completion.chunk\", \"created\": 1700000000, \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {}, \"finish_reason\": \"stop\"}]}\n\n",
+        "data: [DONE]\n\n"
+      ],
+      "expected_events": [
+        {
+          "id": "chatcmpl-golden",
+          "object": "chat.completion.chunk",
+          "created": 1700000000,
+          "model": "test-model",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "role": "assistant",
+                "content": ""
+              }
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-golden",
+          "object": "chat.completion.chunk",
+          "created": 1700000000,
+          "model": "test-model",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {}
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-golden",
+          "object": "chat.completion.chunk",
+          "created": 1700000000,
+          "model": "test-model",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning_content": "I reason"
+              }
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-golden",
+          "object": "chat.completion.chunk",
+          "created": 1700000000,
+          "model": "test-model",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {}
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-golden",
+          "object": "chat.completion.chunk",
+          "created": 1700000000,
+          "model": "test-model",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "content": "Answer"
+              }
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-golden",
+          "object": "chat.completion.chunk",
+          "created": 1700000000,
+          "model": "test-model",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {},
+              "finish_reason": "stop"
+            }
+          ]
+        },
+        "[DONE]"
+      ],
+      "expected_full_content": "Answer",
+      "expected_finish_reason": "stop",
+      "expected_real_usage": null
+    },
+    {
+      "name": "think_split",
+      "thinking_enabled": true,
+      "include_usage": false,
+      "input_chunks": [
+        "data: {\"id\": \"chatcmpl-golden\", \"obje",
+        "ct\": \"chat.completion.chunk\", \"create",
+        "d\": 1700000000, \"model\": \"test-model\"",
+        ", \"choices\": [{\"index\": 0, \"delta\": {",
+        "\"role\": \"assistant\", \"content\": \"\"}, ",
+        "\"finish_reason\": null}]}\n\ndata: {\"id\"",
+        ": \"chatcmpl-golden\", \"object\": \"chat.",
+        "completion.chunk\", \"created\": 1700000",
+        "000, \"model\": \"test-model\", \"choices\"",
+        ": [{\"index\": 0, \"delta\": {\"content\": ",
+        "\"Let me <thi\"}, \"finish_reason\": null",
+        "}]}\n\ndata: {\"id\": \"chatcmpl-golden\", ",
+        "\"object\": \"chat.completion.chunk\", \"c",
+        "reated\": 1700000000, \"model\": \"test-m",
+        "odel\", \"choices\": [{\"index\": 0, \"delt",
+        "a\": {\"content\": \"nk>deep \"}, \"finish_",
+        "reason\": null}]}\n\ndata: {\"id\": \"chatc",
+        "mpl-golden\", \"object\": \"chat.completi",
+        "on.chunk\", \"created\": 1700000000, \"mo",
+        "del\": \"test-model\", \"choices\": [{\"ind",
+        "ex\": 0, \"delta\": {\"content\": \"thought",
+        "</thi\"}, \"finish_reason\": null}]}\n\nda",
+        "ta: {\"id\": \"chatcmpl-golden\", \"object",
+        "\": \"chat.completion.chunk\", \"created\"",
+        ": 1700000000, \"model\": \"test-model\", ",
+        "\"choices\": [{\"index\": 0, \"delta\": {\"c",
+        "ontent\": \"nk> final answer\"}, \"finish",
+        "_reason\": null}]}\n\ndata: {\"id\": \"chat",
+        "cmpl-golden\", \"object\": \"chat.complet",
+        "ion.chunk\", \"created\": 1700000000, \"m",
+        "odel\": \"test-model\", \"choices\": [{\"in",
+        "dex\": 0, \"delta\": {}, \"finish_reason\"",
+        ": \"stop\"}]}\n\ndata: [DONE]\n\n"
+      ],
+      "expected_events": [
+        {
+          "id": "chatcmpl-golden",
+          "object": "chat.completion.chunk",
+          "created": 1700000000,
+          "model": "test-model",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "role": "assistant",
+                "content": ""
+              }
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-golden",
+          "object": "chat.completion.chunk",
+          "created": 1700000000,
+          "model": "test-model",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "content": "Let me "
+              }
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-golden",
+          "object": "chat.completion.chunk",
+          "created": 1700000000,
+          "model": "test-model",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning_content": "deep "
+              }
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-golden",
+          "object": "chat.completion.chunk",
+          "created": 1700000000,
+          "model": "test-model",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning_content": "thought"
+              }
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-golden",
+          "object": "chat.completion.chunk",
+          "created": 1700000000,
+          "model": "test-model",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "content": " final answer"
+              }
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-golden",
+          "object": "chat.completion.chunk",
+          "created": 1700000000,
+          "model": "test-model",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {},
+              "finish_reason": "stop"
+            }
+          ]
+        },
+        "[DONE]"
+      ],
+      "expected_full_content": "Let me  final answer",
+      "expected_finish_reason": "stop",
+      "expected_real_usage": null
+    },
+    {
+      "name": "lt_no_think",
+      "thinking_enabled": true,
+      "include_usage": false,
+      "input_chunks": [
+        "data: {\"id\": \"chatcmpl-golden\", \"object\": \"chat.completion.chunk\", \"created\": 1700000000, \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \"a < b and \"}, \"finish_reason\": null}]}\n\n",
+        "data: {\"id\": \"chatcmpl-golden\", \"object\": \"chat.completion.chunk\", \"created\": 1700000000, \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \"x <t\"}, \"finish_reason\": null}]}\n\n",
+        "data: {\"id\": \"chatcmpl-golden\", \"object\": \"chat.completion.chunk\", \"created\": 1700000000, \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \"humb> done \"}, \"finish_reason\": null}]}\n\n",
+        "data: {\"id\": \"chatcmpl-golden\", \"object\": \"chat.completion.chunk\", \"created\": 1700000000, \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \"tail <th\"}, \"finish_reason\": null}]}\n\n",
+        "data: {\"id\": \"chatcmpl-golden\", \"object\": \"chat.completion.chunk\", \"created\": 1700000000, \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {}, \"finish_reason\": \"stop\"}]}\n\n",
+        "data: [DONE]\n\n"
+      ],
+      "expected_events": [
+        {
+          "id": "chatcmpl-golden",
+          "object": "chat.completion.chunk",
+          "created": 1700000000,
+          "model": "test-model",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "content": "a < b and "
+              }
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-golden",
+          "object": "chat.completion.chunk",
+          "created": 1700000000,
+          "model": "test-model",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "content": "x "
+              }
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-golden",
+          "object": "chat.completion.chunk",
+          "created": 1700000000,
+          "model": "test-model",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "content": "<thumb> done "
+              }
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-golden",
+          "object": "chat.completion.chunk",
+          "created": 1700000000,
+          "model": "test-model",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "content": "tail "
+              }
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-golden",
+          "object": "chat.completion.chunk",
+          "created": 1700000000,
+          "model": "test-model",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {},
+              "finish_reason": "stop"
+            }
+          ]
+        },
+        "[DONE]"
+      ],
+      "expected_full_content": "a < b and x <thumb> done tail ",
+      "expected_finish_reason": "stop",
+      "expected_real_usage": null
+    },
+    {
+      "name": "qwen_reasoning",
+      "thinking_enabled": true,
+      "include_usage": false,
+      "input_chunks": [
+        "data: {\"id\": \"chatcmpl-golden\", \"object\": \"chat.completion.chunk\", \"created\": 1700000000, \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"role\": \"assistant\"}, \"finish_reason\": null}]}\n\n",
+        "data: {\"id\": \"chatcmpl-golden\", \"object\": \"chat.completion.chunk\", \"created\": 1700000000, \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"reasoning_content\": \"step 1 \"}, \"finish_reason\": null}]}\n\n",
+        "data: {\"id\": \"chatcmpl-golden\", \"object\": \"chat.completion.chunk\", \"created\": 1700000000, \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"reasoning_content\": \"step 2\"}, \"finish_reason\": null}]}\n\n",
+        "data: {\"id\": \"chatcmpl-golden\", \"object\": \"chat.completion.chunk\", \"created\": 1700000000, \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"content\": \"answer\"}, \"finish_reason\": null}]}\n\n",
+        "data: {\"id\": \"chatcmpl-golden\", \"object\": \"chat.completion.chunk\", \"created\": 1700000000, \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {}, \"finish_reason\": \"stop\"}]}\n\n",
+        "data: {\"id\": \"chatcmpl-golden\", \"object\": \"chat.completion.chunk\", \"created\": 1700000000, \"model\": \"test-model\", \"choices\": [], \"usage\": {\"prompt_tokens\": 10, \"completion_tokens\": 2, \"total_tokens\": 12}}\n\n",
+        "data: [DONE]\n\n"
+      ],
+      "expected_events": [
+        {
+          "id": "chatcmpl-golden",
+          "object": "chat.completion.chunk",
+          "created": 1700000000,
+          "model": "test-model",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "role": "assistant"
+              }
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-golden",
+          "object": "chat.completion.chunk",
+          "created": 1700000000,
+          "model": "test-model",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning_content": "step 1 "
+              }
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-golden",
+          "object": "chat.completion.chunk",
+          "created": 1700000000,
+          "model": "test-model",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning_content": "step 2"
+              }
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-golden",
+          "object": "chat.completion.chunk",
+          "created": 1700000000,
+          "model": "test-model",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "content": "answer"
+              }
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-golden",
+          "object": "chat.completion.chunk",
+          "created": 1700000000,
+          "model": "test-model",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {},
+              "finish_reason": "stop"
+            }
+          ]
+        },
+        "[DONE]"
+      ],
+      "expected_full_content": "answer",
+      "expected_finish_reason": "stop",
+      "expected_real_usage": {
+        "prompt_tokens": 10,
+        "completion_tokens": 2,
+        "total_tokens": 12,
+        "is_estimated": false
+      }
+    },
+    {
+      "name": "qwen_promotion",
+      "thinking_enabled": false,
+      "include_usage": false,
+      "input_chunks": [
+        "data: {\"id\": \"chatcmpl-golden\", \"object\": \"chat.completion.chunk\", \"created\": 1700000000, \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"role\": \"assistant\"}, \"finish_reason\": null}]}\n\n",
+        "data: {\"id\": \"chatcmpl-golden\", \"object\": \"chat.completion.chunk\", \"created\": 1700000000, \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"reasoning_content\": \"promoted \"}, \"finish_reason\": null}]}\n\n",
+        "data: {\"id\": \"chatcmpl-golden\", \"object\": \"chat.completion.chunk\", \"created\": 1700000000, \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"reasoning_content\": \"text\"}, \"finish_reason\": null}]}\n\n",
+        "data: {\"id\": \"chatcmpl-golden\", \"object\": \"chat.completion.chunk\", \"created\": 1700000000, \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {}, \"finish_reason\": \"stop\"}]}\n\n",
+        "data: [DONE]\n\n"
+      ],
+      "expected_events": [
+        {
+          "id": "chatcmpl-golden",
+          "object": "chat.completion.chunk",
+          "created": 1700000000,
+          "model": "test-model",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "role": "assistant"
+              }
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-golden",
+          "object": "chat.completion.chunk",
+          "created": 1700000000,
+          "model": "test-model",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "content": "promoted "
+              }
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-golden",
+          "object": "chat.completion.chunk",
+          "created": 1700000000,
+          "model": "test-model",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "content": "text"
+              }
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-golden",
+          "object": "chat.completion.chunk",
+          "created": 1700000000,
+          "model": "test-model",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {},
+              "finish_reason": "stop"
+            }
+          ]
+        },
+        "[DONE]"
+      ],
+      "expected_full_content": "promoted text",
+      "expected_finish_reason": "stop",
+      "expected_real_usage": null
+    },
+    {
+      "name": "tools",
+      "thinking_enabled": true,
+      "include_usage": false,
+      "input_chunks": [
+        "data: {\"id\": \"chatcmpl-golden\", \"object\": \"chat.completion.chunk\", \"created\": 1700000000, \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"role\": \"assistant\", \"content\": null}, \"finish_reason\": null}]}\n\n",
+        "data: {\"id\": \"chatcmpl-golden\", \"object\": \"chat.completion.chunk\", \"created\": 1700000000, \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"tool_calls\": [{\"index\": 0, \"id\": \"call_abc\", \"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"arguments\": \"\"}}]}, \"finish_reason\": null}]}\n\n",
+        "data: {\"id\": \"chatcmpl-golden\", \"object\": \"chat.completion.chunk\", \"created\": 1700000000, \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"tool_calls\": [{\"index\": 0, \"function\": {\"arguments\": \"{\\\"city\\\":\"}}]}, \"finish_reason\": null}]}\n\n",
+        "data: {\"id\": \"chatcmpl-golden\", \"object\": \"chat.completion.chunk\", \"created\": 1700000000, \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"tool_calls\": [{\"index\": 0, \"function\": {\"arguments\": \"\\\"Moscow\\\"}\"}}]}, \"finish_reason\": null}]}\n\n",
+        "data: {\"id\": \"chatcmpl-golden\", \"object\": \"chat.completion.chunk\", \"created\": 1700000000, \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {}, \"finish_reason\": \"tool_calls\"}]}\n\n",
+        "data: {\"id\": \"chatcmpl-golden\", \"object\": \"chat.completion.chunk\", \"created\": 1700000000, \"model\": \"test-model\", \"choices\": [], \"usage\": {\"prompt_tokens\": 10, \"completion_tokens\": 2, \"total_tokens\": 12}}\n\n",
+        "data: [DONE]\n\n"
+      ],
+      "expected_events": [
+        {
+          "id": "chatcmpl-golden",
+          "object": "chat.completion.chunk",
+          "created": 1700000000,
+          "model": "test-model",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "role": "assistant"
+              }
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-golden",
+          "object": "chat.completion.chunk",
+          "created": 1700000000,
+          "model": "test-model",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "tool_calls": [
+                  {
+                    "index": 0,
+                    "id": "call_abc",
+                    "type": "function",
+                    "function": {
+                      "name": "get_weather",
+                      "arguments": ""
+                    }
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-golden",
+          "object": "chat.completion.chunk",
+          "created": 1700000000,
+          "model": "test-model",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "tool_calls": [
+                  {
+                    "index": 0,
+                    "function": {
+                      "arguments": "{\"city\":"
+                    }
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-golden",
+          "object": "chat.completion.chunk",
+          "created": 1700000000,
+          "model": "test-model",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "tool_calls": [
+                  {
+                    "index": 0,
+                    "function": {
+                      "arguments": "\"Moscow\"}"
+                    }
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-golden",
+          "object": "chat.completion.chunk",
+          "created": 1700000000,
+          "model": "test-model",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {},
+              "finish_reason": "tool_calls"
+            }
+          ]
+        },
+        "[DONE]"
+      ],
+      "expected_full_content": "",
+      "expected_finish_reason": "tool_calls",
+      "expected_real_usage": {
+        "prompt_tokens": 10,
+        "completion_tokens": 2,
+        "total_tokens": 12,
+        "is_estimated": false
+      }
+    }
+  ]
+}

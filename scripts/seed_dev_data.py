@@ -16,6 +16,7 @@
 """Seed development data for MindRouter."""
 
 import asyncio
+import hashlib
 import os
 import sys
 from pathlib import Path
@@ -118,14 +119,16 @@ async def seed_users():
                 full_key = admin_api_key
                 key_hash = hash_api_key(admin_api_key)
                 key_prefix = admin_api_key[:12]
+                key_sha256 = hashlib.sha256(admin_api_key.encode()).hexdigest()
             else:
-                full_key, key_hash, key_prefix = generate_api_key()
+                full_key, key_hash, key_prefix, key_sha256 = generate_api_key()
             await crud.create_api_key(
                 db=db,
                 user_id=user.id,
                 key_hash=key_hash,
                 key_prefix=key_prefix,
                 name="Default Key",
+                key_sha256=key_sha256,
             )
             print(f"  Created API key: {key_prefix}...")
             # Full key on ONE parseable line (prefix and key were previously on

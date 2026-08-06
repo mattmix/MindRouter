@@ -1529,7 +1529,7 @@ async def create_user_api_key(
         )
 
     # Generate key
-    full_key, key_hash, key_prefix = generate_api_key()
+    full_key, key_hash, key_prefix, key_sha256 = generate_api_key()
 
     # Create record
     api_key = await crud.create_api_key(
@@ -1539,6 +1539,7 @@ async def create_user_api_key(
         key_prefix=key_prefix,
         name=request.name,
         expires_at=request.expires_at,
+        key_sha256=key_sha256,
     )
 
     await crud.log_admin_action(

@@ -281,6 +281,9 @@ class ApiKey(Base, TimestampMixin):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), nullable=False)
     key_hash: Mapped[str] = mapped_column(String(255), unique=True, nullable=False, index=True)
+    # SHA-256 hexdigest of the full key for O(1) hot-path lookup; nullable —
+    # pre-069 keys are backfilled on first successful Argon2 verification
+    key_sha256: Mapped[Optional[str]] = mapped_column(String(64), unique=True, nullable=True, index=True)
     key_prefix: Mapped[str] = mapped_column(String(12), nullable=False)  # First 8 chars for identification
     name: Mapped[str] = mapped_column(String(100), nullable=False)
     status: Mapped[ApiKeyStatus] = mapped_column(

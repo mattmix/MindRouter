@@ -208,6 +208,14 @@ class Settings(BaseSettings):
     backend_request_timeout_per_attempt: int = 180
     backend_retry_max_attempts: int = 3
     structured_output_retry_on_invalid: bool = True
+    # Streaming write coalescing: buffer up to N framed SSE/NDJSON events per
+    # socket write.  The T-ms bound applies while events keep arriving —
+    # during a backend stall, buffered events flush on the next arrival or
+    # end of stream (there is no idle timer).  The first event of a stream,
+    # finish_reason/usage chunks, errors and [DONE] always flush immediately.
+    # Set events to 0/1 (or ms to 0) to disable and restore per-event writes.
+    stream_coalesce_events: int = 8
+    stream_coalesce_ms: int = 50
     # Gateway policy: reasoning/thinking is OFF by default unless the client
     # explicitly opts in (think:true / thinking:{type:enabled} / reasoning_effort).
     # Applies to enable_thinking-style models (Qwen, Gemma, Nemotron); gpt-oss

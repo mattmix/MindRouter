@@ -15,7 +15,6 @@
 """Scheduler policy - main entry point for scheduling decisions."""
 
 from typing import Dict, List, Optional, Set
-import tiktoken
 
 from backend.app.core.scheduler.routing import BackendRouter, RoutingDecision
 from backend.app.core.scheduler.queue import Job, JobModality
@@ -46,9 +45,6 @@ class SchedulerPolicy:
         self.router = BackendRouter()
         self._settings = get_settings()
 
-        # Tokenizer for estimation
-        self._tokenizer = None
-
     async def start(self) -> None:
         """Start the scheduler."""
         await self.router.start()
@@ -59,24 +55,14 @@ class SchedulerPolicy:
         await self.router.stop()
         logger.info("Scheduler policy stopped")
 
-    def _get_tokenizer(self):
-        """Get or create tokenizer for token estimation."""
-        if self._tokenizer is None:
-            try:
-                self._tokenizer = tiktoken.get_encoding(self._settings.default_tokenizer)
-            except Exception:
-                # Fallback to cl100k_base if configured tokenizer not found
-                self._tokenizer = tiktoken.get_encoding("cl100k_base")
-        return self._tokenizer
-
     def estimate_tokens(self, text: str) -> int:
-        """Estimate token count for text."""
-        try:
-            tokenizer = self._get_tokenizer()
-            return len(tokenizer.encode(text))
-        except Exception:
-            # Rough estimate: ~4 chars per token
-            return len(text) // 4
+        """Estimate token count for text (~4 chars per token).
+
+        Only used for fair-share scheduling weight and the rare accounting
+        fallback — not for context capping — so a cheap character-based
+        estimate beats encoding whole conversations with tiktoken.
+        """
+        return len(text) // 4
 
     def create_job_from_chat_request(
         self,
@@ -130,7 +116,6 @@ class SchedulerPolicy:
             estimated_prompt_tokens=estimated_prompt_tokens,
             estimated_completion_tokens=estimated_completion_tokens,
             image_bytes=image_bytes,
-            request_data=request.model_dump(),
         )
 
     def create_job_from_completion_request(
@@ -155,7 +140,6 @@ class SchedulerPolicy:
             requires_structured_output=False,
             estimated_prompt_tokens=estimated_prompt_tokens,
             estimated_completion_tokens=estimated_completion_tokens,
-            request_data=request.model_dump(),
         )
 
     def create_job_from_embedding_request(
@@ -179,7 +163,6 @@ class SchedulerPolicy:
             requires_structured_output=False,
             estimated_prompt_tokens=estimated_tokens,
             estimated_completion_tokens=0,
-            request_data=request.model_dump(),
         )
 
     def create_job_from_rerank_request(
@@ -204,7 +187,6 @@ class SchedulerPolicy:
             requires_structured_output=False,
             estimated_prompt_tokens=estimated_tokens,
             estimated_completion_tokens=0,
-            request_data=request.model_dump(),
         )
 
     def create_job_from_score_request(
@@ -229,7 +211,6 @@ class SchedulerPolicy:
             requires_structured_output=False,
             estimated_prompt_tokens=estimated_tokens,
             estimated_completion_tokens=0,
-            request_data=request.model_dump(),
         )
 
     def create_job_from_image_request(
@@ -254,7 +235,6 @@ class SchedulerPolicy:
             requires_structured_output=False,
             estimated_prompt_tokens=estimated_prompt_tokens,
             estimated_completion_tokens=0,
-            request_data=request.model_dump(),
         )
 
     async def submit_job(
