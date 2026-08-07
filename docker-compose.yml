@@ -32,6 +32,13 @@ services:
       - DEBUG=${DEBUG:-false}
       # Audit content capture (see backend/app/settings.py — keep in sync).
       # Disabling capture also disables DLP scanning of that content.
+      # SAML SP key pair (inline PEM or a path to a mounted file) — needed
+      # only for encrypted assertions / signed AuthnRequests. Secrets: host
+      # .env only, never committed.
+      - SAML_SP_X509_CERT=${SAML_SP_X509_CERT:-}
+      - SAML_SP_PRIVATE_KEY=${SAML_SP_PRIVATE_KEY:-}
+      - SAML_AUTHN_REQUESTS_SIGNED=${SAML_AUTHN_REQUESTS_SIGNED:-false}
+      - SAML_WANT_ASSERTIONS_ENCRYPTED=${SAML_WANT_ASSERTIONS_ENCRYPTED:-false}
       - AUDIT_LOG_ENABLED=${AUDIT_LOG_ENABLED:-true}
       - AUDIT_LOG_PROMPTS=${AUDIT_LOG_PROMPTS:-true}
       - AUDIT_LOG_RESPONSES=${AUDIT_LOG_RESPONSES:-true}

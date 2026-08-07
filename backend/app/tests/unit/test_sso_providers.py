@@ -47,6 +47,10 @@ class FakeSettings:
         self.saml_idp_x509_cert = None
         self.saml_display_name = "SSO"
         self.saml_default_group = "other"
+        self.saml_sp_x509_cert = None
+        self.saml_sp_private_key = None
+        self.saml_authn_requests_signed = False
+        self.saml_want_assertions_encrypted = False
         self.saml_attr_email = "mail"
         self.saml_attr_name = "displayName"
         self.saml_attr_username = "eduPersonPrincipalName"
@@ -832,3 +836,172 @@ def test_azure_missing_group_guard_logs_safely():
         " (create the group or fix AZURE_AD_DEFAULT_GROUP)",
         "other",
     )
+
+
+# ── 2.9.7: SAML SP key pair ──────────────────────────────────────
+
+_TEST_CERT = (
+    "-----BEGIN CERTIFICATE-----\n"
+    "MIIBfakeCERTIFICATEbodyForUnitTestsOnly==\n"
+    "-----END CERTIFICATE-----"
+)
+_TEST_KEY = (
+    "-----BEGIN PRIVATE KEY-----\n"
+    "MIIBfakePRIVATEKEYbodyForUnitTestsOnly==\n"
+    "-----END PRIVATE KEY-----"
+)
+
+
+def _saml_settings(sso, **kw):
+    _use(FakeSettings(
+        saml_sp_entity_id="https://mr.example.edu/sp",
+        saml_idp_entity_id="https://idp.example.edu/idp",
+        saml_idp_sso_url="https://idp.example.edu/sso",
+        saml_idp_x509_cert="IDPCERT",
+        **kw,
+    ))
+    return sso["saml"].build_saml_settings("https://mr.example.edu")
+
+
+def test_saml_sp_has_no_key_material_by_default(sso):
+    """Unchanged default: no SP key pair, and the two dependent security
+    options stay absent so python3-saml cannot refuse the config."""
+    cfg = _saml_settings(sso)
+    assert "x509cert" not in cfg["sp"]
+    assert "privateKey" not in cfg["sp"]
+    assert "authnRequestsSigned" not in cfg["security"]
+    assert "wantAssertionsEncrypted" not in cfg["security"]
+
+
+def test_saml_sp_keypair_is_wired_through(sso):
+    cfg = _saml_settings(
+        sso, saml_sp_x509_cert=_TEST_CERT, saml_sp_private_key=_TEST_KEY
+    )
+    assert cfg["sp"]["x509cert"] == _TEST_CERT
+    assert cfg["sp"]["privateKey"] == _TEST_KEY
+    # Present but off unless explicitly enabled.
+    assert cfg["security"]["authnRequestsSigned"] is False
+    assert cfg["security"]["wantAssertionsEncrypted"] is False
+
+
+def test_saml_security_options_enable_with_keypair(sso):
+    cfg = _saml_settings(
+        sso,
+        saml_sp_x509_cert=_TEST_CERT,
+        saml_sp_private_key=_TEST_KEY,
+        saml_authn_requests_signed=True,
+        saml_want_assertions_encrypted=True,
+    )
+    assert cfg["security"]["authnRequestsSigned"] is True
+    assert cfg["security"]["wantAssertionsEncrypted"] is True
+
+
+def test_saml_security_options_ignored_without_keypair(sso):
+    """python3-saml raises sp_cert_not_found_and_required if either flag
+    is on without a key pair, which would take SAML down entirely — so
+    they must be dropped, not passed through."""
+    cfg = _saml_settings(
+        sso, saml_authn_requests_signed=True, saml_want_assertions_encrypted=True
+    )
+    assert "authnRequestsSigned" not in cfg["security"]
+    assert "wantAssertionsEncrypted" not in cfg["security"]
+    # A cert with no key is equally unusable for signing/decryption.
+    cfg = _saml_settings(
+        sso, saml_sp_x509_cert=_TEST_CERT, saml_authn_requests_signed=True
+    )
+    assert "authnRequestsSigned" not in cfg["security"]
+    assert cfg["sp"]["x509cert"] == _TEST_CERT  # still published in metadata
+
+
+def test_saml_pem_accepts_escaped_newlines(sso):
+    """A multi-line PEM survives a single-line .env entry as \\n escapes."""
+    inline = _TEST_CERT.replace("\n", "\\n")
+    cfg = _saml_settings(sso, saml_sp_x509_cert=inline, saml_sp_private_key=_TEST_KEY)
+    assert cfg["sp"]["x509cert"] == _TEST_CERT
+    assert "\\n" not in cfg["sp"]["x509cert"]
+
+
+def test_saml_pem_accepts_file_path(sso, tmp_path):
+    cert_file = tmp_path / "sp.crt"
+    cert_file.write_text(_TEST_CERT + "\n")
+    key_file = tmp_path / "sp.key"
+    key_file.write_text(_TEST_KEY + "\n")
+    cfg = _saml_settings(
+        sso, saml_sp_x509_cert=str(cert_file), saml_sp_private_key=str(key_file)
+    )
+    assert cfg["sp"]["x509cert"] == _TEST_CERT
+    assert cfg["sp"]["privateKey"] == _TEST_KEY
+
+
+def test_saml_pem_unreadable_path_degrades_without_raising(sso):
+    """A bad path must not take the provider down — metadata simply has
+    no KeyDescriptor, and the dependent options stay off."""
+    cfg = _saml_settings(
+        sso,
+        saml_sp_x509_cert="/nonexistent/sp.crt",
+        saml_sp_private_key="/nonexistent/sp.key",
+        saml_want_assertions_encrypted=True,
+    )
+    assert "x509cert" not in cfg["sp"]
+    assert "wantAssertionsEncrypted" not in cfg["security"]
+
+
+def test_saml_pem_never_logged(sso):
+    """BEHAVIORAL: no shape of bad input may reach the log.
+
+    An earlier grep-based version of this test enumerated kwarg names and
+    missed a real leak (`path=raw` echoed a base64-packed private key), so
+    this asserts on what is actually emitted instead.
+    """
+    saml = sso["saml"]
+    calls = []
+
+    class _Recorder:
+        def __getattr__(self, _level):
+            def _log(event, **fields):
+                calls.append((event, fields))
+            return _log
+
+    original_logger = saml.logger
+    saml.logger = _Recorder()
+    try:
+        sentinel = "SUPERSECRETKEYMATERIAL"
+        # Every non-PEM shape an operator might supply: base64-packed PEM,
+        # a bare key body, a plain wrong path, and a path-shaped value.
+        for bad in (
+            sentinel,
+            sentinel * 200,                      # too long to be a path (ENAMETOOLONG)
+            f"MIIB{sentinel}==",                 # headerless base64 body
+            f"/nonexistent/{sentinel}.key",      # path-shaped, missing
+        ):
+            assert saml._load_pem(bad, "SAML_SP_PRIVATE_KEY") is None
+
+        blob = repr(calls)
+        assert sentinel not in blob, f"PEM material leaked into logs: {blob[:300]}"
+        assert calls, "failures must still be logged (diagnosability)"
+        # The record must stay useful without the value.
+        assert any("value_sha256_8" in f for _, f in calls)
+    finally:
+        saml.logger = original_logger
+
+
+def test_saml_pem_non_utf8_file_degrades(sso, tmp_path):
+    """A DER/PKCS#12 file (or any non-UTF-8 blob) must not 500 every SAML
+    endpoint — UnicodeDecodeError has to be caught alongside OSError."""
+    der = tmp_path / "sp.der"
+    der.write_bytes(b"\x30\x82\x01\x0a\xff\xfe\x00binary-not-utf8")
+    cfg = _saml_settings(sso, saml_sp_x509_cert=str(der), saml_sp_private_key=str(der))
+    assert "x509cert" not in cfg["sp"]
+    assert "privateKey" not in cfg["sp"]
+
+
+def test_saml_sp_keypair_env_passthrough():
+    """Settings the app reads must be in docker-compose (MEMORY.md gotcha)."""
+    compose = (_REPO / "docker-compose.yml").read_text()
+    for var in (
+        "SAML_SP_X509_CERT",
+        "SAML_SP_PRIVATE_KEY",
+        "SAML_AUTHN_REQUESTS_SIGNED",
+        "SAML_WANT_ASSERTIONS_ENCRYPTED",
+    ):
+        assert f"- {var}=${{{var}:-" in compose, f"{var} not passed through"

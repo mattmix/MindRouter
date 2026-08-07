@@ -213,32 +213,70 @@ python3-saml performs against that value. (It falls back to the request scheme
 and `Host` header only when `APP_BASE_URL` is blank, which is why you should
 keep it set behind the nginx proxy.)
 
-> **Native SAML limitations — read before choosing this path.** MindRouter's
-> SAML SP holds **no key pair**, which means it cannot decrypt encrypted
-> assertions, cannot sign AuthnRequests, and publishes metadata with no
-> `<KeyDescriptor>`. Practical consequences:
+> **Decide first: do you need an SP key pair?** Without one MindRouter cannot
+> decrypt encrypted assertions or sign AuthnRequests, and its metadata carries
+> no `<KeyDescriptor>`. Stock Shibboleth **encrypts assertions by default**, so
+> most campus IdPs need you to either supply a key pair (below) or turn
+> encryption off for this SP. If encryption stays on and you have no key pair,
+> the login fails **at the IdP** — no response is ever POSTed to MindRouter, so
+> **nothing appears in MindRouter's logs**; check the IdP's.
 >
-> - **Assertion encryption must be disabled for this SP.** Stock Shibboleth
->   encrypts by default; if it stays on, the login fails at the IdP and no
->   response is ever POSTed to MindRouter, so **nothing appears in MindRouter's
->   logs** — check the IdP's logs for a key-resolution/encryption error.
-> - An IdP configured to **require signed AuthnRequests** will refuse the
->   login. Stock Shibboleth does not require them.
-> - Key-less SP metadata is awkward to register in a federation such as
->   **InCommon**, whose registrars generally expect a key.
-> - There is **no Single Logout (SLO)** endpoint.
+> There is still **no Single Logout (SLO)** endpoint, and login is
+> SP-initiated only.
 >
-> **If you are at an InCommon member institution, prefer CILogon over native
-> SAML** (see the CILogon section above). It reaches the same campus IdP
-> through the OIDC path, needs no metadata exchange or SP key material, and is
-> the configuration we recommend and test.
+> **At an InCommon member institution, CILogon is the easier path** (see the
+> CILogon section above): same campus IdP over OIDC, no metadata exchange and
+> no key material to manage.
+
+### SAML SP key pair (optional)
+
+Generate a **self-signed, long-lived** pair. This is *not* your web server's
+TLS certificate and must not come from a public CA — in SAML the trust comes
+from the certificate registered in the IdP's or federation's metadata, so a
+short-lived CA cert just forces needless metadata re-exchanges.
+
+```bash
+openssl req -x509 -newkey rsa:3072 -nodes -days 3650 \
+  -keyout sp.key -out sp.crt \
+  -subj "/CN=<your-mindrouter-host>"
+```
+
+Point the settings at the files (mount them into the container) or paste the
+PEM inline — a single-line `.env` value may use `\n` escapes:
+
+```bash
+SAML_SP_X509_CERT=/etc/mindrouter/saml/sp.crt
+SAML_SP_PRIVATE_KEY=/etc/mindrouter/saml/sp.key
+# Both require the pair above:
+# Publishes the ENCRYPTION KeyDescriptor and requires encrypted assertions.
+# Set this if your IdP encrypts (Shibboleth does by default).
+SAML_WANT_ASSERTIONS_ENCRYPTED=true
+SAML_AUTHN_REQUESTS_SIGNED=true       # sign our AuthnRequests
+```
+
+With a cert configured, `/saml/metadata` publishes a **signing**
+`<KeyDescriptor>` — what a federation registrar expects and what lets the IdP
+verify our signatures. The **encryption** `<KeyDescriptor>`, which is what an
+IdP reads in order to encrypt assertions *to* this SP, is published only when
+`SAML_WANT_ASSERTIONS_ENCRYPTED=true`: python3-saml derives it from that flag
+rather than from the presence of a certificate. So for an encrypting IdP, set
+both the key pair **and** that flag, then re-export your metadata.
+
+Keep `sp.key` readable only by the app; it belongs in the host `.env` or a
+mounted file, never in the repo. Rotating the pair means re-publishing metadata
+to the IdP.
+
+If either option is enabled **without** a key pair, MindRouter logs
+`saml_sp_keypair_missing` and ignores it rather than letting python3-saml
+refuse the whole configuration and take SAML login down.
 
 **IdP-side setup:**
 
 1. Register MindRouter as an SP using the metadata served at
    `https://<your-mindrouter-host>/saml/metadata`.
-2. **Disable assertion encryption for this SP** (see the limitations note
-   above) and enable assertion signing.
+2. Enable assertion signing. For **assertion encryption**, either configure the
+   SP key pair above (then the metadata carries the key the IdP needs), or
+   disable encryption for this SP.
 3. Release attributes: `mail`, `displayName`, `eduPersonPrincipalName` (or
    whatever you map via `SAML_ATTR_*` below). An email-format NameID also works
    as a fallback for the email (common with ADFS).
@@ -519,12 +557,13 @@ Behavior enforced by the shared framework (see `sso/base.py`, `sso/oidc.py`,
 - **What the IdP must sign (SAML):** the **assertion**
   (`wantAssertionsSigned: true`). A message-level signature on the SAML
   `<Response>` is **not** required (`wantMessagesSigned: false`).
-- **What the IdP must NOT do (SAML): encrypt the assertion.** MindRouter's SP
-  has no key pair, so it cannot decrypt encrypted assertions and cannot sign
-  AuthnRequests — see the limitations note in the SAML section above. Stock
-  Shibboleth encrypts assertions by default, so this must be turned off for
-  the MindRouter SP or logins fail **at the IdP**, before any response reaches
-  MindRouter (meaning nothing appears in MindRouter's logs).
+- **Encrypted assertions (SAML) require an SP key pair.** Configure
+  `SAML_SP_X509_CERT` / `SAML_SP_PRIVATE_KEY` (see "SAML SP key pair" above)
+  and set `SAML_WANT_ASSERTIONS_ENCRYPTED=true`; otherwise encryption must be
+  disabled for this SP at the IdP. Stock Shibboleth encrypts by default, and a
+  mismatch fails **at the IdP** before any response reaches MindRouter — so
+  nothing appears in MindRouter's logs. The private key is a secret: host
+  `.env` or a mounted file, never the repo.
 - **`SECRET_KEY` underpins the SSO handshake.** The signed OIDC `state` cookie
   and the SAML `saml_request_id` cookie are both signed with it
   (`state_serializer()` in `sso/base.py`). A weak or leaked `SECRET_KEY`

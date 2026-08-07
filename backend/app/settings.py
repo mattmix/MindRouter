@@ -120,6 +120,17 @@ class Settings(BaseSettings):
     saml_idp_x509_cert: Optional[str] = None
     saml_display_name: str = "SSO"
     saml_default_group: str = "other"
+    # SP key pair — publishes a <KeyDescriptor> in SP metadata and enables
+    # AuthnRequest signing / encrypted-assertion support.  Each value is
+    # either inline PEM (literal "\n" escapes are accepted, for .env files)
+    # or a path to a PEM file mounted into the container.  Conventionally a
+    # long-lived SELF-SIGNED pair — trust comes from metadata registration,
+    # not a CA chain — and NOT the web server's TLS certificate.
+    saml_sp_x509_cert: Optional[str] = None
+    saml_sp_private_key: Optional[str] = None
+    # Both require a key pair; ignored (with a warning) without one.
+    saml_authn_requests_signed: bool = False
+    saml_want_assertions_encrypted: bool = False
     # Attribute names in the assertion (defaults follow eduPerson/InCommon conventions)
     saml_attr_email: str = "mail"
     saml_attr_name: str = "displayName"

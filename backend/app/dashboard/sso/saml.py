@@ -109,28 +109,100 @@ def build_saml_settings(request_scheme_host: Optional[str] = None) -> Optional[d
     if not acs_url and request_scheme_host:
         acs_url = request_scheme_host.rstrip("/") + "/login/saml/acs"
 
+    sp: dict[str, Any] = {
+        "entityId": s.saml_sp_entity_id,
+        "assertionConsumerService": {
+            "url": acs_url,
+            "binding": "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST",
+        },
+        "NameIDFormat": "urn:oasis:names:tc:SAML:2.0:nameid-format:persistent",
+    }
+    sp_cert = _load_pem(s.saml_sp_x509_cert, "SAML_SP_X509_CERT")
+    sp_key = _load_pem(s.saml_sp_private_key, "SAML_SP_PRIVATE_KEY")
+    if sp_cert:
+        # Publishes a <KeyDescriptor> in SP metadata — what a federation
+        # registrar (e.g. InCommon) expects and what lets the IdP verify
+        # our signatures.  NOTE: python3-saml emits use="signing" only;
+        # the use="encryption" descriptor an IdP needs in order to encrypt
+        # TO this SP is gated on wantAssertionsEncrypted/wantNameIdEncrypted,
+        # not on cert presence — so encryption also needs the flag below.
+        sp["x509cert"] = sp_cert
+    if sp_key:
+        sp["privateKey"] = sp_key
+
+    security: dict[str, Any] = {
+        "wantAssertionsSigned": True,
+        "wantMessagesSigned": False,
+        # Refuse RSA-SHA1/DSA-SHA1 signatures.
+        "rejectDeprecatedAlgorithm": True,
+    }
+    # AuthnRequest signing and encrypted assertions BOTH require the key
+    # pair: python3-saml rejects the entire settings object with
+    # sp_cert_not_found_and_required if either is on without one, which
+    # would take SAML login down completely rather than degrade.
+    if sp_cert and sp_key:
+        security["authnRequestsSigned"] = bool(s.saml_authn_requests_signed)
+        security["wantAssertionsEncrypted"] = bool(s.saml_want_assertions_encrypted)
+    elif s.saml_authn_requests_signed or s.saml_want_assertions_encrypted:
+        logger.warning(
+            "saml_sp_keypair_missing",
+            authn_requests_signed=s.saml_authn_requests_signed,
+            want_assertions_encrypted=s.saml_want_assertions_encrypted,
+            note="both options need SAML_SP_X509_CERT and SAML_SP_PRIVATE_KEY; ignoring them",
+        )
+
     return {
         "strict": True,
         "debug": False,
-        "sp": {
-            "entityId": s.saml_sp_entity_id,
-            "assertionConsumerService": {
-                "url": acs_url,
-                "binding": "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST",
-            },
-            "NameIDFormat": "urn:oasis:names:tc:SAML:2.0:nameid-format:persistent",
-        },
+        "sp": sp,
         "idp": idp,
-        "security": {
-            "wantAssertionsSigned": True,
-            "wantMessagesSigned": False,
-            # Refuse RSA-SHA1/DSA-SHA1 signatures.
-            "rejectDeprecatedAlgorithm": True,
-        },
+        "security": security,
         # NOTE: php-saml's "rejectUnsolicitedResponsesWithInResponseTo" does NOT
         # exist in python3-saml (it is accepted into the settings dict but never
         # read). SP-initiated-only is enforced in handle_acs() instead.
     }
+
+
+def _load_pem(value: Optional[str], setting_name: str) -> Optional[str]:
+    """Resolve a PEM setting given either inline or as a file path.
+
+    Inline values may carry literal ``\\n`` escapes, which is how a
+    multi-line PEM survives a single-line ``.env`` entry.  Anything without
+    a PEM header is treated as a path to a mounted file.  Never logs the
+    value — one of these is a private key.
+    """
+    if not value:
+        return None
+    raw = value.strip()
+    if "-----BEGIN" in raw:
+        return raw.replace("\\n", "\n")
+
+    import hashlib
+    from pathlib import Path
+
+    try:
+        text = Path(raw).read_text(encoding="utf-8").strip()
+    except (OSError, ValueError) as exc:
+        # `raw` was only ASSUMED to be a path, and we are here precisely
+        # because it did not look like PEM — so it may be mangled key
+        # material (a base64-packed PEM, a headerless key body).  Never
+        # echo it: logs travel much further than the host .env does.
+        # ValueError covers UnicodeDecodeError (a DER/PKCS#12 file) and
+        # embedded NULs, which would otherwise 500 every SAML endpoint.
+        logger.error(
+            "saml_sp_pem_unreadable",
+            setting=setting_name,
+            error=exc.__class__.__name__,
+            value_len=len(raw),
+            value_sha256_8=hashlib.sha256(raw.encode()).hexdigest()[:8],
+            note="expected inline PEM (\\n escapes ok) or a path to a readable PEM file",
+        )
+        return None
+    if "-----BEGIN" not in text:
+        # `raw` is a real, readable path here — safe to name.
+        logger.error("saml_sp_pem_invalid", setting=setting_name, path=raw)
+        return None
+    return text
 
 
 async def _prepare_fastapi_request(request: Request) -> dict[str, Any]:
