@@ -139,8 +139,17 @@
 
                                 <div class="mb-3">
                                     <label for="brave_api_key" class="form-label">API Key</label>
-                                    <input type="password" class="form-control" id="brave_api_key" name="brave_api_key" value="{{ brave_api_key or '' }}">
-                                    <div class="form-text">Get one at <a href="https://brave.com/search/api/" target="_blank">brave.com/search/api</a></div>
+                                    {# Never render the key into value=: type="password" masks it on
+                                       screen but View Source shows it, and this page is readable by
+                                       read-only auditors. Blank means "keep current". #}
+                                    <input type="password" class="form-control" id="brave_api_key" name="brave_api_key" placeholder="{% if brave_api_key %}(key configured){% else %}Enter API key{% endif %}">
+                                    <div class="form-text">Get one at <a href="https://brave.com/search/api/" target="_blank">brave.com/search/api</a>. Leave blank to keep the current value.</div>
+                                    {% if brave_api_key %}
+                                    <div class="form-check mt-1">
+                                        <input class="form-check-input" type="checkbox" id="clear_brave_api_key" name="clear_brave_api_key">
+                                        <label class="form-check-label small text-muted" for="clear_brave_api_key">Remove the stored key</label>
+                                    </div>
+                                    {% endif %}
                                 </div>
 
                                 <div class="mb-3">

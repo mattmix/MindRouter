@@ -47,6 +47,15 @@
                             <p class="small text-muted mb-3">
                                 <strong>Not included:</strong> requests, responses, usage ledger, telemetry, chat conversations, scheduler decisions, artifacts.
                             </p>
+                            {% if export_is_redacted %}
+                            <div class="alert alert-info small py-2">
+                                <i class="bi bi-shield-lock"></i>
+                                Your download is <strong>redacted</strong>: password hashes, API key hashes,
+                                and secret settings (SMTP password, provider API keys) are removed.
+                                A redacted file cannot be used to restore &mdash; ask an administrator
+                                for a full export if you need one.
+                            </div>
+                            {% endif %}
                             <a href="/admin/backup/export" class="btn btn-primary">
                                 <i class="bi bi-download"></i> Download Backup
                             </a>

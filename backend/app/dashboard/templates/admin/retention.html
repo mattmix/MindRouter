@@ -221,6 +221,14 @@
                                 <div class="form-text">Conversations API state, swept by last activity. 0 = never delete (default).</div>
                             </div>
                         </div>
+                        <div class="row mt-3">
+                            <div class="col-md-4">
+                                <label class="form-label">DLP Alerts (days)</label>
+                                <input type="number" class="form-control" name="retention.dlp_alerts_days"
+                                       value="{{ config['retention.dlp_alerts_days'] }}" min="0">
+                                <div class="form-text">Data-loss-prevention alert records, swept by scan time. 0 = never delete (default).</div>
+                            </div>
+                        </div>
                     </div>
                 </div>
 
@@ -448,6 +456,7 @@
                                     <option value="request_images">Request images (audit offload)</option>
                                     <option value="responses_store">Stored responses (Responses API)</option>
                                     <option value="conversations">Conversations API</option>
+                                    <option value="dlp_alerts">DLP alerts</option>
                                 </select>
                             </div>
                             <div class="col-md-4">

@@ -15,6 +15,7 @@
 """Database CRUD operations for MindRouter."""
 
 import json as _json
+import re
 from datetime import datetime, timedelta, timezone
 from enum import Enum as PyEnum
 import time as _time
@@ -3799,8 +3800,47 @@ def _row_to_dict(row) -> dict:
     return d
 
 
-async def export_config_tables(db: AsyncSession) -> dict:
-    """Export all configuration tables as a dict suitable for JSON serialization."""
+# Credential material in the config export.  A full export is a restore
+# source and must keep these; a redacted export is for read-only oversight.
+_SECRET_TABLE_COLUMNS = {
+    "users": {"password_hash"},
+    "api_keys": {"key_hash", "key_sha256"},
+    # sidecar_key is a PLAINTEXT shared secret, not a hash: it authenticates
+    # every GPU node's sidecar (X-Sidecar-Key) and gates /ollama/pull and
+    # /ollama/delete.  Every other surface returns only `sidecar_key_set: bool`;
+    # this export was the one place emitting the raw value.
+    "nodes": {"sidecar_key"},
+}
+
+# app_config values that are secrets.  Deliberately NOT matching bare "token":
+# ocr.max_tokens, stats.token_offset and vid.token_cost_per_second are settings,
+# not credentials.
+_SECRET_CONFIG_KEY_RE = re.compile(
+    r"password|secret|api_key|private|credential", re.IGNORECASE
+)
+
+_REDACTED = None  # secrets are nulled, not replaced with a marker string
+
+
+def _redact_row(table_name: str, row: dict) -> dict:
+    """Null out credential material in one exported row."""
+    for col in _SECRET_TABLE_COLUMNS.get(table_name, ()):
+        if col in row:
+            row[col] = _REDACTED
+    if table_name == "app_config" and _SECRET_CONFIG_KEY_RE.search(str(row.get("key", ""))):
+        row["value"] = _REDACTED
+    return row
+
+
+async def export_config_tables(db: AsyncSession, redact_secrets: bool = False) -> dict:
+    """Export all configuration tables as a dict suitable for JSON serialization.
+
+    ``redact_secrets`` nulls credential material — local-account password
+    hashes, API key hashes, and secret-valued app_config rows (SMTP password,
+    provider API keys).  Use it for any caller who should be able to review
+    configuration without walking away with credentials; a redacted dump is
+    NOT a valid restore source and import_config_tables refuses it.
+    """
     from backend.app.settings import get_settings
 
     data = {
@@ -3808,19 +3848,39 @@ async def export_config_tables(db: AsyncSession) -> dict:
             "version": get_settings().app_version,
             "exported_at": datetime.now(timezone.utc).isoformat(),
             "tables": [cls.__tablename__ for cls, _ in _CONFIG_TABLES],
+            "redacted": redact_secrets,
         }
     }
 
     for model_cls, _ in _CONFIG_TABLES:
         result = await db.execute(select(model_cls))
         rows = result.scalars().all()
-        data[model_cls.__tablename__] = [_row_to_dict(r) for r in rows]
+        table_name = model_cls.__tablename__
+        exported = [_row_to_dict(r) for r in rows]
+        if redact_secrets:
+            exported = [_redact_row(table_name, r) for r in exported]
+        data[table_name] = exported
 
     return data
 
 
+class RedactedBackupError(ValueError):
+    """Raised when a restore is attempted from a redacted export."""
+
+
 async def import_config_tables(db: AsyncSession, data: dict) -> dict:
-    """Import configuration from a backup dict. Returns summary with inserted/skipped counts."""
+    """Import configuration from a backup dict. Returns summary with inserted/skipped counts.
+
+    Refuses a redacted export: its credential columns are null, so restoring
+    from one would create local accounts with no password hash and API keys
+    with no hash at all.
+    """
+    if isinstance(data.get("metadata"), dict) and data["metadata"].get("redacted"):
+        raise RedactedBackupError(
+            "This backup was downloaded without credentials and cannot be restored. "
+            "Use a full export taken by an administrator."
+        )
+
     summary: dict[str, dict[str, int]] = {}
 
     for model_cls, unique_col in _CONFIG_TABLES:
@@ -4047,10 +4107,12 @@ async def get_dlp_alerts(
     )
     count_query = select(func.count(DlpAlert.id))
 
-    if severity is not None:
+    # Truthiness, not `is not None`: the filter form submits "" for its "All"
+    # options, and an equality test against "" matches no row.
+    if severity:
         query = query.where(DlpAlert.severity == severity)
         count_query = count_query.where(DlpAlert.severity == severity)
-    if scanner is not None:
+    if scanner:
         query = query.where(DlpAlert.scanner == scanner)
         count_query = count_query.where(DlpAlert.scanner == scanner)
     if user_id is not None:

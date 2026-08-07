@@ -237,68 +237,212 @@ class TestTextExtraction:
 # LLM Prompt Construction Tests
 # ===================================================================
 
+def _fake_complete(reply, captured=None):
+    """Build a completion callable standing in for a backend dispatch."""
+    async def _complete(model, messages):
+        if captured is not None:
+            captured["model"] = model
+            captured["messages"] = messages
+        return reply
+    return _complete
+
+
 class TestLLMPromptConstruction:
     """Tests for LLM scanner input construction."""
 
     @pytest.mark.asyncio
     async def test_llm_scan_includes_text_in_user_message(self):
         """Verify the text is included in the user message sent to the LLM."""
-        import httpx
+        captured = {}
+        await _scanner_mod.scan_llm(
+            "My SSN is 123-45-6789",
+            system_prompt="Analyze for PII",
+            model="test-model",
+            complete=_fake_complete("[]", captured),
+        )
 
-        captured_json = {}
-
-        async def mock_post(self, url, **kwargs):
-            captured_json.update(kwargs.get("json", {}))
-            mock_resp = MagicMock()
-            mock_resp.status_code = 200
-            mock_resp.raise_for_status = MagicMock()
-            mock_resp.json.return_value = {
-                "choices": [{"message": {"content": "[]"}}]
-            }
-            return mock_resp
-
-        with patch.object(httpx.AsyncClient, "post", mock_post):
-            scan_llm = _scanner_mod.scan_llm
-            await scan_llm(
-                "My SSN is 123-45-6789",
-                system_prompt="Analyze for PII",
-                model="test-model",
-                api_key="test-key",
-                base_url="http://localhost:8000",
-            )
-
-        assert "messages" in captured_json
-        user_msg = [m for m in captured_json["messages"] if m["role"] == "user"][0]
+        user_msg = [m for m in captured["messages"] if m["role"] == "user"][0]
         assert "123-45-6789" in user_msg["content"]
+        assert captured["model"] == "test-model"
 
     @pytest.mark.asyncio
     async def test_llm_scan_uses_system_prompt(self):
         """Verify the system prompt is passed correctly."""
-        import httpx
+        captured = {}
+        await _scanner_mod.scan_llm(
+            "test text",
+            system_prompt="Custom system prompt for DLP",
+            model="test-model",
+            complete=_fake_complete("[]", captured),
+        )
 
-        captured_json = {}
-
-        async def mock_post(self, url, **kwargs):
-            captured_json.update(kwargs.get("json", {}))
-            mock_resp = MagicMock()
-            mock_resp.status_code = 200
-            mock_resp.raise_for_status = MagicMock()
-            mock_resp.json.return_value = {
-                "choices": [{"message": {"content": "[]"}}]
-            }
-            return mock_resp
-
-        with patch.object(httpx.AsyncClient, "post", mock_post):
-            scan_llm = _scanner_mod.scan_llm
-            await scan_llm(
-                "test text",
-                system_prompt="Custom system prompt for DLP",
-                model="test-model",
-                api_key="test-key",
-            )
-
-        sys_msg = [m for m in captured_json["messages"] if m["role"] == "system"][0]
+        sys_msg = [m for m in captured["messages"] if m["role"] == "system"][0]
         assert sys_msg["content"] == "Custom system prompt for DLP"
+
+
+class TestLLMCredentialRemoved:
+    """2.9.9: the scanner holds no credential and speaks no HTTP.
+
+    Before 2.9.9 scan_llm authenticated to MindRouter's own /v1 endpoint with a
+    key whose RAW value was stored in app_config. These tests encode the
+    property that the credential is gone, not merely relocated.
+    """
+
+    def test_scan_llm_takes_no_credential(self):
+        import inspect
+
+        params = inspect.signature(_scanner_mod.scan_llm).parameters
+        assert "api_key" not in params
+        assert "base_url" not in params
+        assert "complete" in params
+
+    def test_scan_llm_cannot_speak_http(self):
+        """The scanner must not be able to dispatch on its own."""
+        import inspect
+
+        src = inspect.getsource(_scanner_mod)
+        assert "httpx" not in src
+        assert "localhost:8000" not in src
+
+    @pytest.mark.asyncio
+    async def test_run_dlp_scan_skips_llm_without_callable(self):
+        """llm.enabled with no dispatcher must no-op, not crash."""
+        result = await _scanner_mod.run_dlp_scan(
+            "nothing sensitive here",
+            {"regex.enabled": False, "llm.enabled": True, "llm.complete": None},
+        )
+        assert result is None
+
+
+class TestLLMResponseParsing:
+    """Parse-path hardening for the direct-dispatch scanner."""
+
+    @pytest.mark.asyncio
+    async def test_strips_think_block_before_parsing(self):
+        """Reasoning models wrap the answer; the gateway used to strip this.
+
+        Dispatching straight to a backend skips that, so scan_llm must strip it
+        itself or every reasoning-model scan silently yields zero findings.
+        """
+        reply = (
+            "<think>The user text contains what looks like an SSN.</think>"
+            '[{"category": "social security number", "text": "123-45-6789", "confidence": 0.95}]'
+        )
+        findings = await _scanner_mod.scan_llm(
+            "x", system_prompt="p", model="m", complete=_fake_complete(reply),
+        )
+        assert len(findings) == 1
+        assert findings[0].category == "social security number"
+
+    @pytest.mark.asyncio
+    async def test_strips_markdown_fences(self):
+        reply = '```json\n[{"category": "email", "text": "a@b.com", "confidence": 0.8}]\n```'
+        findings = await _scanner_mod.scan_llm(
+            "x", system_prompt="p", model="m", complete=_fake_complete(reply),
+        )
+        assert len(findings) == 1
+
+    @pytest.mark.asyncio
+    async def test_dispatch_failure_returns_no_findings(self):
+        async def _boom(model, messages):
+            raise RuntimeError("no healthy backend")
+
+        findings = await _scanner_mod.scan_llm(
+            "x", system_prompt="p", model="m", complete=_boom,
+        )
+        assert findings == []
+
+    @pytest.mark.asyncio
+    async def test_non_dict_items_are_skipped(self):
+        """A malformed array element must not abort the whole parse."""
+        reply = '["junk", {"category": "email", "text": "a@b.com", "confidence": 0.8}]'
+        findings = await _scanner_mod.scan_llm(
+            "x", system_prompt="p", model="m", complete=_fake_complete(reply),
+        )
+        assert len(findings) == 1
+        assert findings[0].category == "email"
+
+    @pytest.mark.asyncio
+    async def test_parse_failure_never_logs_scanned_content(self, caplog):
+        """The parse-failure log used to emit 200 chars of the model's reply,
+        which quotes the very content being scanned."""
+        import logging
+
+        records = []
+
+        class _Capture:
+            def warning(self, event, **kw):
+                records.append((event, kw))
+
+            def __getattr__(self, _):
+                return lambda *a, **k: None
+
+        secret = "SENTINEL-9182-SECRET"
+        orig = _scanner_mod.logger
+        _scanner_mod.logger = _Capture()
+        try:
+            await _scanner_mod.scan_llm(
+                "x", system_prompt="p", model="m",
+                complete=_fake_complete(f"I found {secret} in the text"),
+            )
+        finally:
+            _scanner_mod.logger = orig
+
+        assert records, "expected a parse-failure warning"
+        emitted = repr(records)
+        assert secret not in emitted, f"scanned content leaked into logs: {emitted}"
+
+
+class TestMaskSnippet:
+    """Alert rows must not become a second copy of the sensitive data."""
+
+    def test_masks_middle_keeps_ends(self):
+        assert _scanner_mod.mask_snippet("123-45-6789") == "12*******89"
+
+    def test_full_value_never_survives(self):
+        for raw in ("123-45-6789", "4111111111111111", "person@example.edu"):
+            masked = _scanner_mod.mask_snippet(raw)
+            assert raw not in masked
+            assert len(masked) == len(raw)
+
+    def test_short_values_fully_masked(self):
+        assert _scanner_mod.mask_snippet("abcd") == "****"
+        assert _scanner_mod.mask_snippet("") == ""
+
+    def test_long_values_truncated(self):
+        assert len(_scanner_mod.mask_snippet("x" * 500)) == 64
+
+
+class TestRegexRobustness:
+    """One malformed custom pattern must not disable DLP entirely."""
+
+    @pytest.mark.asyncio
+    async def test_malformed_pattern_entry_does_not_abort_scan(self):
+        """A list of strings (valid JSON, wrong shape) used to raise TypeError
+        out of scan_regex, killing the whole scan for every request."""
+        result = await _scanner_mod.run_dlp_scan(
+            "my ssn is 123-45-6789",
+            {"regex.enabled": True, "regex.patterns": ["not-a-dict", 42, None]},
+        )
+        assert result is not None, "built-in patterns must still run"
+        assert any(f.category == "social security number" for f in result.findings)
+
+    def test_invalid_regex_is_skipped_not_raised(self):
+        findings = _scanner_mod.scan_regex(
+            "my ssn is 123-45-6789",
+            custom_patterns=[{"name": "bad", "pattern": "([unclosed", "category": "x"}],
+        )
+        assert any(f.category == "social security number" for f in findings)
+
+    @pytest.mark.asyncio
+    async def test_scan_text_is_capped(self):
+        """A pathological request must not hand unbounded text to the engines."""
+        huge = "a" * (_scanner_mod.MAX_SCAN_CHARS + 5000)
+        result = await _scanner_mod.run_dlp_scan(
+            huge, {"regex.enabled": True, "regex.keywords": ["aaa"]},
+        )
+        assert result is not None
+        assert all(f.end <= _scanner_mod.MAX_SCAN_CHARS for f in result.findings)
 
 
 # ===================================================================

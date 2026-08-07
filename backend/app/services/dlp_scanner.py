@@ -22,11 +22,19 @@ import json
 import re
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from backend.app.logging_config import get_logger
 
 logger = get_logger(__name__)
+
+# Signature of the completion callable injected into scan_llm.  The scanner
+# never holds a credential or speaks HTTP itself — see dlp_worker._internal_chat.
+CompleteFn = Callable[[str, List[Dict[str, str]]], Awaitable[str]]
+
+# Upper bound on the text handed to any scanner.  Caps both regex backtracking
+# cost and GLiNER/LLM token use on a pathological request.
+MAX_SCAN_CHARS = 200_000
 
 
 # ---------------------------------------------------------------------------
@@ -84,7 +92,11 @@ def scan_regex(
 
     all_patterns = list(_BUILTIN_PATTERNS)
     if custom_patterns:
-        all_patterns.extend(custom_patterns)
+        # Admin-supplied patterns are validated at save time, but a row written
+        # before that validation existed (or by a direct DB edit) can still be
+        # the wrong shape.  One bad entry must never abort the built-in patterns
+        # or the scanners that run after this one.
+        all_patterns.extend(p for p in custom_patterns if isinstance(p, dict) and p.get("pattern"))
 
     for pat in all_patterns:
         try:
@@ -97,8 +109,10 @@ def scan_regex(
                     start=m.start(),
                     end=m.end(),
                 ))
-        except re.error:
-            logger.warning("dlp_regex_invalid", pattern=pat.get("name", "?"))
+        except Exception:
+            # re.error for a bad pattern; anything else means a malformed entry
+            # reached us despite the shape filter above.
+            logger.warning("dlp_regex_invalid", pattern=str(pat.get("name", "?"))[:80])
 
     if keywords:
         text_lower = text.lower()
@@ -218,22 +232,28 @@ async def scan_gliner(
 
 
 # ---------------------------------------------------------------------------
-# LLM contextual scanner (self-routes through MindRouter)
+# LLM contextual scanner (dispatched by an injected callable — no credential)
 # ---------------------------------------------------------------------------
+
+# Reasoning models wrap their answer in <think>…</think>.  The gateway strips
+# this on the normal inference path; the DLP scanner dispatches straight to a
+# backend, so it must strip it here or every parse fails.
+_THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
+
 
 async def scan_llm(
     text: str,
     system_prompt: str,
     model: str,
-    api_key: str,
-    base_url: str = "http://localhost:8000",
+    complete: CompleteFn,
 ) -> List[ScanFinding]:
     """Scan text using an LLM for contextual sensitive data detection.
 
-    Self-routes through MindRouter's own /v1/chat/completions endpoint.
+    ``complete(model, messages) -> content`` is injected by the caller so this
+    module stays free of DB, registry, and HTTP imports — and so the scanner
+    holds no API key.  See dlp_worker._internal_chat for the production
+    implementation, which dispatches directly to a healthy backend.
     """
-    import httpx
-
     # Truncate very long text to avoid excessive token usage
     max_chars = 8000
     scan_text = text[:max_chars] if len(text) > max_chars else text
@@ -244,32 +264,15 @@ async def scan_llm(
     ]
 
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.post(
-                f"{base_url}/v1/chat/completions",
-                json={
-                    "model": model,
-                    "messages": messages,
-                    "max_tokens": 1024,
-                    "temperature": 0.0,
-                },
-                headers={"Authorization": f"Bearer {api_key}"},
-            )
-            resp.raise_for_status()
-            data = resp.json()
+        content = await complete(model, messages)
     except Exception:
         logger.exception("dlp_llm_scan_failed", model=model)
         return []
 
-    # Parse LLM response — expect JSON array of findings
-    content = ""
-    if "choices" in data and data["choices"]:
-        content = data["choices"][0].get("message", {}).get("content", "")
-
     findings = []
     try:
-        # Try to extract JSON from the response (may have markdown fences)
-        json_str = content.strip()
+        # Try to extract JSON from the response (may have reasoning or fences)
+        json_str = _THINK_RE.sub("", content or "").strip()
         if json_str.startswith("```"):
             # Strip markdown code fences
             lines = json_str.split("\n")
@@ -279,18 +282,46 @@ async def scan_llm(
         parsed = json.loads(json_str)
         if isinstance(parsed, list):
             for item in parsed:
+                if not isinstance(item, dict):
+                    continue
                 findings.append(ScanFinding(
                     scanner="llm",
-                    category=item.get("category", "unknown"),
-                    text=item.get("text", ""),
+                    category=str(item.get("category", "unknown")),
+                    text=str(item.get("text", "")),
                     confidence=float(item.get("confidence", 0.7)),
                 ))
-    except (json.JSONDecodeError, ValueError):
-        # If the LLM didn't return valid JSON, treat non-empty response as a single finding
-        if content.strip() and content.strip() != "[]":
-            logger.warning("dlp_llm_parse_failed", content_preview=content[:200])
+    except (json.JSONDecodeError, ValueError, TypeError):
+        # The model didn't return the requested JSON array.  Never log the
+        # response body — it quotes the very content we are scanning.
+        if (content or "").strip() not in ("", "[]"):
+            logger.warning("dlp_llm_parse_failed", model=model, content_chars=len(content or ""))
 
     return findings
+
+
+# ---------------------------------------------------------------------------
+# Snippet masking
+# ---------------------------------------------------------------------------
+
+def mask_snippet(text: str, keep: int = 2) -> str:
+    """Mask a matched snippet for storage in an alert row.
+
+    A DLP alert is metadata about sensitive data — it must not become a second
+    copy of it.  Alerts are long-lived and admin-readable, so the verbatim match
+    never leaves the scanner; the full context stays in the audit tables, where
+    the capture toggles and retention policy govern it.
+
+    Keeps the first and last ``keep`` characters so an admin can still recognise
+    a false positive (``4111********1111``), and preserves length for shape.
+    """
+    if not text:
+        return ""
+    s = str(text)
+    if len(s) > 64:
+        s = s[:64]
+    if len(s) <= keep * 2:
+        return "*" * len(s)
+    return f"{s[:keep]}{'*' * (len(s) - keep * 2)}{s[-keep:]}"
 
 
 # ---------------------------------------------------------------------------
@@ -394,12 +425,23 @@ async def run_dlp_scan(
     all_findings: List[ScanFinding] = []
     scanners_used: List[str] = []
 
+    if len(text) > MAX_SCAN_CHARS:
+        logger.info("dlp_scan_text_truncated", original_chars=len(text), kept=MAX_SCAN_CHARS)
+        text = text[:MAX_SCAN_CHARS]
+
     # --- Regex scanner (always fast, run first) ---
     if config.get("regex.enabled", True):
-        regex_findings = scan_regex(
+        # Off the event loop: `re` is a backtracking engine with no timeout, and
+        # admin-supplied patterns meet attacker-controlled text here.  A
+        # pathological pair burns a thread-pool thread instead of stalling the
+        # whole worker, which also serves the inference API.
+        loop = asyncio.get_event_loop()
+        regex_findings = await loop.run_in_executor(
+            None,
+            scan_regex,
             text,
-            custom_patterns=config.get("regex.patterns"),
-            keywords=config.get("regex.keywords"),
+            config.get("regex.patterns"),
+            config.get("regex.keywords"),
         )
         all_findings.extend(regex_findings)
         if regex_findings:
@@ -418,14 +460,13 @@ async def run_dlp_scan(
 
     # --- LLM contextual scanner ---
     if config.get("llm.enabled", False):
-        api_key = config.get("llm.api_key", "")
-        if api_key:
+        complete = config.get("llm.complete")
+        if complete is not None:
             llm_findings = await scan_llm(
                 text,
                 system_prompt=config.get("llm.system_prompt", ""),
                 model=config.get("llm.model", ""),
-                api_key=api_key,
-                base_url=config.get("llm.base_url", "http://localhost:8000"),
+                complete=complete,
             )
             all_findings.extend(llm_findings)
             if llm_findings:

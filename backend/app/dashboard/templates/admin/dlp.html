@@ -90,8 +90,13 @@
             <!-- Configuration -->
             <form method="post" action="/admin/dlp/config" id="dlpForm">
                 <!-- Hidden fields for JSON data built by JavaScript -->
-                <input type="hidden" name="severity_rules" id="severity_rules_json">
-                <input type="hidden" name="regex_patterns" id="regex_patterns_json">
+                {# These two are populated by the submit handler from the rendered rows.
+                   `_json_ready` is flipped to "1" by that handler: if the script did not
+                   run, the server must LEAVE the stored rules and patterns alone rather
+                   than overwrite them with the empty defaults. #}
+                <input type="hidden" name="severity_rules" id="severity_rules_json" value="{}">
+                <input type="hidden" name="regex_patterns" id="regex_patterns_json" value="[]">
+                <input type="hidden" name="_json_ready" id="dlpJsonReady" value="0">
 
                 <!-- Master Toggle -->
                 <div class="card mb-4">
@@ -194,7 +199,7 @@
                                     <label class="form-label fw-bold">Entity Categories</label>
                                     <p class="text-muted small mb-2">Select which categories GLiNER should detect. Add custom categories below.</p>
                                     {% set all_categories = ["person", "phone number", "email", "credit card number", "social security number", "date of birth", "driver license number", "passport number", "bank account number", "medical record number", "student id"] %}
-                                    <div class="row">
+                                    <div class="row" id="glinerCategoriesRow">
                                         {% for cat in all_categories %}
                                         <div class="col-md-6">
                                             <div class="form-check">
@@ -238,12 +243,12 @@
                                 </button>
                             </div>
                             <div class="card-body">
-                                <p class="text-muted small">Uses an LLM for semantic analysis. Self-routes through MindRouter (~500ms). Ideal for FERPA/HIPAA contextual detection.</p>
+                                <p class="text-muted small">Uses an LLM for semantic analysis (~500ms). Ideal for FERPA/HIPAA contextual detection.</p>
                                 <div class="mb-3">
                                     <label class="form-label fw-bold" for="llm_model">Model</label>
                                     <input type="text" class="form-control" id="llm_model" name="llm_model"
                                            value="{{ config.llm_model }}" placeholder="qwen/qwen3.5-4b">
-                                    <div class="form-text">Enter a model name available in MindRouter (e.g. <code>qwen/qwen3.5-4b</code>). The DLP scanner will self-route requests through the <code>/v1/chat/completions</code> API using a dedicated internal API key.</div>
+                                    <div class="form-text">Enter a model name served by MindRouter (e.g. <code>qwen/qwen3.5-4b</code>). The scanner dispatches directly to a healthy backend for that model &mdash; no API key is involved, and scans do not appear in the request log or count against any user's quota.</div>
                                 </div>
                                 <div class="mb-3">
                                     <label class="form-label fw-bold" for="llm_system_prompt">System Prompt</label>
@@ -346,6 +351,9 @@
                             <input type="text" name="search" class="form-control form-control-sm" placeholder="Search..."
                                    value="{{ search }}" style="width: 150px;">
                             <button type="submit" class="btn btn-sm btn-outline-secondary"><i class="bi bi-search"></i></button>
+                            {% if severity_filter or scanner_filter or search %}
+                            <a href="/admin/dlp" class="btn btn-sm btn-outline-secondary">Clear</a>
+                            {% endif %}
                         </form>
                     </div>
                 </div>
@@ -358,6 +366,7 @@
                                     <th>Severity</th>
                                     <th>Scanner</th>
                                     <th>Categories</th>
+                                    <th>Matched</th>
                                     <th>User</th>
                                     <th>Request</th>
                                     <th>Latency</th>
@@ -390,6 +399,21 @@
                                         {% endif %}
                                         {% endif %}
                                     </td>
+                                    <td>
+                                        {# Snippets are masked at scan time — an alert row never stores the
+                                           verbatim match.  Open the linked request to see full context. #}
+                                        {% if alert.entities %}
+                                        {% for ent in alert.entities[:3] %}
+                                        <div><code class="small">{{ ent.text }}</code>
+                                            <span class="text-muted small">{{ ent.category }}</span></div>
+                                        {% endfor %}
+                                        {% if alert.entities | length > 3 %}
+                                        <span class="text-muted small">+{{ alert.entities | length - 3 }} more</span>
+                                        {% endif %}
+                                        {% else %}
+                                        <span class="text-muted small">&mdash;</span>
+                                        {% endif %}
+                                    </td>
                                     <td>{{ alert.user.email if alert.user else 'N/A' }}</td>
                                     <td>
                                         {% if alert.request_id %}
@@ -420,7 +444,7 @@
                                 {% endfor %}
                                 {% if not alerts %}
                                 <tr>
-                                    <td colspan="10" class="text-center text-muted py-4">No DLP alerts found.</td>
+                                    <td colspan="{{ 10 if is_read_only else 11 }}" class="text-center text-muted py-4">No DLP alerts found.</td>
                                 </tr>
                                 {% endif %}
                             </tbody>
@@ -555,7 +579,7 @@
             <div class="modal-body">
                 <h6>How it works</h6>
                 <p>The LLM scanner sends the text to a dedicated language model for <strong>semantic analysis</strong>. Unlike regex or NER, the LLM understands context &mdash; it can detect that "my student John got a B+ in CS101" is a FERPA violation even though no single word is PII on its own.</p>
-                <p>The scanner <strong>self-routes through MindRouter's own API</strong> using a dedicated internal API key. This means it benefits from MindRouter's load balancing and model routing. The internal key's requests are automatically excluded from DLP scanning to prevent infinite loops.</p>
+                <p>The scanner <strong>dispatches directly to a healthy backend</strong> serving the model you name, chosen from the live registry. No API key is involved, scans never re-enter the gateway, and they create no request records &mdash; so a scan cannot re-store the content it just flagged, cannot consume a user's quota, and cannot trigger a scan of itself.</p>
 
                 <h6>Model selection</h6>
                 <p>Enter any model name available in MindRouter. A small, fast model is ideal since DLP scans run in the background. Recommended: <code>qwen/qwen3.5-4b</code> or similar ~4B parameter model.</p>
@@ -607,7 +631,11 @@
 
 {% endblock %}
 
-{% block scripts %}
+{# base.html renders `extra_js`; this template used `scripts`, a block name the
+   parent never renders, so Jinja silently dropped ALL of the page's JavaScript.
+   Every handler below — acknowledge, the pattern/severity/category builders,
+   and the submit serializer — was dead until 2.9.9. #}
+{% block extra_js %}
 <script>
 // Threshold slider display
 const slider = document.getElementById('gliner_threshold');
@@ -707,7 +735,7 @@ function addCustomCategory() {
         }
     }
 
-    const container = document.querySelector('#dlpForm .row .col-md-6:first-child .row');
+    const container = document.getElementById('glinerCategoriesRow');
     if (!container) return;
 
     const div = document.createElement('div');
@@ -746,6 +774,10 @@ document.getElementById('dlpForm')?.addEventListener('submit', function() {
         }
     });
     document.getElementById('regex_patterns_json').value = JSON.stringify(patterns);
+
+    // Tell the server these two fields are authoritative.  Without this the
+    // route preserves the stored values instead of writing the empty defaults.
+    document.getElementById('dlpJsonReady').value = '1';
 });
 </script>
 {% endblock %}

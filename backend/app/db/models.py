@@ -1384,6 +1384,8 @@ class DlpAlert(Base):
         Index("ix_dlp_alerts_user_time", "user_id", "scanned_at"),
         Index("ix_dlp_alerts_request", "request_id"),
         Index("ix_dlp_alerts_scanner", "scanner"),
+        # Serves the retention sweep, which filters on scanned_at alone.
+        Index("ix_dlp_alerts_scanned_at", "scanned_at"),
     )
 
 

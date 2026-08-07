@@ -18,7 +18,7 @@
 """Background DLP worker: async queue consumer for post-hoc scanning."""
 
 import asyncio
-from typing import Optional
+import time
 
 from backend.app.logging_config import get_logger
 
@@ -26,6 +26,15 @@ logger = get_logger(__name__)
 
 # Module-level queue — bounded to 10,000 to prevent unbounded memory growth
 _dlp_queue: asyncio.Queue = asyncio.Queue(maxsize=10_000)
+
+# Cap on masked snippets stored per alert (see _process_one).
+MAX_STORED_ENTITIES = 50
+
+# Alert-email flood guard: at most EMAIL_BURST messages per severity per
+# EMAIL_WINDOW_SECONDS, per process.  severity -> (window_start, count, suppressed)
+EMAIL_BURST = 10
+EMAIL_WINDOW_SECONDS = 300.0
+_email_budget: dict = {}
 
 
 def get_dlp_queue() -> asyncio.Queue:
@@ -88,10 +97,9 @@ async def _process_one(request_id: int) -> None:
         if req is None:
             return
 
-        # Self-loop prevention: skip requests from the DLP internal API key
-        internal_key_id = await crud.get_config_json(db, "dlp.internal_api_key_id", None)
-        if internal_key_id is not None and req.api_key_id == internal_key_id:
-            return
+        # No self-loop guard is needed: the LLM scanner dispatches straight to a
+        # backend (_internal_chat) and never re-enters the gateway, so a scan
+        # creates no request row of its own.
 
         # Load response content
         resp_result = await db.execute(
@@ -118,20 +126,34 @@ async def _process_one(request_id: int) -> None:
         if scan_result is None:
             return
 
-        # Build entities list (redacted snippets)
+        # Build entities list.  Snippets are MASKED, not merely truncated: an
+        # alert row is metadata about sensitive data and must not become a
+        # second, longer-lived copy of it.  Cap the count so a pathological
+        # match (a 1-char keyword against a large prompt) can't write a
+        # multi-megabyte JSON column.
+        from backend.app.services.dlp_scanner import mask_snippet
+
         entities = []
         categories_set = set()
         max_confidence = 0.0
         for f in scan_result.findings:
-            entities.append({
-                "scanner": f.scanner,
-                "category": f.category,
-                "text": f.text[:50],  # truncate for storage
-                "confidence": f.confidence,
-            })
+            if len(entities) < MAX_STORED_ENTITIES:
+                entities.append({
+                    "scanner": f.scanner,
+                    "category": f.category,
+                    "text": mask_snippet(f.text),
+                    "confidence": f.confidence,
+                })
             categories_set.add(f.category)
             if f.confidence > max_confidence:
                 max_confidence = f.confidence
+        if len(scan_result.findings) > MAX_STORED_ENTITIES:
+            entities.append({
+                "scanner": "-",
+                "category": "(truncated)",
+                "text": f"+{len(scan_result.findings) - MAX_STORED_ENTITIES} more",
+                "confidence": 0.0,
+            })
 
         # Create DLP alert
         alert = await crud.create_dlp_alert(
@@ -177,15 +199,98 @@ async def _load_dlp_config(db) -> dict:
     config["llm.system_prompt"] = await crud.get_config_json(db, "dlp.llm.system_prompt", "")
     config["severity_rules"] = await crud.get_config_json(db, "dlp.severity_rules", {})
 
-    # Load internal API key for LLM scanner (raw key stored in config)
-    if config["llm.enabled"]:
-        config["llm.api_key"] = await crud.get_config_json(db, "dlp.internal_api_key_raw", "") or ""
-    else:
-        config["llm.api_key"] = ""
-
-    config["llm.base_url"] = "http://localhost:8000"
+    # The LLM scanner dispatches through this callable rather than holding an
+    # API key.  Nothing credential-shaped is stored for DLP anywhere.
+    config["llm.complete"] = _internal_chat if config["llm.enabled"] else None
 
     return config
+
+
+async def _internal_chat(model: str, messages: list) -> str:
+    """Run one chat completion for the LLM scanner, straight to a backend.
+
+    Deliberately bypasses the gateway's own /v1 endpoint: routing internally
+    means DLP needs no API key, creates no request/response rows (which would
+    re-store the very content it flagged), and consumes no user's quota.
+    Mirrors services/image_policy._call_judge, which does the same on the
+    image-moderation path.
+
+    Trade-off: no scheduler admission, no retry/failover.  Scans are post-hoc
+    and best-effort, so a failed dispatch costs one scan, not a request.
+    """
+    import random
+
+    import httpx
+
+    from backend.app.core.telemetry.registry import get_registry
+    from backend.app.db.models import BackendEngine
+
+    registry = get_registry()
+    resolved, _ = registry.resolve_alias(model)
+
+    # get_backends_with_model already filters to HEALTHY in SQL.
+    backends = await registry.get_backends_with_model(resolved)
+    available = []
+    for b in backends:
+        try:
+            if await registry.is_backend_available(b.id):
+                available.append(b)
+        except Exception:
+            continue
+    if not available:
+        logger.warning("dlp_llm_no_backend", model=model, resolved=resolved)
+        raise RuntimeError(f"no healthy backend serving DLP model {resolved!r}")
+
+    backend = random.choice(available)
+
+    payload = {
+        "model": resolved,
+        "messages": messages,
+        "temperature": 0.0,
+        "max_tokens": 1024,
+        "stream": False,
+    }
+    # Reasoning is off fleet-wide on the normal inference path; dispatching
+    # directly skips that policy, so re-apply it here or the scanner's JSON
+    # answer arrives wrapped in <think> blocks.  gpt-oss rejects the kwarg.
+    if backend.engine != BackendEngine.OLLAMA and "gpt-oss" not in resolved.lower():
+        payload["chat_template_kwargs"] = {"enable_thinking": False}
+
+    timeout = httpx.Timeout(connect=10.0, read=30.0, write=10.0, pool=10.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        resp = await client.post(f"{backend.url}/v1/chat/completions", json=payload)
+        resp.raise_for_status()
+        data = resp.json()
+
+    choices = data.get("choices") or [{}]
+    msg = choices[0].get("message") or {}
+    return msg.get("content") or ""
+
+
+def _email_allowed(severity: str) -> tuple:
+    """Token-bucket guard: at most EMAIL_BURST alerts per severity per window.
+
+    DLP scans every completed request, so a single chatty user can trip the same
+    rule hundreds of times a minute.  Without a cap, enabling notifications for
+    a low severity mails the admin into oblivion.  Per-process state (each
+    uvicorn worker keeps its own), which is fine — this is a flood guard, not
+    an exactly-once ledger.
+
+    Returns (allowed, suppressed_since_last_send).
+    """
+    now = time.monotonic()
+    window_start, count, suppressed = _email_budget.get(severity, (now, 0, 0))
+    if now - window_start >= EMAIL_WINDOW_SECONDS:
+        # Reset the window's send count but CARRY the suppressed tally: it is
+        # cleared only by an actual send, so the next email that goes out can
+        # tell the admin how many alerts were dropped while the budget was
+        # exhausted.  Zeroing it here made that report permanently unreachable.
+        window_start, count = now, 0
+    if count >= EMAIL_BURST:
+        _email_budget[severity] = (window_start, count, suppressed + 1)
+        return False, suppressed + 1
+    _email_budget[severity] = (window_start, count + 1, 0)
+    return True, suppressed
 
 
 async def _maybe_send_email(db, alert, scan_result) -> None:
@@ -198,8 +303,13 @@ async def _maybe_send_email(db, alert, scan_result) -> None:
     if not recipients_str:
         return
 
-    recipients = [r.strip() for r in recipients_str.split(",") if r.strip()]
+    recipients = [r.strip() for r in str(recipients_str).split(",") if r.strip()]
     if not recipients:
+        return
+
+    allowed, suppressed = _email_allowed(severity)
+    if not allowed:
+        logger.info("dlp_email_suppressed", severity=severity, suppressed=suppressed)
         return
 
     try:
@@ -210,71 +320,46 @@ async def _maybe_send_email(db, alert, scan_result) -> None:
             logger.warning("dlp_email_smtp_not_configured")
             return
 
-        subject = f"[MindRouter DLP] {severity.upper()} alert — {', '.join(scan_result.findings[0].category if scan_result.findings else ['unknown'])}"
-        body = (
-            f"DLP Alert: {severity.upper()}\n\n"
-            f"Scanner: {scan_result.scanner}\n"
-            f"Findings: {len(scan_result.findings)}\n"
-            f"Detail: {scan_result.detail}\n"
-            f"Request ID: {alert.request_id}\n"
-            f"Scan latency: {scan_result.scan_latency_ms}ms\n\n"
-            f"Review in Admin: /admin/dlp"
+        categories = ", ".join(sorted(alert.categories or [])) or "unknown"
+        subject = f"[MindRouter DLP] {severity.upper()} alert — {categories}"
+
+        # Body carries metadata only.  The matched values stay out of mail:
+        # an inbox is the last place a DLP alert should reproduce them.
+        base_url = await email_service.get_base_url(db)
+        suppressed_note = (
+            f"<p><em>{suppressed} further {severity} alert(s) were suppressed by the "
+            f"notification rate limit.</em></p>" if suppressed else ""
+        )
+        body_html = (
+            f"<p><strong>DLP Alert: {severity.upper()}</strong></p>"
+            f"<p>Scanner: {scan_result.scanner}<br>"
+            f"Categories: {categories}<br>"
+            f"Findings: {len(scan_result.findings)}<br>"
+            f"Request ID: {alert.request_id if alert.request_id else 'n/a'}<br>"
+            f"Scan latency: {scan_result.scan_latency_ms}ms</p>"
+            f"{suppressed_note}"
+            f'<p><a href="{base_url}/admin/dlp">Review in Admin &rarr; DLP</a></p>'
+            f"<p><small>Matched values are not included in this email. "
+            f"Open the alert in the admin console to review.</small></p>"
         )
 
-        for recipient in recipients:
-            await email_service.send_email(
-                smtp_config=smtp_config,
-                to_email=recipient,
-                subject=subject,
-                body=body,
-            )
-
-        logger.info("dlp_email_sent", severity=severity, recipients=len(recipients))
+        sent = await email_service.send_notification_email(
+            config=smtp_config,
+            recipients=recipients,
+            subject=subject,
+            body_html=body_html,
+            base_url=base_url,
+        )
+        logger.info("dlp_email_sent", severity=severity, recipients=len(recipients), sent=sent)
     except Exception:
         logger.exception("dlp_email_failed")
 
 
-async def ensure_internal_api_key(db) -> Optional[int]:
-    """Ensure the DLP system API key exists. Returns the key ID.
-
-    The raw key is stored in AppConfig so the LLM scanner can use it
-    for self-routing. The DB is encrypted at rest via TDE.
-    """
-    from backend.app.db import crud
-
-    existing_id = await crud.get_config_json(db, "dlp.internal_api_key_id", None)
-    if existing_id is not None:
-        # Verify it still exists
-        from backend.app.db.models import ApiKey
-        from sqlalchemy import select
-        result = await db.execute(
-            select(ApiKey.id).where(ApiKey.id == existing_id)
-        )
-        if result.scalar_one_or_none() is not None:
-            return existing_id
-
-    # Generate a proper API key
-    from backend.app.security.api_keys import generate_api_key
-    full_key, key_hash, key_prefix, key_sha256 = generate_api_key()
-
-    # Find a system user (user_id=1 is typically admin)
-    from backend.app.db.models import User
-    from sqlalchemy import select as sa_select
-    result = await db.execute(sa_select(User.id).limit(1))
-    system_user_id = result.scalar_one_or_none() or 1
-
-    api_key = await crud.create_api_key(
-        db,
-        user_id=system_user_id,
-        key_hash=key_hash,
-        key_prefix=key_prefix,
-        name="DLP Internal Scanner",
-        key_sha256=key_sha256,
-    )
-    await crud.set_config(db, "dlp.internal_api_key_id", api_key.id)
-    # Store raw key in config so LLM scanner can authenticate
-    await crud.set_config(db, "dlp.internal_api_key_raw", full_key)
-    await db.commit()
-
-    logger.info("dlp_internal_api_key_created", key_id=api_key.id)
-    return api_key.id
+# NOTE: ensure_internal_api_key() was removed in 2.9.9.  It minted a
+# never-expiring API key owned by whichever row `SELECT id FROM users LIMIT 1`
+# returned (in practice the bootstrap admin, so the key carried admin rights)
+# and stored the RAW key in app_config.dlp.internal_api_key_raw — the only
+# unhashed key in a system that otherwise persists Argon2 + SHA-256 only.
+# The LLM scanner now dispatches straight to a backend via _internal_chat and
+# needs no credential at all.  Migration 071 revokes any key it created and
+# drops both config rows.

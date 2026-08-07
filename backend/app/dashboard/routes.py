@@ -4227,12 +4227,18 @@ async def admin_voice_config_post(
 
     if action == "save_voice_tts_backend":
         tts_url = form.get("tts_url", "").strip() or None
-        tts_api_key = form.get("tts_api_key", "").strip() or None
+        tts_api_key = form.get("tts_api_key", "").strip()
         tts_voices = form.get("tts_voices", "").strip()
         default_voice = form.get("default_voice", "").strip() or "af_heart"
 
         await crud.set_config(db, "voice.tts_url", tts_url)
-        await crud.set_config(db, "voice.tts_api_key", tts_api_key)
+        # The form no longer round-trips the key (it would be readable in page
+        # source), so blank means "keep current" — matching the enrichment-key
+        # field on /admin/settings.  Use the Clear button to remove one.
+        if tts_api_key:
+            await crud.set_config(db, "voice.tts_api_key", tts_api_key)
+        elif form.get("clear_tts_api_key") == "on":
+            await crud.set_config(db, "voice.tts_api_key", None)
         await crud.set_config(db, "voice_api.tts_voices", tts_voices)
         await crud.set_config(db, "voice_api.default_voice", default_voice)
         await crud.log_admin_action(
@@ -4245,11 +4251,15 @@ async def admin_voice_config_post(
 
     elif action == "save_voice_stt_backend":
         stt_url = form.get("stt_url", "").strip() or None
-        stt_api_key = form.get("stt_api_key", "").strip() or None
+        stt_api_key = form.get("stt_api_key", "").strip()
         stt_model = form.get("stt_model", "").strip() or "whisper-large-v3-turbo"
 
         await crud.set_config(db, "voice.stt_url", stt_url)
-        await crud.set_config(db, "voice.stt_api_key", stt_api_key)
+        # Blank = keep current; see the TTS branch above.
+        if stt_api_key:
+            await crud.set_config(db, "voice.stt_api_key", stt_api_key)
+        elif form.get("clear_stt_api_key") == "on":
+            await crud.set_config(db, "voice.stt_api_key", None)
         await crud.set_config(db, "voice.stt_model", stt_model)
         await crud.log_admin_action(
             db, user_id=user_id, action="voice_config.save_stt_backend",
@@ -5332,6 +5342,7 @@ async def admin_retention_post(
             "retention.request_images_days",
             "retention.responses_store_days",
             "retention.conversations_days",
+            "retention.dlp_alerts_days",
             "retention.cleanup_interval",
             "retention.batch_size",
         ]:
@@ -5483,6 +5494,11 @@ async def admin_backup(
             "request": request,
             "user": user,
             **masq,
+            # Derived exactly as admin_backup_export derives `redact`, from the
+            # real session user.  masq["is_read_only"] describes the EFFECTIVE
+            # user, so under masquerade it would promise a redacted download
+            # while the export — keyed off the real admin — returns a full one.
+            "export_is_redacted": not user.group.is_admin,
             "success": success,
             "error": error,
             "restore_summary": None,
@@ -5504,10 +5520,25 @@ async def admin_backup_export(
     if not user or (not user.group or not user.group.has_admin_read):
         return RedirectResponse(url="/dashboard", status_code=302)
 
-    data = await crud.export_config_tables(db)
+    # Full admins get a restorable dump, credentials included.  Read-only
+    # auditors get the same configuration with credential material nulled:
+    # local-account password hashes, API key hashes, and secret-valued
+    # app_config rows (SMTP password, provider API keys — several of which are
+    # directly usable, not hashes).  Oversight does not require the secrets.
+    redact = not user.group.is_admin
+
+    data = await crud.export_config_tables(db, redact_secrets=redact)
     content = json.dumps(data, indent=2, ensure_ascii=False)
     date_str = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-    filename = f"mindrouter-config-{date_str}.json"
+    suffix = "-redacted" if redact else ""
+    filename = f"mindrouter-config{suffix}-{date_str}.json"
+
+    await crud.log_admin_action(
+        db, user_id=user.id, action="backup.export", entity_type="config",
+        detail=f"Configuration backup downloaded ({'redacted' if redact else 'full'})",
+        ip_address=get_client_ip(request),
+    )
+    await db.commit()
 
     return StreamingResponse(
         iter([content]),
@@ -5581,15 +5612,29 @@ async def admin_backup_restore(
             ip_address=get_client_ip(request),
         )
         await db.commit()
-    except Exception as exc:
-        logger.error("Backup restore failed", error=str(exc))
+    except crud.RedactedBackupError as exc:
         return templates.TemplateResponse(
             "admin/backup.html",
             {
                 "request": request,
                 "user": user,
                 "success": None,
-                "error": f"Restore failed: {exc}",
+                "error": str(exc),
+                "restore_summary": None,
+            },
+        )
+    except Exception:
+        # Never surface the exception text: this path inserts uploaded rows, so
+        # a DBAPIError stringifies its bound parameters — including password
+        # hashes — into the page.
+        logger.exception("backup_restore_failed")
+        return templates.TemplateResponse(
+            "admin/backup.html",
+            {
+                "request": request,
+                "user": user,
+                "success": None,
+                "error": "Restore failed — see the server log for details.",
                 "restore_summary": None,
             },
         )
@@ -5734,10 +5779,17 @@ async def admin_search_config_post(
 
     elif action == "save_brave":
         updates = {
-            "search.brave.api_key": form.get("brave_api_key", "").strip(),
             "search.brave.endpoint": form.get("brave_endpoint", "").strip()
                 or "https://api.search.brave.com/res/v1/web/search",
         }
+        # Blank = keep current: the form no longer round-trips the key, since
+        # type="password" hides it on screen but not in page source, and this
+        # page is readable by read-only auditors.
+        brave_key = form.get("brave_api_key", "").strip()
+        if brave_key:
+            updates["search.brave.api_key"] = brave_key
+        elif form.get("clear_brave_api_key") == "on":
+            updates["search.brave.api_key"] = ""
         await save_search_config(db, updates)
         await crud.log_admin_action(
             db, user_id=user_id, action="search_config.save_brave",

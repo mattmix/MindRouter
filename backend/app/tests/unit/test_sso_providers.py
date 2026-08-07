@@ -796,7 +796,11 @@ def test_stdlib_logger_modules_use_no_structlog_kwargs():
     _LEVELS = {"debug", "info", "warning", "warn", "error", "critical", "exception"}
 
     offenders = []
-    for path in sorted((_APP_DIR / "dashboard").rglob("*.py")):
+    # Whole app, not just dashboard/: services/email_service.py also binds a
+    # stdlib logger, and 2.9.9 added a DLP alert-notification call into it.
+    for path in sorted(_APP_DIR.rglob("*.py")):
+        if "tests" in path.parts:
+            continue
         src = path.read_text()
         # Only modules that bind the STDLIB logger are at risk.
         if "logging.getLogger(" not in src:

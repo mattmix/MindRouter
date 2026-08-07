@@ -461,15 +461,32 @@ class TestSourceContracts:
             "(String(64), unique=True, nullable=True, index=True)" in src
         )
 
+    # services/dlp_worker.py was here until 2.9.9, when the DLP scanner stopped
+    # minting a key entirely (it dispatches straight to a backend now).  The
+    # module must therefore NOT appear in this list — see
+    # test_dlp_worker.TestCredentialRemoved.
     @pytest.mark.parametrize(
         "rel_path",
         [
             "dashboard/routes.py",
             "api/admin_api.py",
-            "services/dlp_worker.py",
         ],
     )
     def test_callers_store_both_columns(self, rel_path):
         src = (_APP_DIR / rel_path).read_text()
         assert "full_key, key_hash, key_prefix, key_sha256 = generate_api_key()" in src
         assert "key_sha256=key_sha256" in src
+
+    def test_every_generate_api_key_caller_is_covered(self):
+        """The parametrize list above must not silently drift out of date."""
+        callers = {
+            str(p.relative_to(_APP_DIR))
+            for p in _APP_DIR.rglob("*.py")
+            if "tests" not in p.parts and "generate_api_key()" in p.read_text()
+        }
+        callers.discard("security/api_keys.py")  # the definition itself
+        callers.discard("scripts/seed_dev_data.py")
+        assert callers == {"dashboard/routes.py", "api/admin_api.py"}, (
+            f"generate_api_key() callers changed: {sorted(callers)} — update the "
+            "parametrize list above so each new caller is checked."
+        )

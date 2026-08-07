@@ -51,6 +51,12 @@ _DEFAULTS: dict[str, Any] = {
     "retention.request_images_days": 180,
     "retention.responses_store_days": 30,
     "retention.conversations_days": 0,
+    # 0 = keep forever, matching conversations.  DLP alert rows carry masked
+    # snippets of flagged content, so they are governed data rather than an
+    # audit trail — but they were retained forever by omission until 2.9.9, and
+    # a nonzero default here would mass-delete existing history on the first
+    # cycle after deploy.  An admin opts in on the Retention page.
+    "retention.dlp_alerts_days": 0,
     "retention.cleanup_interval": 3600,
     "retention.batch_size": 500,
 }
@@ -976,6 +982,7 @@ async def get_app_db_counts(app_db: AsyncSession) -> dict[str, int]:
         Artifact,
         ChatConversation,
         ChatMessage,
+        DlpAlert,
         Request,
         Response,
         SchedulerDecision,
@@ -989,6 +996,7 @@ async def get_app_db_counts(app_db: AsyncSession) -> dict[str, int]:
         ("artifacts", Artifact),
         ("chat_conversations", ChatConversation),
         ("chat_messages", ChatMessage),
+        ("dlp_alerts", DlpAlert),
     ]:
         result = await app_db.execute(select(func.count()).select_from(model))
         counts[label] = result.scalar() or 0
@@ -1291,6 +1299,47 @@ async def cleanup_expired_conversations(
     return {"deleted": deleted_convs, "items_deleted": deleted_items}
 
 
+async def cleanup_expired_dlp_alerts(
+    app_db: AsyncSession, cutoff: datetime, batch_size: int
+) -> dict[str, int]:
+    """Delete DLP alerts scanned before the cutoff.
+
+    Delete-only, like responses_store: alerts have no archive table and no file
+    artifacts, and nothing references dlp_alerts, so no FK ordering is needed.
+    """
+    deleted = 0
+
+    while True:
+        result = await app_db.execute(
+            text(
+                "SELECT id FROM dlp_alerts WHERE scanned_at < :cutoff"
+                " ORDER BY id LIMIT :batch"
+            ),
+            {"cutoff": cutoff, "batch": batch_size},
+        )
+        rows = result.fetchall()
+        if not rows:
+            break
+
+        ids = [row.id for row in rows]
+        await app_db.execute(
+            text("DELETE FROM dlp_alerts WHERE id IN :ids").bindparams(
+                bindparam("ids", expanding=True)
+            ),
+            {"ids": ids},
+        )
+        deleted += len(rows)
+        await app_db.commit()
+
+        logger.info(
+            "retention_dlp_alerts_batch", deleted=len(rows), total=deleted,
+        )
+        if len(rows) < batch_size:
+            break
+
+    return {"deleted": deleted}
+
+
 async def delete_expired_requests_no_archive(
     app_db: AsyncSession, cutoff: datetime, batch_size: int
 ) -> dict[str, int]:
@@ -1349,6 +1398,7 @@ PURGE_CATEGORIES = (
     "request_images",
     "responses_store",
     "conversations",
+    "dlp_alerts",
 )
 
 
@@ -1425,6 +1475,11 @@ async def run_purge(category: str, older_than_days: int) -> dict[str, Any]:
     elif category == "conversations":
         async with get_async_db_context() as app_db:
             summary["result"] = await cleanup_expired_conversations(
+                app_db, cutoff, batch
+            )
+    elif category == "dlp_alerts":
+        async with get_async_db_context() as app_db:
+            summary["result"] = await cleanup_expired_dlp_alerts(
                 app_db, cutoff, batch
             )
 
@@ -1593,6 +1648,15 @@ async def run_retention_cycle() -> dict[str, Any]:
         cutoff = datetime.now(timezone.utc) - timedelta(days=conversations_days)
         async with get_async_db_context() as app_db:
             summary["conversations"] = await cleanup_expired_conversations(
+                app_db, cutoff, config.get("retention.batch_size", 5000)
+            )
+
+    # DLP alerts (delete-only, no archival — default 0 = never delete).
+    dlp_days = config.get("retention.dlp_alerts_days", 0)
+    if dlp_days > 0:
+        cutoff = datetime.now(timezone.utc) - timedelta(days=dlp_days)
+        async with get_async_db_context() as app_db:
+            summary["dlp_alerts"] = await cleanup_expired_dlp_alerts(
                 app_db, cutoff, config.get("retention.batch_size", 5000)
             )
 

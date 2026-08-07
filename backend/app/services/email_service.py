@@ -406,6 +406,53 @@ async def send_test_email(config: Dict[str, Any], recipient: str, base_url: str 
         return str(e)
 
 
+async def send_notification_email(
+    config: Dict[str, Any],
+    recipients: List[str],
+    subject: str,
+    body_html: str,
+    base_url: str = "",
+) -> int:
+    """Send one operational notification to a list of plain addresses.
+
+    For system-generated alerts (no per-user personalization, no EmailLog row) —
+    unlike ``send_bulk_email``, which drives admin-composed campaigns.  Opens a
+    single SMTP connection for the whole batch.  Returns the number of messages
+    successfully sent; never raises.
+    """
+    if not recipients:
+        return 0
+    if not is_smtp_configured(config):
+        logger.warning("notification email skipped: SMTP not configured")
+        return 0
+
+    # A recipient carrying CR/LF would inject extra SMTP headers.
+    clean = [r.strip() for r in recipients if r and "\n" not in r and "\r" not in r]
+    if not clean:
+        return 0
+
+    sent = 0
+    try:
+        smtp = await _open_smtp(config)
+        try:
+            body = _wrap_html(body_html, base_url=base_url)
+            for recipient in clean:
+                try:
+                    await _send_one(smtp, config["default_sender"], recipient, subject, body)
+                    sent += 1
+                except Exception as e:
+                    logger.warning("notification email failed for %s: %s", recipient, e)
+                await asyncio.sleep(0.05)  # throttle
+        finally:
+            try:
+                await smtp.quit()
+            except Exception:
+                pass
+    except Exception as e:
+        logger.error("notification email send error: %s", e)
+    return sent
+
+
 async def send_bulk_email(
     email_log_id: int,
     subject: str,

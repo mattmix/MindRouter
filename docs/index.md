@@ -1103,7 +1103,7 @@ The admin dashboard has a persistent sidebar with links to all admin pages:
 | Requests | `/admin/requests` | Pending API key, service key, and quota increase requests, approve/deny |
 | Audit Log | `/admin/audit` | Inference request history with filtering and search |
 | Admin Audit | `/admin/admin-audit` | Log of administrative actions -- who changed what, when, and from which IP |
-| DLP | `/admin/dlp` | Data-loss-prevention scanner configuration and alert review (filter by severity, scanner, text; acknowledge alerts) |
+| DLP | `/admin/dlp` | Data-loss-prevention scanner configuration and alert review (filter by severity, scanner, text; acknowledge alerts). Three scanners: regex/keyword (always available), GLiNER NER (local model, downloaded on first scan), and an optional LLM contextual scanner that dispatches directly to a backend serving the model you name — no API key, and scans create no request records and consume no quota. Alert rows store **masked** snippets, never the verbatim match; open the linked request for full context. Alerts are governed by the `DLP Alerts (days)` retention setting (default 0 = keep forever). Requires content capture: see `AUDIT_LOG_ENABLED` below. |
 | Conversations | `/admin/conversations` | Browse and search all user conversations, view messages, export |
 | Chat Config | `/admin/chat-config` | Configure core models, default model, system prompt, max_tokens, temperature, thinking mode, voice TTS/STT settings |
 | Voice Config | `/admin/voice-config` | Configure TTS/STT backend connections, available voices, and API quota token costs |
@@ -1114,7 +1114,7 @@ The admin dashboard has a persistent sidebar with links to all admin pages:
 | Blog Posts | `/admin/blog` | Blog/CMS management -- create, edit, publish, delete posts |
 | Email | `/admin/email` | Compose and send announcement email to selected users or groups, with recipient count preview and test send |
 | Data Retention | `/admin/retention` | Retention policies for request, conversation, telemetry, request-image, stored-response, and Conversations-API data; archive statistics; an archive browser; and a **Purge** tab for immediate per-category deletion older than a chosen cutoff (typed `PURGE` confirmation) |
-| Backup & Restore | `/admin/backup` | Export or restore MindRouter configuration (nodes, backends, users, groups, API keys, quotas, models, settings, blog posts) |
+| Backup & Restore | `/admin/backup` | Export or restore MindRouter configuration (nodes, backends, users, groups, API keys, quotas, models, settings, blog posts). The export is role-scoped since 2.9.9: full admins get a restorable dump including credential material, while read-only auditors get the same configuration with password hashes, API key hashes, and secret settings (SMTP password, provider API keys) nulled. A redacted file is marked in its metadata and is refused by Restore |
 | Branding | `/admin/branding` | Institution / organization name, logos (navbar / footer / login), favicon, and accessible light/dark accent colors (see [branding.md](branding.md)) |
 | Settings | `/admin/settings` | Site-wide settings: timezone, enforce `num_ctx` override |
 
@@ -2208,10 +2208,13 @@ Audit content capture IS environment-configurable:
 > storage is user-facing state, not audit, and is unaffected by these flags.
 
 **Never removed by retention or by a manual purge:** the `admin_audit_log`
-(retained permanently by design, as tamper-evidence), plus DLP alerts and the
-email log, which have no retention category. Purging is time-based per
-category — there is no per-user or per-conversation deletion. To remove one
-person's records, delete the user account (Admin → Users → the user →
+(retained permanently by design, as tamper-evidence) and the email log, which
+has no retention category. DLP alerts gained a retention category in 2.9.9
+(`DLP Alerts (days)` on the Retention page, and a `dlp_alerts` purge
+category); the default is `0` — keep forever — so existing alert history is
+never deleted without an admin opting in. Purging is time-based per category —
+there is no per-user or per-conversation deletion. To remove one person's
+records, delete the user account (Admin → Users → the user →
 Account Management).
 
 ### Web Search (Brave)

@@ -47,8 +47,17 @@
 
                                 <div class="mb-3">
                                     <label for="tts_api_key" class="form-label">API Key</label>
-                                    <input type="password" class="form-control" id="tts_api_key" name="tts_api_key" value="{{ tts_api_key or '' }}" placeholder="(optional)">
-                                    <div class="form-text">Only needed if the TTS service requires authentication.</div>
+                                    {# Never render the key into value=: type="password" masks it on
+                                       screen but View Source shows it, and this page is readable by
+                                       read-only auditors. Blank means "keep current". #}
+                                    <input type="password" class="form-control" id="tts_api_key" name="tts_api_key" placeholder="{% if tts_api_key %}(key configured){% else %}(optional){% endif %}">
+                                    <div class="form-text">Only needed if the TTS service requires authentication. Leave blank to keep the current value.</div>
+                                    {% if tts_api_key %}
+                                    <div class="form-check mt-1">
+                                        <input class="form-check-input" type="checkbox" id="clear_tts_api_key" name="clear_tts_api_key">
+                                        <label class="form-check-label small text-muted" for="clear_tts_api_key">Remove the stored key</label>
+                                    </div>
+                                    {% endif %}
                                 </div>
 
                                 <div class="mb-3">
@@ -88,8 +97,14 @@
 
                                 <div class="mb-3">
                                     <label for="stt_api_key" class="form-label">API Key</label>
-                                    <input type="password" class="form-control" id="stt_api_key" name="stt_api_key" value="{{ stt_api_key or '' }}" placeholder="(optional)">
-                                    <div class="form-text">Only needed if the STT service requires authentication.</div>
+                                    <input type="password" class="form-control" id="stt_api_key" name="stt_api_key" placeholder="{% if stt_api_key %}(key configured){% else %}(optional){% endif %}">
+                                    <div class="form-text">Only needed if the STT service requires authentication. Leave blank to keep the current value.</div>
+                                    {% if stt_api_key %}
+                                    <div class="form-check mt-1">
+                                        <input class="form-check-input" type="checkbox" id="clear_stt_api_key" name="clear_stt_api_key">
+                                        <label class="form-check-label small text-muted" for="clear_stt_api_key">Remove the stored key</label>
+                                    </div>
+                                    {% endif %}
                                 </div>
 
                                 <div class="mb-3">

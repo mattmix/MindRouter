@@ -1265,14 +1265,14 @@ client.conversations.delete(conv.id)               # delete state anytime</code>
                         <tr><td>Site Settings</td><td><code>/admin/settings</code></td><td>Global settings: display timezone, Ollama context length enforcement</td></tr>
                         <tr><td>Queue</td><td><code>/admin/queue</code></td><td>Live queue monitor &mdash; per-model capacity and per-user completion stats, polled from <code>GET /api/admin/queue/monitor</code></td></tr>
                         <tr><td>Energy</td><td><code>/admin/energy</code></td><td>Server and GPU power history per node and cluster-wide, with CSV/JSON export</td></tr>
-                        <tr><td>DLP</td><td><code>/admin/dlp</code></td><td>Data-loss-prevention scanner configuration and alert review (filter by severity, scanner, text; acknowledge alerts)</td></tr>
+                        <tr><td>DLP</td><td><code>/admin/dlp</code></td><td>Data-loss-prevention scanner configuration and alert review (filter by severity, scanner, text; acknowledge alerts). Alert rows store <em>masked</em> snippets, never the verbatim match &mdash; open the linked request for full context. Governed by the <code>DLP Alerts (days)</code> retention setting (default 0 = keep forever)</td></tr>
                         <tr><td>Voice Config</td><td><code>/admin/voice-config</code></td><td>Configure TTS/STT backend connections, available voices, and API quota token costs</td></tr>
                         <tr><td>OCR</td><td><code>/admin/ocr-config</code></td><td>OCR enable toggle, default model, prompts, DPI, page/file limits, chunk size and overlap, chunk concurrency, retries</td></tr>
                         <tr><td>Images</td><td><code>/admin/images-config</code></td><td>Image generation enable toggle, default model, default/allowed sizes, steps and guidance defaults, safety judge models and policy, per-user access grants</td></tr>
                         <tr><td>Video</td><td><code>/admin/video-config</code></td><td>Video generation enable toggle, default model, allowed sizes and durations, per-user concurrent job cap and storage cap, token cost per second, per-user access grants</td></tr>
                         <tr><td>Email</td><td><code>/admin/email</code></td><td>Compose and send announcement email to selected users or groups, with recipient count preview and test send</td></tr>
                         <tr><td>Data Retention</td><td><code>/admin/retention</code></td><td>Retention policies for request, conversation, telemetry, request-image, stored-response, and Conversations-API data; archive statistics; an archive browser; and a <strong>Purge</strong> tab for immediate, per-category deletion older than a chosen cutoff (typed <code>PURGE</code> confirmation)</td></tr>
-                        <tr><td>Backup &amp; Restore</td><td><code>/admin/backup</code></td><td>Export or restore MindRouter configuration (nodes, backends, users, groups, API keys, quotas, models, settings, blog posts)</td></tr>
+                        <tr><td>Backup &amp; Restore</td><td><code>/admin/backup</code></td><td>Export or restore MindRouter configuration (nodes, backends, users, groups, API keys, quotas, models, settings, blog posts). Role-scoped since 2.9.9 &mdash; full admins get a restorable dump; read-only auditors get the same configuration with password hashes, API key hashes, and secret settings nulled, and that redacted file cannot be used to restore</td></tr>
                     </tbody>
                 </table>
 
@@ -2559,13 +2559,13 @@ ARCHIVE_DATABASE_URL=mysql+pymysql://mindrouter_archive:&lt;secure-password&gt;@
                 <h3>Manual Purge</h3>
                 <p>The <strong>Purge</strong> tab (admin-only; hidden from read-only auditors) deletes one category of records older than a cutoff you choose, immediately. It runs the same archive-then-delete pipeline as the scheduled cycle — so with an archive database configured, requests and chat rows are still archived before they leave the live database, and file artifacts are removed along with their rows.</p>
                 <ul>
-                    <li><strong>Categories:</strong> requests, chat, telemetry, request images, stored responses (Responses API), and Conversations API.</li>
+                    <li><strong>Categories:</strong> requests, chat, telemetry, request images, stored responses (Responses API), Conversations API, and DLP alerts.</li>
                     <li><strong>Older than (days):</strong> <code>0</code> purges everything in that category.</li>
                     <li><strong>Confirmation:</strong> you must type <code>PURGE</code> in the confirmation dialog; this is re-checked server-side, so the dialog cannot be bypassed.</li>
                     <li><strong>Concurrency:</strong> a purge takes the same advisory lock as the retention cycle, so the two can never overlap. It runs in the background — progress appears in the server logs.</li>
                     <li>Both the purge and any policy change are recorded in the admin audit log.</li>
                 </ul>
-                <p><strong>Never removed by any purge or retention sweep:</strong> the <code>admin_audit_log</code> (retained permanently by design, as tamper-evidence), plus DLP alerts and the email log, which have no retention category. Purging is time-based per category — there is no per-user or per-conversation deletion; to remove one person's records, delete the user account (Admin → Users → the user → Account Management).</p>
+                <p><strong>Never removed by any purge or retention sweep:</strong> the <code>admin_audit_log</code> (retained permanently by design, as tamper-evidence) and the email log, which has no retention category. DLP alerts gained a retention category in 2.9.9 — <code>retention.dlp_alerts_days</code>, surfaced as <strong>DLP Alerts (days)</strong> on the Retention page, plus a <code>dlp_alerts</code> purge category. Its default is <code>0</code> (keep forever), so existing alert history is never deleted without an admin opting in. Purging is time-based per category — there is no per-user or per-conversation deletion; to remove one person's records, delete the user account (Admin → Users → the user → Account Management).</p>
 
                 <h3>Background Loop</h3>
                 <p>A background task (<code>_retention_loop</code>) runs continuously and executes a full retention cycle at the configured interval. Each cycle:</p>
@@ -3620,7 +3620,7 @@ WHERE ENCRYPTION_SCHEME = 1;</code></pre>
               +----------+----------+
               |          |          |
          Regex/KW    GLiNER      LLM Scanner
-         (~0.1ms)    (~10ms)    (~500ms, self-routed)
+         (~0.1ms)    (~10ms)   (~500ms, direct to backend)
               |          |          |
               +----------+----------+
                          |
@@ -3648,7 +3648,7 @@ WHERE ENCRYPTION_SCHEME = 1;</code></pre>
                         </tr>
                         <tr>
                             <td><strong>LLM Contextual</strong></td>
-                            <td>Dedicated LLM, self-routed via <code>/v1/chat/completions</code></td>
+                            <td>Dedicated LLM, dispatched directly to a healthy backend (no API key)</td>
                             <td>~500ms</td>
                             <td>FERPA violations, HIPAA/PHI context, CUI, semantic sensitive data</td>
                             <td>Contextual understanding &mdash; e.g. detecting that "John got a B+ in CS101" is a FERPA violation even though no single word is PII.</td>
@@ -3702,11 +3702,16 @@ WHERE ENCRYPTION_SCHEME = 1;</code></pre>
                     <li><strong>Severity rules</strong> &mdash; After adding a custom category, add a corresponding severity rule so the system knows how to classify findings in that category.</li>
                 </ul>
 
-                <h3>Self-Routing Loop Prevention</h3>
-                <p>When the LLM scanner is enabled, MindRouter automatically creates a dedicated internal API key.
-                   The LLM scanner uses this key to call <code>/v1/chat/completions</code> on itself. The DLP worker
-                   checks the API key on each incoming request &mdash; if it matches the internal key, the scan is skipped.
-                   This prevents an infinite scanning loop where the DLP scan triggers another DLP scan.</p>
+                <h3>How the LLM Scanner Dispatches</h3>
+                <p>The LLM scanner resolves the model you name against the live backend registry and posts
+                   directly to a healthy backend serving it. No API key is involved, and the scan never
+                   re-enters MindRouter's own API. Consequently a scan creates no request or response
+                   records, cannot re-store the content it just flagged, consumes no user's quota, and
+                   cannot trigger a scan of itself &mdash; so no loop-prevention bookkeeping is needed.</p>
+                <p class="text-muted"><small>Before 2.9.9 the scanner authenticated to MindRouter's own
+                   <code>/v1/chat/completions</code> using an auto-created internal API key whose raw value
+                   was stored in the configuration table. That key and the loop guard it required were
+                   removed; migration 071 revokes any key a previous version created.</small></p>
 
                 <h3>Alerts &amp; Acknowledgment</h3>
                 <p>All DLP findings are stored in the <code>dlp_alerts</code> table and displayed on the Admin &rarr; DLP page.
