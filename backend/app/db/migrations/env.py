@@ -38,8 +38,19 @@ from backend.app.settings import get_settings
 # Alembic Config object
 config = context.config
 
-# Interpret the config file for Python logging
-if config.config_file_name is not None:
+# Interpret the config file for Python logging.
+#
+# Skipped when invoked in-process (RUN_MIGRATIONS=1 at app startup): the
+# caller sets attributes["configure_logger"] = False, because
+# logging.config.fileConfig() defaults to disable_existing_loggers=True —
+# in-process it would disable every logger already created and replace
+# root's structlog handler with alembic's plain stderr handler at WARN,
+# for the remaining life of the process.  The alembic CLI still gets the
+# alembic.ini logging config as before.
+if (
+    config.config_file_name is not None
+    and config.attributes.get("configure_logger", True)
+):
     fileConfig(config.config_file_name)
 
 # Model metadata for autogenerate

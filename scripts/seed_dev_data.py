@@ -28,7 +28,7 @@ from backend.app.db.session import get_async_db_context
 from backend.app.db import crud
 from backend.app.db.models import UserRole
 from backend.app.security import hash_password, generate_api_key
-from backend.app.security.api_keys import hash_api_key
+from backend.app.security.api_keys import API_KEY_PREFIX, hash_api_key
 from backend.app.settings import get_settings
 
 
@@ -79,6 +79,21 @@ async def seed_users():
         admin_password = os.environ.get("ADMIN_PASSWORD", "admin123")
         admin_api_key = os.environ.get("ADMIN_API_KEY")
         mint_admin_key = os.environ.get("MINT_ADMIN_KEY", "").lower() in ("1", "true", "yes")
+
+        # A supplied key that doesn't carry the expected prefix is stored
+        # happily but can NEVER authenticate: verify_api_key() rejects on
+        # the prefix before any lookup.  Fail loudly instead of handing
+        # the operator a key that silently 401s forever.
+        if admin_api_key and not admin_api_key.startswith(API_KEY_PREFIX):
+            print(
+                f"ERROR: ADMIN_API_KEY must start with '{API_KEY_PREFIX}' — a key "
+                f"without that prefix is rejected by authentication before it is "
+                f"even looked up, so it would never work.\n"
+                f"       Either supply a '{API_KEY_PREFIX}...' key or unset "
+                f"ADMIN_API_KEY to have one minted for you.",
+                file=sys.stderr,
+            )
+            raise SystemExit(2)
 
         users_data = [
             {

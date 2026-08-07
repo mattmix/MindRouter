@@ -39,6 +39,9 @@ services:
       - SAML_SP_PRIVATE_KEY=${SAML_SP_PRIVATE_KEY:-}
       - SAML_AUTHN_REQUESTS_SIGNED=${SAML_AUTHN_REQUESTS_SIGNED:-false}
       - SAML_WANT_ASSERTIONS_ENCRYPTED=${SAML_WANT_ASSERTIONS_ENCRYPTED:-false}
+      # Opt-in `alembic upgrade head` at startup, for a fresh database.
+      # Run single-worker on first boot to avoid concurrent DDL.
+      - RUN_MIGRATIONS=${RUN_MIGRATIONS:-false}
       - AUDIT_LOG_ENABLED=${AUDIT_LOG_ENABLED:-true}
       - AUDIT_LOG_PROMPTS=${AUDIT_LOG_PROMPTS:-true}
       - AUDIT_LOG_RESPONSES=${AUDIT_LOG_RESPONSES:-true}

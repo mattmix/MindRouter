@@ -190,7 +190,7 @@ Environment overrides it honors:
 | Variable | Effect |
 |----------|--------|
 | `ADMIN_PASSWORD` | Password for the admin account. **Defaults to `admin123` if unset** — never accept that default on an internet-reachable host. |
-| `ADMIN_API_KEY` | Use this exact key instead of minting a random one. |
+| `ADMIN_API_KEY` | Use this exact key instead of minting a random one. **Must start with `mr2_`** — authentication rejects any other prefix before it even looks the key up, so a key without it would silently 401 forever. Since 2.9.8 the script refuses to run rather than store an unusable key. |
 | `MINT_ADMIN_KEY=1` | Issue an additional API key for an admin that already exists. |
 
 Two behaviors worth knowing before you run it:
@@ -203,6 +203,66 @@ Then, immediately:
 1. Log in at `https://your-domain/login` as `admin`.
 2. Change the password from the account page (do this even if you set a strong `ADMIN_PASSWORD`, since it was visible to your shell history and to anyone reading the deploy transcript).
 3. Set **Admin → Branding → Institution / organization name** if you plan to enable SSO — it is what the primary SSO button is labeled with.
+
+### Ordering on a truly fresh database
+
+The app reads the `backends` table during startup, so on an unmigrated
+database it exits before it can serve — and the `docker compose exec` you need
+in order to migrate then races the restart loop. Bring the schema up **before**
+the app serves traffic, either way round:
+
+```bash
+# Option A — migrate out of band (recommended, and required for multi-worker)
+docker compose -f docker-compose.prod.yml up -d mariadb
+docker compose -f docker-compose.prod.yml run --rm app alembic upgrade head
+docker compose -f docker-compose.prod.yml up -d
+
+# Option B — let the app migrate itself on first boot
+RUN_MIGRATIONS=1 docker compose -f docker-compose.prod.yml up -d
+```
+
+`RUN_MIGRATIONS=1` runs `alembic upgrade head` inside the app before anything
+reads the schema. Concurrent workers are serialized on a database advisory lock,
+so one applies the DDL and the others wait — but Option A remains the
+recommendation, because a migration failure there is a plain command failure
+instead of a container that won't start. Unset the flag once the schema is at
+head.
+
+Two upgrade notes: this flag was inert-and-then-fatal before 2.9.8, so don't
+carry a `RUN_MIGRATIONS=1` value forward from an old `.env` without re-reading
+this. And when you finish with it, **delete the line rather than blanking it** —
+`env_file` passes `RUN_MIGRATIONS=` through as an empty string, which fails
+boolean validation and stops the app from starting.
+
+### Making an SSO identity the admin
+
+SSO **cannot** produce the first admin on its own: newly provisioned SSO users
+land in a **non-admin** group chosen at provision time — the provider's
+`*_DEFAULT_GROUP` (default `other`), or for Azure the `jobTitle` mapping
+(`students`/`faculty`/`staff`, falling back to `AZURE_AD_DEFAULT_GROUP`) —
+nothing promotes a first user, and creating an API key to drive the admin API
+requires a principal that does not exist yet. Bootstrap the local `admin` above
+first, then use **one** of these:
+
+1. **Email pre-linking (cleanest — do it before your first SSO login).** As the
+   local `admin`, create an account (Admin → Users → Create Local User) whose
+   email exactly matches your institutional SSO email, and put it in the `admin`
+   group. Your first SSO login then *links to that existing account* and keeps
+   its group. Order matters: if you log in via SSO first, you get a separate
+   non-admin account instead, and you must use option 2.
+2. **Promote after the fact.** Log in via SSO once so the account is
+   provisioned, then sign in as the local `admin`, open Admin → Users → *your
+   SSO user* → Edit, and set **Group** to `admin`. It takes effect on your next
+   page load.
+
+Do **not** set a provider's `*_DEFAULT_GROUP` to `admin` as a shortcut: it makes
+**every** user from that provider an admin for as long as it is set, and the
+group is fixed at provision time, so accounts created meanwhile keep admin after
+you change it back. (For Azure it is not even reliable — the `jobTitle` mapping
+is consulted first and silently overrides `AZURE_AD_DEFAULT_GROUP`.)
+
+Keep the local `admin` account. It is your way back in if SSO breaks, and an
+SSO-provisioned account cannot be given a local password afterwards.
 
 ## Single sign-on (optional)
 

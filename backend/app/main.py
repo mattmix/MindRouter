@@ -16,7 +16,6 @@
 
 import asyncio
 import uuid
-from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import AsyncGenerator, Optional
 
@@ -346,20 +345,62 @@ _trend_warm_task: Optional[asyncio.Task] = None
 _dlp_task: Optional[asyncio.Task] = None
 
 
-@asynccontextmanager
 async def _run_migrations() -> None:
     """Run 'alembic upgrade head' at startup (opt-in via RUN_MIGRATIONS=1).
 
+    NOT an @asynccontextmanager: lifespan awaits this directly, and the
+    decorator turns it into an _AsyncGeneratorContextManager, which is
+    not awaitable — awaiting it raised TypeError before the body ever
+    ran, so RUN_MIGRATIONS=1 guaranteed the crash-loop it exists to
+    prevent (fixed 2.9.8).
+
     Alembic is synchronous, so run it in a worker thread. Fail fast on error —
     a clear migration failure beats a downstream "Table 'backends' doesn't
-    exist" crash-loop. NOTE: with multiple workers, run single-worker on first
-    boot (or migrate out-of-band) to avoid a concurrent-DDL race.
+    exist" crash-loop.
+
+    Concurrent uvicorn workers are serialized on a MariaDB advisory lock, so
+    only one applies the DDL and the rest wait and then find the schema at
+    head.  (MariaDB DDL is non-transactional, so overlapping upgrades can
+    leave partial state that needs manual cleanup.)
     """
+    _LOCK_NAME = "mindrouter_migrations"
+
     def _upgrade() -> None:
         from alembic import command
         from alembic.config import Config
+        from sqlalchemy import create_engine, text
 
-        command.upgrade(Config("alembic.ini"), "head")
+        from backend.app.settings import get_settings as _get_settings
+
+        cfg = Config("alembic.ini")
+        # env.py calls logging.config.fileConfig(), which defaults to
+        # disable_existing_loggers=True — in-process that would disable
+        # every logger already created and swap root's structlog handler
+        # for alembic's plain stderr handler, permanently.
+        cfg.attributes["configure_logger"] = False
+
+        # GET_LOCK is connection-scoped and alembic opens its own
+        # connection, so the lock lives on a separate sync connection held
+        # for the whole upgrade.  600s covers a long first migration; on
+        # timeout we proceed rather than block startup forever, since the
+        # likely cause is a peer that already finished.
+        engine = create_engine(_get_settings().database_url, pool_pre_ping=True)
+        try:
+            with engine.connect() as conn:
+                acquired = conn.execute(
+                    text("SELECT GET_LOCK(:n, 600)"), {"n": _LOCK_NAME}
+                ).scalar()
+                if acquired != 1:
+                    logger.warning("run_migrations_lock_timeout", lock=_LOCK_NAME)
+                try:
+                    command.upgrade(cfg, "head")
+                finally:
+                    if acquired == 1:
+                        conn.execute(
+                            text("SELECT RELEASE_LOCK(:n)"), {"n": _LOCK_NAME}
+                        )
+        finally:
+            engine.dispose()
 
     logger.info("run_migrations_start")
     await asyncio.to_thread(_upgrade)

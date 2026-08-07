@@ -72,7 +72,12 @@ def test_startup_migrations_are_opt_in():
     main = _read("backend/app/main.py")
     assert "async def _run_migrations()" in main
     assert "if get_settings().run_migrations:" in main
-    assert 'command.upgrade(Config("alembic.ini"), "head")' in main
+    # Upgrades to head from alembic.ini. (Asserted in parts rather than as
+    # one literal: 2.9.8 split the call out to suppress alembic's logging
+    # reconfiguration and to take an advisory lock — see
+    # test_bootstrap_paths.py for those contracts.)
+    assert 'Config("alembic.ini")' in main
+    assert 'command.upgrade(cfg, "head")' in main
     # runs before the registry reads the backends table
     assert main.index("if get_settings().run_migrations:") < main.index("await init_registry()")
 

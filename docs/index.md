@@ -2350,7 +2350,7 @@ The repository ships **two different Compose stacks**, and they get their config
 
 Consequences worth knowing:
 
-- `docker-compose.yml` currently forwards the database/Redis/secret basics, all SSO variables, `APP_BASE_URL`, `BRAVE_SEARCH_API_KEY`, OTel, MCP, `RESPONSES_API_ENABLED`, and the full `VIDEO_*` and `BRANDING_*` blocks. Settings **not** in that list -- `THINKING_OFF_BY_DEFAULT`, `FIELD_VALIDATION`, `RUN_MIGRATIONS`, the `SCHEDULER_*` and `BACKEND_*` tunables, the `RESPONSES_STORE_*` / `CONVERSATIONS_*` caps -- run at their `settings.py` defaults under that stack until a passthrough line is added.
+- `docker-compose.yml` currently forwards the database/Redis/secret basics, all SSO variables (including the `SAML_SP_*` key pair), `APP_BASE_URL`, `BRAVE_SEARCH_API_KEY`, OTel, MCP, `RESPONSES_API_ENABLED`, `RUN_MIGRATIONS`, the `AUDIT_LOG_*` capture toggles, and the full `VIDEO_*` and `BRANDING_*` blocks. Settings **not** in that list -- `THINKING_OFF_BY_DEFAULT`, `FIELD_VALIDATION`, the `SCHEDULER_*` and `BACKEND_*` tunables, the `RESPONSES_STORE_*` / `CONVERSATIONS_*` caps -- run at their `settings.py` defaults under that stack until a passthrough line is added.
 - `APP_BASE_URL` is forwarded with an **empty** default (`${APP_BASE_URL:-}`), so an unset value does not fall back to the `settings.py` placeholder; the app sees an empty string and derives URLs from request headers instead.
 - A bare `docker compose up -d` on a host deployed from the guide starts the *other* stack alongside the running one. Pass `-f docker-compose.prod.yml` on every command, or export `COMPOSE_FILE=docker-compose.prod.yml` in the deployment shell.
 - Secrets belong only in the host `.env` / `.env.prod`. Never commit them.

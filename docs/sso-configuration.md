@@ -408,6 +408,24 @@ All providers share the same semantics (`find_or_create_sso_user()` in
    - **Quota is seeded from the group** (`rpm_limit` copied from the group's
      defaults).
 
+> **SSO cannot create your first admin.** Every SSO account is provisioned into
+> a non-admin group chosen at provision time — `*_DEFAULT_GROUP` (default
+> `other`), or for Azure the `jobTitle` mapping falling back to
+> `AZURE_AD_DEFAULT_GROUP` — nothing promotes a first user, and creating the
+> API key needed to drive the admin API requires a principal that does not
+> exist yet. Bootstrap the local `admin` account first
+> ([DEPLOYMENT.md → Bootstrap the First Admin Account](../deploy/DEPLOYMENT.md)),
+> **then** either pre-create a local account whose email matches your SSO email
+> and put it in the `admin` group (your first SSO login links to it and keeps
+> the group — do this *before* logging in via SSO), or log in via SSO once and
+> promote that account from Admin → Users.
+>
+> Do **not** point a `*_DEFAULT_GROUP` at `admin` as a shortcut: it makes every
+> user from that provider an admin for as long as it is set, and the group is
+> fixed at provision time, so accounts created in the meantime stay admin after
+> you change it back. Keep the local `admin` account as your way back in — an
+> SSO-provisioned account can never be given a local password.
+
 Deactivated accounts (`is_active = false`) are refused at login regardless of
 provider.
 
