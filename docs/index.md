@@ -1000,7 +1000,7 @@ These endpoints are mounted under `/api/admin/`. Authorization is not uniform:
 | GET | `/api/admin/groups` | List all groups with user counts |
 | POST | `/api/admin/groups` | Create a new group |
 | PATCH | `/api/admin/groups/{id}` | Update group defaults (token budget, RPM, etc.) |
-| DELETE | `/api/admin/groups/{id}` | Delete a group (fails if users are assigned) |
+| DELETE | `/api/admin/groups/{id}` | Delete a group. Returns 409 `Cannot delete group with active users. Reassign users first.` while any user is still assigned — reassign every member to another group (Admin → Users, filter by the group, edit each user), then delete |
 
 #### API Key Management
 
@@ -1113,7 +1113,7 @@ The admin dashboard has a persistent sidebar with links to all admin pages:
 | Video | `/admin/video-config` | Video generation enable toggle, default model, allowed sizes and durations, per-user concurrent job cap and storage cap, token cost per second, per-user access grants |
 | Blog Posts | `/admin/blog` | Blog/CMS management -- create, edit, publish, delete posts |
 | Email | `/admin/email` | Compose and send announcement email to selected users or groups, with recipient count preview and test send |
-| Data Retention | `/admin/retention` | Retention policies for request, conversation, and telemetry data, plus archive statistics and an archive browser |
+| Data Retention | `/admin/retention` | Retention policies for request, conversation, telemetry, request-image, stored-response, and Conversations-API data; archive statistics; an archive browser; and a **Purge** tab for immediate per-category deletion older than a chosen cutoff (typed `PURGE` confirmation) |
 | Backup & Restore | `/admin/backup` | Export or restore MindRouter configuration (nodes, backends, users, groups, API keys, quotas, models, settings, blog posts) |
 | Branding | `/admin/branding` | Institution / organization name, logos (navbar / footer / login), favicon, and accessible light/dark accent colors (see [branding.md](branding.md)) |
 | Settings | `/admin/settings` | Site-wide settings: timezone, enforce `num_ctx` override |
@@ -1137,6 +1137,12 @@ These are dashboard routes (not API endpoints) that require an admin session coo
 | POST | `/admin/masquerade/{target_user_id}` | Start masquerading as a user (sets signed cookie, redirects to their dashboard) |
 | POST | `/admin/masquerade/stop` | Stop masquerading and return to admin view |
 | GET | `/admin/audit/export` | Export audit logs as CSV or JSON (filterable by user, model, status, date range) |
+| POST | `/admin/users/create` | Create a local account (username/password) from the admin Users page |
+| POST | `/admin/users/{id}/reset-password` | Set a new password on a local account (min 8 chars, confirmation required; SSO accounts rejected) |
+| POST | `/admin/users/{id}/set-active` | Activate or deactivate an account. Deactivation immediately disables the user's API keys **and** their existing dashboard sessions |
+| POST | `/admin/users/{id}/delete` | Hard-delete a user; requires typing the exact username to confirm (validated server-side). Self-deletion is blocked |
+| POST | `/admin/api-keys/{id}/revoke` | Revoke any user's API key (personal or service) |
+| POST | `/admin/retention` (`action=purge`) | Purge one retention category older than a cutoff; requires typing `PURGE` (validated server-side) |
 
 > **Export content option:** Both audit and conversation exports support an optional `include_content` checkbox. When enabled, exports include full prompt messages, request parameters, and response content. This is disabled by default; enabling it produces significantly larger export files.
 
@@ -1258,6 +1264,8 @@ Group settings are editable through the admin UI or API. The per-role environmen
 ### Change Password
 
 Users with local (non-SSO) accounts can change their password from the user dashboard (`/dashboard`). The form requires the current password, a new password (minimum 8 characters), and password confirmation. Accounts provisioned through SSO have no local password, so `POST /dashboard/change-password` returns early for them; there is no admin UI or API for adding a local password to an existing SSO account.
+
+An admin can set a new password on a **local** account without knowing the current one: `POST /api/admin/users/{id}/reset-password` (`{"new_password": "..."}`, minimum 8 characters), or **Reset Password** under Account Management on the user's admin detail page. SSO accounts are rejected — they have no local password to reset.
 
 ### API Key Lifecycle
 
@@ -2001,7 +2009,7 @@ All providers share the same semantics. On login, MindRouter looks up `(provider
 #### Scope and Limits
 
 - One IdP per provider type -- a single generic-OIDC issuer and a single SAML IdP.
-- SAML: SP-initiated only, no Single Logout (SLO), and no exposed encrypted-assertion configuration.
+- SAML: SP-initiated only, and no Single Logout (SLO). **The SP holds no key pair**, so it cannot decrypt encrypted assertions, cannot sign AuthnRequests, and its metadata carries no `<KeyDescriptor>`. **Assertion encryption must therefore be disabled for this SP at the IdP** — stock Shibboleth encrypts by default, and when it does the login fails *at the IdP* with nothing in MindRouter's logs (no response is ever POSTed). Key-less metadata is also awkward to register in a federation such as InCommon. **At an InCommon member institution, prefer CILogon (OIDC) over native SAML** — same campus IdP, no metadata exchange or SP key material. See [SSO configuration](sso-configuration.md).
 - No SCIM / directory sync and no group-claim-driven authorization. Group assignment comes from the provider's `*_DEFAULT_GROUP` (except Azure's `jobTitle` mapping); ongoing group and role changes are managed in MindRouter, not pushed from the IdP.
 
 ### Artifact Storage
@@ -2199,6 +2207,13 @@ Audit content capture IS environment-configurable:
 > capture also disables DLP scanning of that content. Web-chat conversation
 > storage is user-facing state, not audit, and is unaffected by these flags.
 
+**Never removed by retention or by a manual purge:** the `admin_audit_log`
+(retained permanently by design, as tamper-evidence), plus DLP alerts and the
+email log, which have no retention category. Purging is time-based per
+category — there is no per-user or per-conversation deletion. To remove one
+person's records, delete the user account (Admin → Users → the user →
+Account Management).
+
 ### Web Search (Brave)
 
 | Variable | Type | Default | Description |
@@ -2293,7 +2308,9 @@ The scheduler maintains an exponential moving average (EMA) of request latency (
 
 ### Soft Delete
 
-User accounts and blog posts use soft deletion -- a `deleted_at` timestamp is set rather than removing the row. Soft-deleted records are excluded from normal queries but retained in the database for audit purposes.
+Blog posts use soft deletion -- a `deleted_at` timestamp is set rather than removing the row, and soft-deleted posts are excluded from normal queries but retained in the database.
+
+**User accounts are hard-deleted**, not soft-deleted (`DELETE /api/admin/users/{id}`, or Account Management on the admin user detail page). The account and its keys, requests/responses, chats, images, videos, and stored responses are removed, including files on disk; blog posts, the email log, and admin-audit entries are kept with the user reference detached, so authorship history survives the deletion.
 
 ### Status Enums
 

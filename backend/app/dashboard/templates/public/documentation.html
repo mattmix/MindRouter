@@ -1132,7 +1132,7 @@ client.conversations.delete(conv.id)               # delete state anytime</code>
                         <tr><td>GET</td><td><code>/api/admin/groups</code></td><td>List all groups with user counts</td></tr>
                         <tr><td>POST</td><td><code>/api/admin/groups</code></td><td>Create a new group with quota defaults</td></tr>
                         <tr><td>PATCH</td><td><code>/api/admin/groups/{id}</code></td><td>Update group defaults (token budget, RPM, weight, etc.)</td></tr>
-                        <tr><td>DELETE</td><td><code>/api/admin/groups/{id}</code></td><td>Delete a group (fails if users are assigned)</td></tr>
+                        <tr><td>DELETE</td><td><code>/api/admin/groups/{id}</code></td><td>Delete a group. Returns 409 <code>Cannot delete group with active users. Reassign users first.</code> while any user is still assigned — reassign every member to another group (Admin &rarr; Users, filter by the group, edit each user) and the delete succeeds</td></tr>
                     </tbody>
                 </table>
 
@@ -1224,7 +1224,7 @@ client.conversations.delete(conv.id)               # delete state anytime</code>
                     </thead>
                     <tbody>
                         <tr><td>Dashboard</td><td><code>/dashboard</code></td><td>Token usage progress bar, active API keys, quota usage history, change password</td></tr>
-                        <tr><td>Change Password</td><td><code>POST /dashboard/change-password</code></td><td>Change the password of an account that has a local password. Requires current password, new password (min 8 chars), and confirmation. Accounts provisioned through <a href="#sso">SSO</a> have <strong>no local password</strong> and cannot use the local login form &mdash; this endpoint returns early for them. There is currently <strong>no admin UI or API for adding a local password to an existing SSO account</strong>; that would require creating a separate local account or direct database access.</td></tr>
+                        <tr><td>Change Password</td><td><code>POST /dashboard/change-password</code></td><td>Change the password of an account that has a local password. Requires current password, new password (min 8 chars), and confirmation. Accounts provisioned through <a href="#sso">SSO</a> have <strong>no local password</strong> and cannot use the local login form &mdash; this endpoint returns early for them. There is currently <strong>no admin UI or API for adding a local password to an existing SSO account</strong>; that would require creating a separate local account or direct database access. Since 2.9.4 an admin can set a new password on a <em>local</em> account without knowing the old one &mdash; <code>POST /api/admin/users/{id}/reset-password</code>, or <strong>Reset Password</strong> under Account Management on the user's admin detail page.</td></tr>
                         <tr><td>Request Quota</td><td><code>/dashboard/request-quota</code></td><td>Submit a quota increase request with justification</td></tr>
                         <tr><td>Key Created</td><td>(after creation)</td><td>Displays the full API key once (copy-to-clipboard)</td></tr>
                     </tbody>
@@ -1271,7 +1271,7 @@ client.conversations.delete(conv.id)               # delete state anytime</code>
                         <tr><td>Images</td><td><code>/admin/images-config</code></td><td>Image generation enable toggle, default model, default/allowed sizes, steps and guidance defaults, safety judge models and policy, per-user access grants</td></tr>
                         <tr><td>Video</td><td><code>/admin/video-config</code></td><td>Video generation enable toggle, default model, allowed sizes and durations, per-user concurrent job cap and storage cap, token cost per second, per-user access grants</td></tr>
                         <tr><td>Email</td><td><code>/admin/email</code></td><td>Compose and send announcement email to selected users or groups, with recipient count preview and test send</td></tr>
-                        <tr><td>Data Retention</td><td><code>/admin/retention</code></td><td>Retention policies for request, conversation, and telemetry data, plus archive statistics and an archive browser</td></tr>
+                        <tr><td>Data Retention</td><td><code>/admin/retention</code></td><td>Retention policies for request, conversation, telemetry, request-image, stored-response, and Conversations-API data; archive statistics; an archive browser; and a <strong>Purge</strong> tab for immediate, per-category deletion older than a chosen cutoff (typed <code>PURGE</code> confirmation)</td></tr>
                         <tr><td>Backup &amp; Restore</td><td><code>/admin/backup</code></td><td>Export or restore MindRouter configuration (nodes, backends, users, groups, API keys, quotas, models, settings, blog posts)</td></tr>
                     </tbody>
                 </table>
@@ -2481,7 +2481,7 @@ docker run --rm --gpus all nvidia/cuda:12.2.0-base-ubuntu22.04 nvidia-smi</code>
                 <p>MindRouter includes a two-tier data retention system that automatically archives and purges old data to keep the primary database lean while preserving historical records in a separate archive database.</p>
 
                 <h3>Architecture</h3>
-                <p>The retention system manages three data categories:</p>
+                <p>The retention system manages six data categories (the three tiered ones below, plus request images, stored responses, and Conversations API state, which are delete-only):</p>
                 <table class="table table-bordered">
                     <thead><tr><th>Category</th><th>Tables</th><th>Default Tier 1</th><th>Default Tier 2</th></tr></thead>
                     <tbody>
@@ -2547,13 +2547,25 @@ ARCHIVE_DATABASE_URL=mysql+pymysql://mindrouter_archive:&lt;secure-password&gt;@
                 <p>Setting a Tier 1 value to <code>0</code> disables retention for that category (data is kept indefinitely).</p>
 
                 <h3>Admin UI</h3>
-                <p>The <strong>Data Retention</strong> page in the admin dashboard (<code>/admin/retention</code>) provides three tabs:</p>
+                <p>The <strong>Data Retention</strong> page in the admin dashboard (<code>/admin/retention</code>) provides four tabs:</p>
                 <ul>
                     <li><strong>Policies</strong> — Edit all retention periods and advanced settings (cleanup interval, batch size). Shows current row counts in the app DB for each category.</li>
                     <li><strong>Archive Stats</strong> — Per-table row counts and disk usage in the archive database. Only available when the archive DB is configured.</li>
                     <li><strong>Browse Archive</strong> — Paginated view of archived records with filters for model and user. Supports browsing both archived requests and chat conversations.</li>
+                    <li><strong>Purge</strong> — Immediately delete one category of records older than a day cutoff, outside the scheduled cycle (see below).</li>
                 </ul>
                 <p>A <strong>Run Retention Now</strong> button triggers an immediate retention cycle without waiting for the next scheduled run.</p>
+
+                <h3>Manual Purge</h3>
+                <p>The <strong>Purge</strong> tab (admin-only; hidden from read-only auditors) deletes one category of records older than a cutoff you choose, immediately. It runs the same archive-then-delete pipeline as the scheduled cycle — so with an archive database configured, requests and chat rows are still archived before they leave the live database, and file artifacts are removed along with their rows.</p>
+                <ul>
+                    <li><strong>Categories:</strong> requests, chat, telemetry, request images, stored responses (Responses API), and Conversations API.</li>
+                    <li><strong>Older than (days):</strong> <code>0</code> purges everything in that category.</li>
+                    <li><strong>Confirmation:</strong> you must type <code>PURGE</code> in the confirmation dialog; this is re-checked server-side, so the dialog cannot be bypassed.</li>
+                    <li><strong>Concurrency:</strong> a purge takes the same advisory lock as the retention cycle, so the two can never overlap. It runs in the background — progress appears in the server logs.</li>
+                    <li>Both the purge and any policy change are recorded in the admin audit log.</li>
+                </ul>
+                <p><strong>Never removed by any purge or retention sweep:</strong> the <code>admin_audit_log</code> (retained permanently by design, as tamper-evidence), plus DLP alerts and the email log, which have no retention category. Purging is time-based per category — there is no per-user or per-conversation deletion; to remove one person's records, delete the user account (Admin → Users → the user → Account Management).</p>
 
                 <h3>Background Loop</h3>
                 <p>A background task (<code>_retention_loop</code>) runs continuously and executes a full retention cycle at the configured interval. Each cycle:</p>
@@ -3290,7 +3302,7 @@ Hello from MindRouter!</code></pre>
                 <h4>SSO Scope and Limits</h4>
                 <ul>
                     <li><strong>One IdP per provider type</strong> &mdash; a single generic-OIDC issuer and a single SAML IdP (use CILogon if you need many institutions behind one registration).</li>
-                    <li><strong>SAML</strong> &mdash; SP-initiated only, no Single Logout (SLO), and no exposed configuration for encrypted assertions.</li>
+                    <li><strong>SAML</strong> &mdash; SP-initiated only, and no Single Logout (SLO). <strong>The SP holds no key pair</strong>, so it cannot decrypt encrypted assertions, cannot sign AuthnRequests, and its metadata carries no <code>&lt;KeyDescriptor&gt;</code>. <strong>Assertion encryption must be disabled for this SP at the IdP</strong> &mdash; stock Shibboleth encrypts by default, and when it does the login fails <em>at the IdP</em> with nothing in MindRouter's logs. At an InCommon member institution, prefer <strong>CILogon (OIDC)</strong> over native SAML: same campus IdP, no metadata exchange or SP key material.</li>
                     <li><strong>No SCIM / directory sync and no group-claim-driven authorization</strong> &mdash; group assignment comes from the provider's <code>*_DEFAULT_GROUP</code> (Azure AD's <code>jobTitle</code> mapping is the one exception). Ongoing group and role changes are managed in MindRouter, not pushed from the IdP.</li>
                     <li><strong>Azure AD</strong> keeps its own legacy identity column (<code>users.azure_oid</code>) and its own driver; the other three providers share <code>users.sso_provider</code> / <code>users.sso_subject</code>.</li>
                 </ul>

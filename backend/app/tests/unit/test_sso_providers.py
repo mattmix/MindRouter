@@ -408,14 +408,36 @@ def test_jit_username_collision_gets_suffix(sso):
     crud = sso["_crud"]
     crud.get_user_by_sso_subject = AsyncMock(return_value=None)
     crud.get_user_by_email = AsyncMock(return_value=None)
-    crud.get_group_by_name = AsyncMock(return_value=None)
+    crud.get_group_by_name = AsyncMock(return_value=MagicMock(id=7, rpm_limit=30, name="other"))
     crud.get_user_by_username = AsyncMock(return_value=MagicMock())  # taken
     crud.create_user = AsyncMock(return_value=MagicMock())
+    crud.create_quota = AsyncMock()
     db = MagicMock(flush=AsyncMock())
 
     _run(sso["base"].find_or_create_sso_user(db, _profile(sso, subject="subject-42"), "other"))
     # Suffix = first 8 chars of the subject, mirroring the Azure driver.
     assert crud.create_user.await_args.kwargs["username"] == "newuser_subject-"
+
+
+def test_jit_refuses_when_default_group_missing(sso):
+    """A *_DEFAULT_GROUP naming a group that does not exist must refuse
+    cleanly, not pass group_id=None into a NOT NULL column (which
+    surfaced as a bare HTTP 500 at the IdP callback)."""
+    crud = sso["_crud"]
+    crud.get_user_by_sso_subject = AsyncMock(return_value=None)
+    crud.get_user_by_email = AsyncMock(return_value=None)
+    crud.get_group_by_name = AsyncMock(return_value=None)  # group absent
+    crud.get_user_by_username = AsyncMock(return_value=None)
+    crud.create_user = AsyncMock(return_value=MagicMock())
+    crud.create_quota = AsyncMock()
+    db = MagicMock(flush=AsyncMock())
+
+    result = _run(
+        sso["base"].find_or_create_sso_user(db, _profile(sso), "no-such-group")
+    )
+    assert result is None, "must refuse rather than provision without a group"
+    crud.create_user.assert_not_awaited()
+    crud.create_quota.assert_not_awaited()
 
 
 def test_jit_rejects_missing_email_or_subject(sso):
@@ -698,3 +720,115 @@ def test_dockerfile_installs_saml_deps():
     assert ".[saml]" in dockerfile
     pyproject = (_REPO / "pyproject.toml").read_text()
     assert "python3-saml" in pyproject
+
+
+# ── 2.9.6: OIDC callback hardening for external IdPs ─────────────
+
+
+def test_id_token_claims_decoded_without_verification(sso):
+    """ADFS-style IdPs return a userinfo document containing only `sub`;
+    email/name live in the id_token. We merge them so provisioning works."""
+    import base64
+    import json as _json
+
+    oidc = sso["oidc"]
+    payload = {"sub": "abc", "email": "person@utah.edu", "name": "A Person"}
+    raw = base64.urlsafe_b64encode(_json.dumps(payload).encode()).rstrip(b"=").decode()
+    token = f"header.{raw}.signature"
+
+    assert oidc._decode_id_token_claims(token) == payload
+
+
+def test_id_token_decode_is_total(sso):
+    """Malformed tokens must degrade to {}, never raise into the callback."""
+    oidc = sso["oidc"]
+    for bad in ("", "notatoken", "a.b", "a.!!!!.c", "a." + "x" * 7 + ".c"):
+        assert oidc._decode_id_token_claims(bad) == {}
+
+
+def test_email_verified_helper_matches_profile_rule(sso):
+    """The helper that picks the error message must agree with the rule
+    that actually rejects the profile — otherwise we'd report the wrong
+    cause. Absent claim is trusted; string forms must not fail open."""
+    oidc = sso["oidc"]
+    assert oidc._email_is_verified({}) is True
+    assert oidc._email_is_verified({"email_verified": True}) is True
+    assert oidc._email_is_verified({"email_verified": "true"}) is True
+    assert oidc._email_is_verified({"email_verified": "1"}) is True
+    assert oidc._email_is_verified({"email_verified": False}) is False
+    assert oidc._email_is_verified({"email_verified": "false"}) is False
+    assert oidc._email_is_verified({"email_verified": "0"}) is False
+
+
+def test_token_exchange_falls_back_to_basic_auth(sso):
+    """Okta and friends register clients as client_secret_basic by
+    default and reject credentials in the POST body."""
+    src = (_APP_DIR / "dashboard" / "sso" / "oidc.py").read_text()
+    assert "auth=(cfg.client_id, cfg.client_secret)" in src
+    # The failure log must carry the response body: OIDC error payloads
+    # hold the actionable detail a bare status code hides.
+    assert "body=token_response.text[:500]" in src
+    assert "basic_body=basic_response.text[:500]" in src
+
+
+def test_profile_failure_messages_are_distinct(sso):
+    """One generic 'missing a verified email' sent operators down the
+    wrong path; the three causes must be reported separately."""
+    src = (_APP_DIR / "dashboard" / "sso" / "oidc.py").read_text()
+    assert "missing+required+claims" in src
+    assert "not+verified+at+the+identity+provider" in src
+    assert "not+in+an+allowed+domain" in src
+
+
+def test_stdlib_logger_modules_use_no_structlog_kwargs():
+    """Modules bound to a stdlib logger must not use structlog-style
+    keyword fields: `logging.Logger.error(msg, key=...)` raises TypeError
+    at call time, which is worst inside an error-handling guard (2.9.6
+    regression — the Azure missing-group guard crashed instead of
+    returning, producing the very 500 it was written to prevent)."""
+    import ast
+
+    _STDLIB_OK = {"exc_info", "extra", "stack_info", "stacklevel"}
+    _LEVELS = {"debug", "info", "warning", "warn", "error", "critical", "exception"}
+
+    offenders = []
+    for path in sorted((_APP_DIR / "dashboard").rglob("*.py")):
+        src = path.read_text()
+        # Only modules that bind the STDLIB logger are at risk.
+        if "logging.getLogger(" not in src:
+            continue
+        if "from backend.app.logging_config import get_logger" in src:
+            continue
+        tree = ast.parse(src)
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            fn = node.func
+            if not (isinstance(fn, ast.Attribute) and fn.attr in _LEVELS):
+                continue
+            if not (isinstance(fn.value, ast.Name) and fn.value.id == "logger"):
+                continue
+            bad = [k.arg for k in node.keywords if k.arg not in _STDLIB_OK]
+            if bad:
+                offenders.append(
+                    f"{path.relative_to(_APP_DIR)}:{node.lineno} logger.{fn.attr}(..., {', '.join(bad)}=)"
+                )
+
+    assert not offenders, (
+        "structlog-style kwargs on a stdlib logger will raise TypeError when called: "
+        + "; ".join(offenders)
+    )
+
+
+def test_azure_missing_group_guard_logs_safely():
+    """The Azure guard's log line must survive a real stdlib logger."""
+    import logging
+
+    src = (_REPO / "backend/app/dashboard/azure_auth.py").read_text()
+    assert "sso_default_group_missing provider=azure" in src, "guard log line missing"
+    # Execute the exact %-format the guard uses.
+    logging.getLogger("test_azure_guard").error(
+        "sso_default_group_missing provider=azure group=%s"
+        " (create the group or fix AZURE_AD_DEFAULT_GROUP)",
+        "other",
+    )

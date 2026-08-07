@@ -280,6 +280,18 @@ async def find_or_create_azure_user(db: AsyncSession, profile: dict):
     if not group:
         settings = get_settings()
         group = await crud.get_group_by_name(db, settings.azure_ad_default_group)
+    if group is None:
+        # users.group_id is NOT NULL (migration 009): provisioning without
+        # a group would raise IntegrityError and surface as a bare 500 at
+        # the callback.  Refuse cleanly — the caller redirects to /login.
+        # NOTE: this module uses stdlib logging (%-style), not structlog —
+        # keyword fields here would raise TypeError inside the guard.
+        logger.error(
+            "sso_default_group_missing provider=azure group=%s"
+            " (create the group or fix AZURE_AD_DEFAULT_GROUP)",
+            get_settings().azure_ad_default_group,
+        )
+        return None
 
     role = _map_group_to_role(group_name)
 
@@ -297,7 +309,7 @@ async def find_or_create_azure_user(db: AsyncSession, profile: dict):
         password_hash=None,
         role=role,
         full_name=display_name,
-        group_id=group.id if group else None,
+        group_id=group.id,
         college=college,
         department=department,
     )
@@ -306,11 +318,10 @@ async def find_or_create_azure_user(db: AsyncSession, profile: dict):
     await db.flush()
 
     # Create quota from group defaults
-    if group:
-        await crud.create_quota(
-            db=db,
-            user_id=user.id,
-            rpm_limit=group.rpm_limit,
-        )
+    await crud.create_quota(
+        db=db,
+        user_id=user.id,
+        rpm_limit=group.rpm_limit,
+    )
 
     return user

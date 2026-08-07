@@ -10,7 +10,13 @@
         <div class="col-md-10 py-3">
             <div class="d-flex justify-content-between align-items-center mb-4">
                 <h1><i class="bi bi-shield-check"></i> Admin Audit Log</h1>
-                <span class="text-muted">{{ total }} action{{ 's' if total != 1 else '' }}</span>
+                <div class="d-flex align-items-center gap-3">
+                    <span class="text-muted">{{ total }} action{{ 's' if total != 1 else '' }}</span>
+                    <span class="badge bg-light text-dark border"
+                          title="The admin audit log is deliberately never purged, so it remains tamper-evident">
+                        <i class="bi bi-lock"></i> Retained permanently
+                    </span>
+                </div>
             </div>
 
             <!-- Filters -->

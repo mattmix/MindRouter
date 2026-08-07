@@ -213,11 +213,33 @@ python3-saml performs against that value. (It falls back to the request scheme
 and `Host` header only when `APP_BASE_URL` is blank, which is why you should
 keep it set behind the nginx proxy.)
 
+> **Native SAML limitations — read before choosing this path.** MindRouter's
+> SAML SP holds **no key pair**, which means it cannot decrypt encrypted
+> assertions, cannot sign AuthnRequests, and publishes metadata with no
+> `<KeyDescriptor>`. Practical consequences:
+>
+> - **Assertion encryption must be disabled for this SP.** Stock Shibboleth
+>   encrypts by default; if it stays on, the login fails at the IdP and no
+>   response is ever POSTed to MindRouter, so **nothing appears in MindRouter's
+>   logs** — check the IdP's logs for a key-resolution/encryption error.
+> - An IdP configured to **require signed AuthnRequests** will refuse the
+>   login. Stock Shibboleth does not require them.
+> - Key-less SP metadata is awkward to register in a federation such as
+>   **InCommon**, whose registrars generally expect a key.
+> - There is **no Single Logout (SLO)** endpoint.
+>
+> **If you are at an InCommon member institution, prefer CILogon over native
+> SAML** (see the CILogon section above). It reaches the same campus IdP
+> through the OIDC path, needs no metadata exchange or SP key material, and is
+> the configuration we recommend and test.
+
 **IdP-side setup:**
 
 1. Register MindRouter as an SP using the metadata served at
    `https://<your-mindrouter-host>/saml/metadata`.
-2. Release attributes: `mail`, `displayName`, `eduPersonPrincipalName` (or
+2. **Disable assertion encryption for this SP** (see the limitations note
+   above) and enable assertion signing.
+3. Release attributes: `mail`, `displayName`, `eduPersonPrincipalName` (or
    whatever you map via `SAML_ATTR_*` below). An email-format NameID also works
    as a fallback for the email (common with ADFS).
 
@@ -340,8 +362,11 @@ All providers share the same semantics (`find_or_create_sso_user()` in
      database.
    - Group = the provider's `*_DEFAULT_GROUP` setting (default `other`).
      **The group must already exist** — create it on the admin **Groups** page
-     first. If the named group does not exist, the user is created with no
-     group and **no quota row**, so keep this pointed at a real group.
+     first. If the named group does not exist, provisioning is refused: the
+     user is bounced to the login page with "Failed to provision user
+     account" and the server logs `sso_default_group_missing` naming the
+     group. Existing users are unaffected; fix the setting (or create the
+     group) and the login succeeds on retry.
    - **Quota is seeded from the group** (`rpm_limit` copied from the group's
      defaults).
 
@@ -439,8 +464,11 @@ repo do it differently — check which one you are on before editing anything:
   *other* stack alongside the running one.
 - **`APP_BASE_URL` must name this deployment's own public HTTPS origin** before
   any provider will work; redirect URIs and the SAML `Destination` check are
-  derived from it. It has a non-empty default, so a stale value produces a
-  plausible-looking config that fails only at the IdP. See the Security notes
+  derived from it. On the `docker-compose.yml` stack it is passed through as
+  `${APP_BASE_URL:-}`, so leaving it unset delivers an **empty string** to the
+  app — the code then falls back to the request scheme and `Host` header, which
+  behind a TLS-terminating proxy yields an `http://` SAML `Destination` and a
+  failed validation at the IdP. Set it explicitly. See the Security notes
   below.
 
 ---
@@ -490,8 +518,13 @@ Behavior enforced by the shared framework (see `sso/base.py`, `sso/oidc.py`,
   leaving it set matters. Point it at your public HTTPS origin.
 - **What the IdP must sign (SAML):** the **assertion**
   (`wantAssertionsSigned: true`). A message-level signature on the SAML
-  `<Response>` is **not** required (`wantMessagesSigned: false`), so IdP admins
-  only need to enable assertion signing.
+  `<Response>` is **not** required (`wantMessagesSigned: false`).
+- **What the IdP must NOT do (SAML): encrypt the assertion.** MindRouter's SP
+  has no key pair, so it cannot decrypt encrypted assertions and cannot sign
+  AuthnRequests — see the limitations note in the SAML section above. Stock
+  Shibboleth encrypts assertions by default, so this must be turned off for
+  the MindRouter SP or logins fail **at the IdP**, before any response reaches
+  MindRouter (meaning nothing appears in MindRouter's logs).
 - **`SECRET_KEY` underpins the SSO handshake.** The signed OIDC `state` cookie
   and the SAML `saml_request_id` cookie are both signed with it
   (`state_serializer()` in `sso/base.py`). A weak or leaked `SECRET_KEY`

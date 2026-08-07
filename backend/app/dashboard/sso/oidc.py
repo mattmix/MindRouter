@@ -192,43 +192,143 @@ async def handle_callback(
         "grant_type": "authorization_code",
     }
     async with httpx.AsyncClient(timeout=15.0) as client:
+        # Client authentication: POST body (client_secret_post) first, then
+        # HTTP Basic (client_secret_basic) — Okta and several other IdPs
+        # register clients as Basic by default and reject the body form.
         token_response = await client.post(meta["token_endpoint"], data=token_data)
         if token_response.status_code != 200:
-            logger.warning(
-                "oidc_token_exchange_failed",
-                provider=cfg.provider_id,
-                status=token_response.status_code,
+            basic_data = {k: v for k, v in token_data.items() if k != "client_secret"}
+            basic_response = await client.post(
+                meta["token_endpoint"],
+                data=basic_data,
+                auth=(cfg.client_id, cfg.client_secret),
             )
-            return RedirectResponse(
-                url="/login?error=Failed+to+exchange+authorization+code", status_code=302
-            )
+            if basic_response.status_code == 200:
+                logger.info(
+                    "oidc_token_exchange_basic_auth",
+                    provider=cfg.provider_id,
+                    note="IdP rejected client_secret_post; client_secret_basic succeeded",
+                )
+                token_response = basic_response
+            else:
+                # Log the body: OIDC error responses carry the actionable
+                # detail (invalid_client, redirect_uri mismatch, ...) that a
+                # bare status code hides.
+                logger.warning(
+                    "oidc_token_exchange_failed",
+                    provider=cfg.provider_id,
+                    status=token_response.status_code,
+                    body=token_response.text[:500],
+                    basic_status=basic_response.status_code,
+                    basic_body=basic_response.text[:500],
+                )
+                return RedirectResponse(
+                    url="/login?error=Failed+to+exchange+authorization+code", status_code=302
+                )
         tokens = token_response.json()
         access_token = tokens.get("access_token")
         if not access_token:
             return RedirectResponse(url="/login?error=No+access+token+received", status_code=302)
 
+        # Start from the id_token's claims: some IdPs (notably ADFS) return
+        # a minimal userinfo document containing only `sub`, with email and
+        # name available solely in the id_token.  Userinfo values win on
+        # conflict — it is the fresher source.
+        claims: dict = {}
+        id_token = tokens.get("id_token")
+        if id_token:
+            claims.update(_decode_id_token_claims(id_token))
+
         userinfo_endpoint = meta.get("userinfo_endpoint")
-        if not userinfo_endpoint:
+        if userinfo_endpoint:
+            userinfo_response = await client.get(
+                userinfo_endpoint, headers={"Authorization": f"Bearer {access_token}"}
+            )
+            if userinfo_response.status_code == 200:
+                claims.update(userinfo_response.json())
+            else:
+                # Always log the failure: continuing on id_token claims
+                # alone is a fallback, not a success, and silence here
+                # would misreport a broken userinfo endpoint as a
+                # scopes/claim-mapping problem further down.
+                logger.warning(
+                    "oidc_userinfo_failed",
+                    provider=cfg.provider_id,
+                    status=userinfo_response.status_code,
+                    body=userinfo_response.text[:500],
+                    continuing_on_id_token=bool(claims),
+                )
+                if not claims:
+                    return RedirectResponse(
+                        url="/login?error=Failed+to+fetch+user+profile", status_code=302
+                    )
+        elif not claims:
             return RedirectResponse(
                 url="/login?error=SSO+provider+has+no+userinfo+endpoint", status_code=302
             )
-        userinfo_response = await client.get(
-            userinfo_endpoint, headers={"Authorization": f"Bearer {access_token}"}
-        )
-        if userinfo_response.status_code != 200:
-            return RedirectResponse(
-                url="/login?error=Failed+to+fetch+user+profile", status_code=302
-            )
-        claims = userinfo_response.json()
 
     profile = profile_from_claims(cfg, claims)
     if profile is None:
+        # Distinguish the three ways this fails, so the operator knows
+        # whether to fix scopes, the IdP's email_verified, or the domain
+        # restriction — one generic message sent them down the wrong path.
+        if not claims.get("sub") or not claims.get("email"):
+            missing = [c for c in ("sub", "email") if not claims.get(c)]
+            logger.warning(
+                "oidc_profile_missing_claims",
+                provider=cfg.provider_id,
+                missing=missing,
+                claims_seen=sorted(claims.keys())[:20],
+            )
+            return RedirectResponse(
+                url="/login?error=SSO+profile+is+missing+required+claims+"
+                    "(check+the+scopes+requested+and+the+IdP+claim+mapping)",
+                status_code=302,
+            )
+        if not _email_is_verified(claims):
+            return RedirectResponse(
+                url="/login?error=SSO+account+email+is+not+verified+at+the+identity+provider",
+                status_code=302,
+            )
         return RedirectResponse(
-            url="/login?error=SSO+profile+is+missing+a+verified+email", status_code=302
+            url="/login?error=SSO+account+is+not+in+an+allowed+domain", status_code=302
         )
 
     user = await find_or_create_sso_user(db, profile, cfg.default_group)
     return await finish_login(db, user, clear_cookie=_state_cookie(cfg.provider_id))
+
+
+def _email_is_verified(claims: dict) -> bool:
+    """Mirror of the email_verified rule in profile_from_claims: the claim
+    is trusted when absent, and string forms ("false"/"0") must not fail
+    open."""
+    verified = claims.get("email_verified")
+    if verified is None:
+        return True
+    return str(verified).strip().lower() in ("true", "1")
+
+
+def _decode_id_token_claims(id_token: str) -> dict:
+    """Read the claim set out of an id_token WITHOUT verifying it.
+
+    Signature verification is deliberately not done here: these claims are
+    only a fallback source for `sub`/`email`/`name` when the IdP's userinfo
+    document is thin, and the token arrived over TLS directly from the
+    token endpoint in response to our own client-authenticated request —
+    the same trust basis as the userinfo response itself.  Nothing
+    security-relevant is decided from these values that isn't equally
+    decided from userinfo.
+    """
+    import base64
+    import json as _json
+
+    try:
+        payload = id_token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)  # restore base64url padding
+        decoded = _json.loads(base64.urlsafe_b64decode(payload))
+        return decoded if isinstance(decoded, dict) else {}
+    except Exception:
+        return {}
 
 
 def profile_from_claims(cfg: OIDCConfig, claims: dict) -> Optional[SSOProfile]:

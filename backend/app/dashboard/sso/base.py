@@ -117,6 +117,18 @@ async def find_or_create_sso_user(
         return user
 
     group = await crud.get_group_by_name(db, default_group_name)
+    if group is None:
+        # users.group_id is NOT NULL (migration 009), so provisioning with
+        # no group would raise IntegrityError and surface as a bare 500 at
+        # the IdP callback.  Refuse cleanly instead — finish_login turns
+        # None into a redirect with an error banner.
+        logger.error(
+            "sso_default_group_missing",
+            provider=profile.provider,
+            group=default_group_name,
+            note="create the group or fix the provider's default-group setting",
+        )
+        return None
 
     username = (profile.username_hint or email).split("@")[0]
     if await crud.get_user_by_username(db, username):
@@ -128,7 +140,7 @@ async def find_or_create_sso_user(
         email=email,
         password_hash=None,
         full_name=profile.display_name,
-        group_id=group.id if group else None,
+        group_id=group.id,
         department=profile.department,
         college=profile.college,
     )
@@ -137,15 +149,14 @@ async def find_or_create_sso_user(
     user.last_login_at = datetime.now(timezone.utc)
     await db.flush()
 
-    if group:
-        await crud.create_quota(db=db, user_id=user.id, rpm_limit=group.rpm_limit)
+    await crud.create_quota(db=db, user_id=user.id, rpm_limit=group.rpm_limit)
 
     logger.info(
         "sso_user_provisioned",
         provider=profile.provider,
         user_id=user.id,
         username=user.username,
-        group=group.name if group else None,
+        group=group.name,
     )
     return user
 

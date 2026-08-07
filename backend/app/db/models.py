@@ -230,7 +230,9 @@ class User(Base, TimestampMixin, SoftDeleteMixin):
     last_login_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
     # Group membership
-    group_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("groups.id"), nullable=True)
+    # NOT NULL in the database since migration 009 — the model must match,
+    # or code that assigns None looks safe and fails at INSERT time.
+    group_id: Mapped[int] = mapped_column(Integer, ForeignKey("groups.id"), nullable=False)
 
     # Profile fields
     college: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
