@@ -183,6 +183,12 @@ async def tts_speech(
     # The client and response are opened here rather than in an `async with`
     # so the connection can outlive this function and be consumed by the
     # streaming generator; the generator's `finally` closes both.
+    # Release the read transaction before dialing out. Every config lookup above
+    # issued a SELECT, so the session holds a pooled connection; without this it
+    # would stay checked out for the whole upstream call (up to
+    # TTS_TIMEOUT_SECONDS) and a wedged TTS service could exhaust the pool.
+    await db.commit()
+
     client = httpx.AsyncClient(timeout=TTS_TIMEOUT_SECONDS)
     upstream_url = f"{tts_url.rstrip('/')}/v1/audio/speech"
 
@@ -218,15 +224,26 @@ async def tts_speech(
         await _fail("TTS service is unavailable", f"TTS upstream unreachable: {e}")
 
     if resp.status_code != 200:
-        # Deliberately not logging the body: an upstream validation error can
-        # echo the caller's input text back, which is user content.
-        error_body = await resp.aread()
-        await resp.aclose()
-        await client.aclose()
+        # Reading the error body is itself network I/O on a streamed response —
+        # an upstream that dies after sending headers makes aread() raise. That
+        # must not skip the failure record, which is the whole point of this
+        # path, so the read is best-effort and cleanup happens regardless.
+        body_chars = -1
+        try:
+            body_chars = len(await resp.aread())
+        except Exception:
+            logger.warning("tts_error_body_read_failed", status=resp.status_code)
+        finally:
+            try:
+                await resp.aclose()
+            finally:
+                await client.aclose()
+        # Deliberately not logging the body itself: an upstream validation error
+        # can echo the caller's input text back, which is user content.
         logger.warning(
             "tts_api_proxy_error",
             status=resp.status_code,
-            body_chars=len(error_body),
+            body_chars=body_chars,
         )
         await _fail(
             "TTS service returned an error",

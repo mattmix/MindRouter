@@ -76,9 +76,25 @@ async def resolve_voice_backend(db, kind: str) -> Optional[VoiceTarget]:
 
     target = await _from_registry(kind)
     if target is not None:
+        # The Backend model has no credential column, so an operator-set
+        # voice.<kind>_api_key still applies to registered backends. Without
+        # this, registering a backend would silently stop sending a key that
+        # was previously being sent — an auth failure with no obvious cause.
+        target.api_key = await _config_api_key(db, kind)
         return target
 
     return await _from_config(db, kind)
+
+
+async def _config_api_key(db, kind: str) -> Optional[str]:
+    """Read the configured upstream credential for this voice kind."""
+    from backend.app.db import crud
+
+    try:
+        return await crud.get_config_json(db, _LEGACY_KEYS[kind][1], None)
+    except Exception:
+        logger.exception("voice_api_key_lookup_failed", kind=kind)
+        return None
 
 
 async def _from_registry(kind: str) -> Optional[VoiceTarget]:
@@ -110,7 +126,7 @@ async def _from_registry(kind: str) -> Optional[VoiceTarget]:
     backend = random.choice(available)
     return VoiceTarget(
         url=str(backend.url).rstrip("/"),
-        api_key=None,          # registered backends carry no per-service key today
+        api_key=None,          # filled in by the caller from app_config
         backend_id=backend.id,
         backend_name=backend.name,
     )

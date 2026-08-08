@@ -177,6 +177,19 @@ class TestRegistryPreferred:
         assert len(seen) > 1, "resolution must not pin to a single backend"
 
     @pytest.mark.asyncio
+    async def test_registry_target_still_carries_the_configured_api_key(self, vr):
+        """`backends` has no credential column, so an operator-set
+        voice.<kind>_api_key must keep applying once a backend is registered —
+        otherwise registering silently stops sending a key that was working."""
+        _install_registry([_backend()])
+        _install_crud(url="https://legacy.example.edu:8003", api_key="sk-upstream")
+
+        t = await vr.resolve_voice_backend(MagicMock(), "tts")
+
+        assert t.source == "registry"
+        assert t.api_key == "sk-upstream"
+
+    @pytest.mark.asyncio
     async def test_open_circuit_backends_are_skipped(self, vr):
         _install_registry([_backend()], available=False)
         _install_crud(url="https://legacy.example.edu:8003")
@@ -216,6 +229,52 @@ class TestConfigFallback:
         _install_crud(url=None)
 
         assert await vr.resolve_voice_backend(MagicMock(), "tts") is None
+
+
+class TestAllRequestPathsUseTheResolver:
+    """Every path that DIALS a voice service must go through the resolver.
+
+    Reading ``voice.tts_url`` / ``voice.stt_url`` directly bypasses health
+    checks, circuit breakers and failover — it is exactly the bypass this
+    change exists to remove. The admin Voice Config page is the one legitimate
+    reader: it loads those keys to render the form and writes them on save.
+    """
+
+    _APP = Path(__file__).resolve().parents[2]
+
+    def _request_path_sources(self):
+        return {
+            "api/voice_api.py": (self._APP / "api" / "voice_api.py").read_text(),
+            "dashboard/chat.py": (self._APP / "dashboard" / "chat.py").read_text(),
+        }
+
+    def test_request_paths_never_read_the_url_config_directly(self):
+        offenders = []
+        for name, src in self._request_path_sources().items():
+            for key in ('"voice.tts_url"', '"voice.stt_url"'):
+                if key in src:
+                    offenders.append(f"{name} reads {key}")
+        assert not offenders, (
+            "voice request paths must resolve through voice_router: " + "; ".join(offenders)
+        )
+
+    def test_request_paths_call_the_resolver(self):
+        for name, src in self._request_path_sources().items():
+            assert "resolve_voice_backend" in src, f"{name} does not use the resolver"
+
+    def test_admin_voice_config_page_still_manages_the_legacy_keys(self):
+        """The fallback must stay editable until it is retired."""
+        src = (self._APP / "dashboard" / "routes.py").read_text()
+        assert 'set_config(db, "voice.tts_url"' in src
+        assert 'set_config(db, "voice.stt_url"' in src
+
+    def test_voices_endpoint_uses_the_resolver(self):
+        src = (self._APP / "dashboard" / "routes.py").read_text()
+        i = src.index("/v1/audio/voices")
+        window = src[max(0, i - 1500):i]
+        assert "resolve_voice_backend" in window, (
+            "the voices lookup should ask a registered backend before the config URL"
+        )
 
 
 class TestContract:

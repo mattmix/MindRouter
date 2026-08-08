@@ -52,6 +52,27 @@ sys.modules.setdefault("backend.app.db.models", MagicMock())
 sys.modules.setdefault("backend.app.db.session", MagicMock())
 sys.modules.setdefault("backend.app.logging_config", MagicMock(get_logger=MagicMock(return_value=MagicMock())))
 
+# voice_api resolves its upstream through services/voice_router. Other unit
+# modules stub sys.modules["backend.app.services"] with a bare MagicMock, which
+# has no __path__, so a later `from backend.app.services.voice_router import ...`
+# raises ImportError purely as a function of collection order. Spec-load the REAL
+# resolver and register it under its own name so the lookup always succeeds and
+# these tests exercise production resolution logic rather than a stand-in.
+_services_dir = Path(__file__).resolve().parents[2] / "services"
+_vr_spec = importlib.util.spec_from_file_location(
+    "backend.app.services.voice_router", _services_dir / "voice_router.py",
+    submodule_search_locations=[],
+)
+_vr_mod = importlib.util.module_from_spec(_vr_spec)
+_vr_spec.loader.exec_module(_vr_mod)
+sys.modules["backend.app.services.voice_router"] = _vr_mod
+_services_pkg = sys.modules.get("backend.app.services")
+if _services_pkg is None or not hasattr(_services_pkg, "__path__"):
+    _services_pkg = MagicMock()
+    _services_pkg.__path__ = [str(_services_dir)]
+    sys.modules["backend.app.services"] = _services_pkg
+_services_pkg.voice_router = _vr_mod
+
 _voice_spec = importlib.util.spec_from_file_location(
     "voice_api", _api_dir / "voice_api.py",
     submodule_search_locations=[],

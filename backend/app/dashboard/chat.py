@@ -1209,9 +1209,13 @@ async def chat_tts_proxy(
     if not tts_enabled:
         raise HTTPException(status_code=404, detail="TTS is not enabled")
 
-    tts_url = await crud.get_config_json(db, "voice.tts_url", None)
-    if not tts_url:
+    # Prefer a registered TTS backend; fall back to the legacy config URL.
+    from backend.app.services.voice_router import resolve_voice_backend
+
+    tts_target = await resolve_voice_backend(db, "tts")
+    if tts_target is None:
         raise HTTPException(status_code=500, detail="TTS service URL not configured")
+    tts_url = tts_target.url
 
     body = await request.json()
     text = body.get("text", "").strip()
@@ -1233,12 +1237,11 @@ async def chat_tts_proxy(
         await crud.get_config_json(db, f"user.{user_id}.tts_speed", None)
         or await crud.get_config_json(db, "voice.tts_speed", 1.0)
     )
-    tts_api_key = await crud.get_config_json(db, "voice.tts_api_key", None)
     tts_provider = await crud.get_config_json(db, "voice.tts_provider", "kokoro")
 
     headers = {"Content-Type": "application/json"}
-    if tts_api_key:
-        headers["Authorization"] = f"Bearer {tts_api_key}"
+    if tts_target.api_key:
+        headers["Authorization"] = f"Bearer {tts_target.api_key}"
 
     payload = {
         "model": tts_provider,
@@ -1284,16 +1287,19 @@ async def chat_stt_proxy(
     if not stt_enabled:
         raise HTTPException(status_code=404, detail="STT is not enabled")
 
-    stt_url = await crud.get_config_json(db, "voice.stt_url", None)
-    if not stt_url:
+    # Prefer a registered STT backend; fall back to the legacy config URL.
+    from backend.app.services.voice_router import resolve_voice_backend
+
+    stt_target = await resolve_voice_backend(db, "stt")
+    if stt_target is None:
         raise HTTPException(status_code=500, detail="STT service URL not configured")
+    stt_url = stt_target.url
 
     stt_model = await crud.get_config_json(db, "voice.stt_model", "whisper-large-v3-turbo")
-    stt_api_key = await crud.get_config_json(db, "voice.stt_api_key", None)
 
     headers = {}
-    if stt_api_key:
-        headers["Authorization"] = f"Bearer {stt_api_key}"
+    if stt_target.api_key:
+        headers["Authorization"] = f"Bearer {stt_target.api_key}"
 
     audio_data = await file.read()
 

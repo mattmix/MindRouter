@@ -1340,8 +1340,12 @@ Node: gpu-server-1 (4x A100-80GB, sidecar at :8007)
 | **vLLM** (`vllm`) | `GET /health` (fallback: `GET /v1/models`) | `GET /v1/models` | `GET /metrics` (Prometheus format) |
 | **Diffusion** (`diffusion`) | `GET /health` (fallback: `GET /v1/models`) | `GET /v1/models` | `GET /metrics` when the server exposes it; otherwise sidecar GPU data only |
 | **Video** (`video`) | `GET /health` (fallback: `GET /v1/models`) | `GET /v1/models` | `GET /metrics` when the server exposes it; otherwise sidecar GPU data only |
+| **TTS** (`tts`) | `GET /health` (fallback: `GET /v1/models`) | `GET /v1/models` | Sidecar GPU data only |
+| **STT** (`stt`) | `GET /health` (fallback: `GET /v1/models`) | `GET /v1/models` | Sidecar GPU data only |
 
-The `BackendEngine` enum has exactly these four values. The registry builds an `OllamaAdapter` for `ollama` backends and a `VLLMAdapter` for every other engine, so diffusion and video servers must expose the same OpenAI-compatible `/health` and `/v1/models` surface as vLLM. Discovery then assigns modality by engine before looking at the model name: every model found on a `diffusion` backend becomes `IMAGE_GENERATION`, every model on a `video` backend becomes `VIDEO_GENERATION`.
+The `BackendEngine` enum has exactly these six values. The registry builds an `OllamaAdapter` for `ollama` backends and a `VLLMAdapter` for every other engine, so diffusion, video and voice servers must expose the same OpenAI-compatible `/health` and `/v1/models` surface as vLLM. Discovery then assigns modality by engine before looking at the model name: every model found on a `diffusion` backend becomes `IMAGE_GENERATION`, every model on a `video` backend becomes `VIDEO_GENERATION`, every model on a `tts` backend becomes `TTS`, and every model on an `stt` backend becomes `STT`.
+
+> **Registering a voice backend (2.9.10+).** `tts` and `stt` were added by migration 072 so speech services join the registry like any other backend, gaining health checks, circuit breakers and load balancing. Both reference implementations already speak the required surface — Kokoro advertises `kokoro`/`tts-1`/`tts-1-hd` and speaches advertises its whisper model — so no adapter work is needed. Register through the admin API (`POST /api/admin/backends/register` with `"engine": "tts"` or `"stt"`); the Admin → Backends form does not yet offer these engines. Until a voice backend is registered, requests continue to use the single `voice.tts_url` / `voice.stt_url` values on Admin → Voice Config, which remain the fallback. The upstream credential still comes from `voice.tts_api_key` / `voice.stt_api_key` — `backends` has no per-backend credential column.
 
 ### Registration
 

@@ -819,12 +819,21 @@ async def api_tts_voices(
     voices = []
     source = "config"
 
-    tts_url = await crud.get_config_json(db, "voice.tts_url", None)
-    if tts_url:
+    # Any TTS service can answer this — ask a registered backend if one is
+    # available, otherwise the legacy config URL.
+    from backend.app.services.voice_router import resolve_voice_backend
+
+    tts_target = await resolve_voice_backend(db, "tts")
+    if tts_target is not None:
         try:
             import httpx
+            headers = {}
+            if tts_target.api_key:
+                headers["Authorization"] = f"Bearer {tts_target.api_key}"
             async with httpx.AsyncClient(timeout=3.0) as client:
-                resp = await client.get(f"{tts_url.rstrip('/')}/v1/audio/voices")
+                resp = await client.get(
+                    f"{tts_target.url}/v1/audio/voices", headers=headers
+                )
                 resp.raise_for_status()
                 data = resp.json()
                 # Kokoro returns {"voices": [{"id": "af_heart", ...}, ...]}
