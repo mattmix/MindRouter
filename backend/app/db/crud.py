@@ -28,6 +28,7 @@ from sqlalchemy.orm import selectinload
 from backend.app.db.models import (
     AdminAuditLog,
     ApiKey,
+    App,
     ApiKeyStatus,
     AppConfig,
     Artifact,
@@ -689,6 +690,11 @@ async def delete_user(db: AsyncSession, user_id: int) -> bool:
         update(ServiceKeyRequest)
         .where(ServiceKeyRequest.reviewed_by == user_id)
         .values(reviewed_by=None)
+    )
+    # Deleting the admin who registered an app must not delete the app —
+    # it is shared infrastructure, and its users' keys depend on it.
+    await db.execute(
+        update(App).where(App.created_by == user_id).values(created_by=None)
     )
 
     # --- Inference audit trail (children of requests, then requests) ---

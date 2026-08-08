@@ -321,15 +321,64 @@ class ApiKey(Base, TimestampMixin):
     archived_completion_tokens: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0, server_default="0")
     archived_request_count: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0, server_default="0")
 
+    # --- Registered-app integration (migration 073) -----------------------
+    # Which registered app minted this key. NULL for hand-created keys.
+    # ATTRIBUTION ONLY — policy comes from the owning user's group, because a
+    # person who uses both an app and the API directly is one user with one
+    # token budget and one share of the scheduler.
+    app_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("apps.id"), nullable=True)
+    # Comma-separated scope allowlist. NULL means legacy: privilege is derived
+    # from the owner's group exactly as it always was. A non-NULL value can
+    # only REMOVE privilege, never add it — see security/scopes.py.
+    scopes: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    # Hidden from the owning user's own dashboard: they never chose this key
+    # and cannot meaningfully rotate it — the app does that for them.
+    hidden: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("0"))
+
     # Relationships
     user: Mapped["User"] = relationship("User", back_populates="api_keys", foreign_keys=[user_id])
     promoted_by_user: Mapped[Optional["User"]] = relationship("User", foreign_keys=[promoted_by])
     requests: Mapped[List["Request"]] = relationship("Request", back_populates="api_key")
+    app: Mapped[Optional["App"]] = relationship("App", foreign_keys=[app_id])
 
     __table_args__ = (
         Index("ix_api_keys_status_user", "status", "user_id"),
         Index("ix_api_keys_is_service", "is_service"),
+        Index("ix_api_keys_app_id", "app_id"),
     )
+
+
+class App(Base, TimestampMixin):
+    """A registered first-party application allowed to provision its own users.
+
+    Exists so an app can be granted a bounded credential instead of full
+    deployment admin, which was previously the only way to let something
+    create users and mint keys.
+    """
+
+    __tablename__ = "apps"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    slug: Mapped[str] = mapped_column(String(64), unique=True, nullable=False, index=True)
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="active", server_default="active")
+
+    # The Entra application (client) ID whose id_tokens this app may present.
+    # An incoming token's `aud` must equal this EXACTLY — accepting any token
+    # from the tenant would let every app in the tenant provision accounts.
+    entra_client_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    entra_tenant_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+
+    # Lifetime of the per-user keys this app mints. They are rotated silently
+    # on each user login, so this bounds how long a leaked key stays useful.
+    key_ttl_days: Mapped[int] = mapped_column(Integer, nullable=False, default=30, server_default="30")
+
+    # Detach-not-delete (migration 070): deleting an admin must not destroy
+    # the apps they registered.
+    created_by: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("users.id"), nullable=True)
+
+    creator: Mapped[Optional["User"]] = relationship("User", foreign_keys=[created_by])
 
 
 class Quota(Base, TimestampMixin):

@@ -158,17 +158,47 @@ async def require_role(
     return user
 
 
+def _deny_unscoped(api_key, scope: str) -> None:
+    """Reject a key whose scope list does not permit ``scope``.
+
+    Scopes intersect with the owner's group-derived privilege; they never
+    extend it. So a key minted by a registered app is not an admin credential
+    even when its owner is an administrator — administrators use first-party
+    apps too, and an app-minted key must not carry their admin rights.
+    """
+    from backend.app.security.scopes import key_has_scope
+
+    if not key_has_scope(api_key, scope):
+        logger.warning(
+            "api_key_scope_denied",
+            key_id=getattr(api_key, "id", None),
+            required_scope=scope,
+            app_id=getattr(api_key, "app_id", None),
+        )
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="This credential is not permitted to perform that action",
+        )
+
+
 def require_admin():
-    """Dependency that requires admin role (via group.is_admin)."""
+    """Dependency that requires admin role (via group.is_admin).
+
+    A scoped key must additionally carry the `admin` scope; group membership
+    alone is no longer sufficient for keys that declare a scope list.
+    """
     async def check_admin(
         auth_result: Tuple[User, ApiKey] = Depends(authenticate_request),
     ) -> User:
-        user, _ = auth_result
+        from backend.app.security.scopes import SCOPE_ADMIN
+
+        user, api_key = auth_result
         if not user.group or not user.group.is_admin:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Admin access required",
             )
+        _deny_unscoped(api_key, SCOPE_ADMIN)
         return user
     return check_admin
 
@@ -178,14 +208,47 @@ def require_admin_read():
     async def check_admin_read(
         auth_result: Tuple[User, ApiKey] = Depends(authenticate_request),
     ) -> User:
-        user, _ = auth_result
+        from backend.app.security.scopes import SCOPE_ADMIN
+
+        user, api_key = auth_result
         if not user.group or not user.group.has_admin_read:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Admin or auditor access required",
             )
+        _deny_unscoped(api_key, SCOPE_ADMIN)
         return user
     return check_admin_read
+
+
+def require_scope(scope: str):
+    """Dependency requiring a key to carry an explicit scope.
+
+    Unlike the admin dependencies this is not a narrowing of group privilege —
+    it gates capabilities that no group confers, such as an app provisioning
+    users on its own behalf. A legacy key (NULL scopes) does NOT satisfy it:
+    these capabilities are opt-in by construction, so an old broad key can
+    never drift into them.
+    """
+    async def check_scope(
+        auth_result: Tuple[User, ApiKey] = Depends(authenticate_request),
+    ) -> Tuple[User, ApiKey]:
+        from backend.app.security.scopes import is_scoped, key_has_scope
+
+        user, api_key = auth_result
+        if not is_scoped(api_key) or not key_has_scope(api_key, scope):
+            logger.warning(
+                "api_key_scope_denied",
+                key_id=getattr(api_key, "id", None),
+                required_scope=scope,
+                app_id=getattr(api_key, "app_id", None),
+            )
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="This credential is not permitted to perform that action",
+            )
+        return user, api_key
+    return check_scope
 
 
 def require_admin_or_session():
@@ -215,8 +278,18 @@ def require_admin_or_session():
             # Shared post-verify gate: rejects revoked, expired, and
             # inactive/deleted-user keys — same checks as authenticate_request
             if api_key and api_key_rejection_reason(api_key) is None:
+                from backend.app.security.scopes import SCOPE_ADMIN, key_has_scope
+
                 user = api_key.user
-                if user.group and user.group.is_admin:
+                # Same rule as require_admin: a scoped key must also carry the
+                # admin scope. Without this check here, an app-minted key
+                # belonging to an administrator would still reach every admin
+                # endpoint that uses this dependency.
+                if (
+                    user.group
+                    and user.group.is_admin
+                    and key_has_scope(api_key, SCOPE_ADMIN)
+                ):
                     return user
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
@@ -267,8 +340,17 @@ def require_admin_read_or_session():
             # Shared post-verify gate: rejects revoked, expired, and
             # inactive/deleted-user keys — same checks as authenticate_request
             if api_key and api_key_rejection_reason(api_key) is None:
+                from backend.app.security.scopes import SCOPE_ADMIN, key_has_scope
+
                 user = api_key.user
-                if user.group and user.group.has_admin_read:
+                # A scoped key must also carry the admin scope — see
+                # require_admin. Session cookies below carry no scope, so the
+                # check applies only on the API-key path.
+                if (
+                    user.group
+                    and user.group.has_admin_read
+                    and key_has_scope(api_key, SCOPE_ADMIN)
+                ):
                     return user
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
@@ -306,14 +388,17 @@ class AuthenticatedUser:
         self,
         auth_result: Tuple[User, ApiKey] = Depends(authenticate_request),
     ) -> User:
-        user, _ = auth_result
+        user, _api_key = auth_result
 
         if self.require_admin_flag:
+            from backend.app.security.scopes import SCOPE_ADMIN
+
             if not user.group or not user.group.is_admin:
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
                     detail="Admin access required",
                 )
+            _deny_unscoped(_api_key, SCOPE_ADMIN)
         elif self.require_role:
             # Legacy role hierarchy check (kept for backward compat)
             role_hierarchy = {
