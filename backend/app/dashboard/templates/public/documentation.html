@@ -604,7 +604,7 @@ max_tokens    = min(requested_max_tokens, remaining, 65536)</code></pre>
                     </thead>
                     <tbody>
                         <tr><td><code>prompt</code></td><td>string</td><td><em>required</em></td><td>Text description of the desired image</td></tr>
-                        <tr><td><code>model</code></td><td>string</td><td>server default</td><td>Diffusion model name; omit to use the administrator-configured default. Image models appear in <code>GET /v1/models</code>.</td></tr>
+                        <tr><td><code>model</code></td><td>string</td><td>server default</td><td>Diffusion model name; omit to use the administrator-configured default. Image models are listed by <code>GET /v1/images/models</code> &mdash; they are deliberately absent from <code>GET /v1/models</code>, which lists only text models.</td></tr>
                         <tr><td><code>n</code></td><td>int</td><td>1</td><td>Number of images (capped server-side, default cap 4)</td></tr>
                         <tr><td><code>size</code></td><td>string</td><td>"1024x1024"</td><td>Must be on the administrator-configured allow-list (e.g. <code>512x512</code>, <code>768x768</code>, <code>1024x1024</code>, <code>1024x768</code>, <code>768x1024</code>); disallowed sizes return 400 listing the permitted values</td></tr>
                         <tr><td><code>response_format</code></td><td>string</td><td>"url"</td><td><code>"b64_json"</code> or <code>"url"</code>. <strong>Always use <code>b64_json</code> from API clients</strong> &mdash; see <em>Retrieving the image</em> below.</td></tr>

@@ -162,13 +162,19 @@ async def cluster_status() -> Dict[str, Any]:
         all_backends = []
         healthy_backends = []
 
-    # Collect model names from healthy backends
+    # Collect model names from healthy backends. This endpoint is
+    # unauthenticated, so it publishes the same text-only catalog as
+    # /v1/models — image, video and speech models are not advertised here
+    # either (see models_api.CATALOG_MODALITIES).
+    from backend.app.api.models_api import is_catalog_model
+
     models = set()
     for backend in healthy_backends:
         try:
             backend_models = await registry.get_backend_models(backend.id)
             for m in backend_models:
-                models.add(m.name)
+                if is_catalog_model(m):
+                    models.add(m.name)
         except Exception:
             pass
 

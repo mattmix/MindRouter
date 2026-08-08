@@ -23,8 +23,36 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from backend.app.api.auth import authenticate_request
 from backend.app.core.canonical_schemas import CanonicalModelInfo, CanonicalModelList
 from backend.app.core.telemetry.registry import get_registry
-from backend.app.db.models import ApiKey, User
+from backend.app.db.models import ApiKey, Modality, User
 from backend.app.db.session import get_async_db
+
+# Modalities published in the general model catalogs (/v1/models, /api/tags,
+# /anthropic/v1/models). These are the text-in/text-out families an OpenAI
+# client can actually send to a chat, completion, embedding or rerank endpoint.
+#
+# Image, video and speech models are deliberately excluded: advertising them
+# here presents them as LLMs, and a client that picks one for
+# /v1/chat/completions gets a confusing failure. Each has its own discovery
+# endpoint — /v1/images/models, /videos/models, /v1/audio/voices.
+CATALOG_MODALITIES = frozenset({
+    Modality.CHAT,
+    Modality.COMPLETION,
+    Modality.MULTIMODAL,
+    Modality.EMBEDDING,
+    Modality.RERANKING,
+})
+
+
+def is_catalog_model(model) -> bool:
+    """True when a model belongs in the general LLM catalog.
+
+    Unknown/NULL modality is treated as catalogable so a discovery gap can
+    never silently hide a working chat model.
+    """
+    modality = getattr(model, "modality", None)
+    if modality is None:
+        return True
+    return modality in CATALOG_MODALITIES
 
 router = APIRouter(tags=["models"])
 
@@ -52,6 +80,8 @@ async def list_models(
         backend_models = await registry.get_backend_models(backend.id)
 
         for model in backend_models:
+            if not is_catalog_model(model):
+                continue
             if model.name not in model_data:
                 model_data[model.name] = {
                     "backends": [],

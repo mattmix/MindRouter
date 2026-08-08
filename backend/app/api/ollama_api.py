@@ -183,9 +183,16 @@ async def ollama_tags(
     models = []
     seen_models = set()
 
+    from backend.app.api.models_api import is_catalog_model
+
     for backend in backends:
         backend_models = await registry.get_backend_models(backend.id)
         for model in backend_models:
+            # Image/video/speech models are not LLMs; listing them here would
+            # offer them to an Ollama client as chat models. See
+            # models_api.CATALOG_MODALITIES.
+            if not is_catalog_model(model):
+                continue
             if model.name not in seen_models:
                 seen_models.add(model.name)
                 models.append({

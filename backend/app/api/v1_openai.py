@@ -869,6 +869,39 @@ async def _prepare_image_canonical(
     return canonical
 
 
+@router.get("/images/models")
+async def list_image_models(
+    db: AsyncSession = Depends(get_async_db),
+    auth: Tuple[User, ApiKey] = Depends(authenticate_request),
+):
+    """Image-model discovery.
+
+    Image models are deliberately absent from /v1/models, which lists only
+    text-in/text-out models — advertising a diffusion model there presents it
+    as an LLM, and a client that picks one for /v1/chat/completions gets a
+    confusing failure. This is the equivalent of /videos/models for images.
+    """
+    registry = get_registry()
+    names: List[str] = []
+    seen = set()
+    for backend in await registry.get_all_backends():
+        if getattr(backend, "engine", None) != BackendEngine.DIFFUSION:
+            continue
+        for model in await registry.get_backend_models(backend.id):
+            name = getattr(model, "name", None)
+            if name and name not in seen:
+                seen.add(name)
+                names.append(name)
+
+    return {
+        "object": "list",
+        "data": [
+            {"id": n, "object": "model", "owned_by": "mindrouter"}
+            for n in sorted(names)
+        ],
+    }
+
+
 @router.post("/images/generations")
 async def image_generations(
     request: Request,
