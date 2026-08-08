@@ -358,6 +358,52 @@ class TestRecordAndComplete:
 # ================================================================
 
 
+def _make_tts_upstream(status=200, chunks=(b"ID3AUDIO",), send_exc=None,
+                       error_body=b'{"detail":"upstream exploded"}'):
+    """Mock httpx client for the TTS proxy.
+
+    The endpoint calls build_request/send(stream=True) and consumes the
+    response with aiter_bytes, so the mock must model that shape rather than
+    the older `client.stream()` context manager.
+    """
+    resp = MagicMock()
+    resp.status_code = status
+    resp.aread = AsyncMock(return_value=error_body)
+    resp.aclose = AsyncMock()
+
+    async def _aiter_bytes(_n=4096):
+        for c in chunks:
+            yield c
+
+    resp.aiter_bytes = _aiter_bytes
+
+    client = MagicMock()
+    client.build_request = MagicMock(return_value=MagicMock(name="request"))
+    client.send = AsyncMock(side_effect=send_exc) if send_exc else AsyncMock(return_value=resp)
+    client.aclose = AsyncMock()
+    return client, resp
+
+
+_TTS_CONFIG = {
+    ("voice.tts_enabled", False): True,
+    ("voice.tts_url", None): "http://tts-service:8080",
+    ("voice.tts_api_key", None): None,
+    ("voice_api.tts_quota_tokens", 100): 100,
+}
+
+
+def _tts_patches(client, config_map=None, record=None):
+    cfg = config_map or _TTS_CONFIG
+    return (
+        patch.object(_voice_mod, "_check_quota", new_callable=AsyncMock),
+        patch.object(_crud, "get_config_json", new_callable=AsyncMock,
+                     side_effect=lambda db, key, default: cfg.get((key, default), default)),
+        patch.object(_voice_mod, "_record_and_complete",
+                     new=(record or AsyncMock())),
+        patch.object(_voice_mod.httpx, "AsyncClient", return_value=client),
+    )
+
+
 class TestTTSSpeechEndpoint:
     """Test the POST /v1/audio/speech endpoint."""
 
@@ -370,21 +416,14 @@ class TestTTSSpeechEndpoint:
         http_request = _make_mock_request()
         body = TTSRequest(input="Hello world")
 
-        config_map = {
-            ("voice.tts_enabled", False): True,
-            ("voice.tts_url", None): "http://tts-service:8080",
-            ("voice.tts_api_key", None): None,
-            ("voice_api.tts_quota_tokens", 100): 100,
-        }
-
-        with patch.object(_voice_mod, "_check_quota", new_callable=AsyncMock), \
-             patch.object(_crud, "get_config_json", new_callable=AsyncMock,
-                          side_effect=lambda db, key, default: config_map.get((key, default), default)), \
-             patch.object(_voice_mod, "_record_and_complete", new_callable=AsyncMock):
-
+        client, _ = _make_tts_upstream(status=200)
+        p1, p2, p3, p4 = _tts_patches(client)
+        with p1, p2, p3, p4:
             result = await tts_speech(http_request, body, db=db, auth=(user, api_key))
-
             assert result.media_type == "audio/mpeg"
+            # the audio actually flows through
+            got = b"".join([c async for c in result.body_iterator])
+            assert got == b"ID3AUDIO"
 
     @pytest.mark.asyncio
     async def test_tts_empty_text_rejected(self):
@@ -451,18 +490,9 @@ class TestTTSSpeechEndpoint:
         http_request = _make_mock_request()
         body = TTSRequest(input="Hello", response_format="wav")
 
-        config_map = {
-            ("voice.tts_enabled", False): True,
-            ("voice.tts_url", None): "http://tts:8080",
-            ("voice.tts_api_key", None): None,
-            ("voice_api.tts_quota_tokens", 100): 100,
-        }
-
-        with patch.object(_voice_mod, "_check_quota", new_callable=AsyncMock), \
-             patch.object(_crud, "get_config_json", new_callable=AsyncMock,
-                          side_effect=lambda db, key, default: config_map.get((key, default), default)), \
-             patch.object(_voice_mod, "_record_and_complete", new_callable=AsyncMock):
-
+        client, _ = _make_tts_upstream(status=200)
+        p1, p2, p3, p4 = _tts_patches(client)
+        with p1, p2, p3, p4:
             result = await tts_speech(http_request, body, db=db, auth=(user, api_key))
             assert result.media_type == "audio/wav"
 
@@ -475,18 +505,17 @@ class TestTTSSpeechEndpoint:
         http_request = _make_mock_request()
         body = TTSRequest(input="Hello", model="custom-tts")
 
-        config_map = {
+        cfg = {
             ("voice.tts_enabled", False): True,
             ("voice.tts_url", None): "http://tts:8080",
             ("voice.tts_api_key", None): None,
             ("voice_api.tts_quota_tokens", 100): 150,
         }
 
-        with patch.object(_voice_mod, "_check_quota", new_callable=AsyncMock), \
-             patch.object(_crud, "get_config_json", new_callable=AsyncMock,
-                          side_effect=lambda db, key, default: config_map.get((key, default), default)), \
-             patch.object(_voice_mod, "_record_and_complete", new_callable=AsyncMock) as record:
-
+        client, _ = _make_tts_upstream(status=200)
+        record = AsyncMock()
+        p1, p2, p3, p4 = _tts_patches(client, config_map=cfg, record=record)
+        with p1, p2, p3, p4:
             await tts_speech(http_request, body, db=db, auth=(user, api_key))
 
             record.assert_called_once()
@@ -504,22 +533,129 @@ class TestTTSSpeechEndpoint:
         http_request = _make_mock_request()
         body = TTSRequest(input="Hello")
 
-        config_map = {
+        cfg = {
             ("voice.tts_enabled", False): True,
             ("voice.tts_url", None): "http://tts:8080",
             ("voice.tts_api_key", None): "sk-upstream-key",
             ("voice_api.tts_quota_tokens", 100): 100,
         }
 
-        # We test that the function completes without error — the actual
-        # upstream call is in the generator, not executed until iterated.
-        with patch.object(_voice_mod, "_check_quota", new_callable=AsyncMock), \
-             patch.object(_crud, "get_config_json", new_callable=AsyncMock,
-                          side_effect=lambda db, key, default: config_map.get((key, default), default)), \
-             patch.object(_voice_mod, "_record_and_complete", new_callable=AsyncMock):
+        client, _ = _make_tts_upstream(status=200)
+        p1, p2, p3, p4 = _tts_patches(client, config_map=cfg)
+        with p1, p2, p3, p4:
+            await tts_speech(http_request, body, db=db, auth=(user, api_key))
 
+        # Actually assert the header reached the upstream request. The previous
+        # version of this test asserted only `result is not None`, which passed
+        # whether or not the key was forwarded.
+        client.build_request.assert_called_once()
+        headers = client.build_request.call_args[1]["headers"]
+        assert headers["Authorization"] == "Bearer sk-upstream-key"
+
+
+class TestTTSUpstreamFailureIsNotBilled:
+    """A failing TTS upstream must produce an error, not a billed empty 200.
+
+    Before this fix the request was recorded COMPLETED and the caller charged
+    the full token cost *before* the upstream was ever contacted — the response
+    generator dialled out lazily, so a dead service returned HTTP 200 with a
+    zero-byte body while the audit trail showed success. Every test in this
+    class fails against that implementation.
+    """
+
+    async def _run(self, **upstream):
+        db = _make_mock_db()
+        user = _make_mock_user()
+        api_key = _make_mock_api_key()
+        http_request = _make_mock_request()
+        body = TTSRequest(input="Hello world")
+
+        client, _ = _make_tts_upstream(**upstream)
+        record = AsyncMock()
+        p1, p2, p3, p4 = _tts_patches(client, record=record)
+        with p1, p2, p3, p4:
+            with pytest.raises(HTTPException) as exc:
+                await tts_speech(http_request, body, db=db, auth=(user, api_key))
+        return exc.value, record, client
+
+    @pytest.mark.asyncio
+    async def test_upstream_500_raises_502_and_bills_nothing(self):
+        exc, record, _ = await self._run(status=500)
+        assert exc.status_code == 502
+        record.assert_called_once()
+        kw = record.call_args[1]
+        assert kw["token_cost"] == 0, "a failed TTS request must not be billed"
+        assert kw["error_message"], "the failure must be recorded, not silent"
+
+    @pytest.mark.asyncio
+    async def test_upstream_timeout_raises_502_and_bills_nothing(self):
+        exc, record, _ = await self._run(send_exc=_voice_mod.httpx.TimeoutException("timed out"))
+        assert exc.status_code == 502
+        assert record.call_args[1]["token_cost"] == 0
+
+    @pytest.mark.asyncio
+    async def test_upstream_unreachable_raises_502_and_bills_nothing(self):
+        exc, record, _ = await self._run(send_exc=ConnectionError("no route to host"))
+        assert exc.status_code == 502
+        assert record.call_args[1]["token_cost"] == 0
+
+    @pytest.mark.asyncio
+    async def test_failure_closes_the_upstream_connection(self):
+        """No leaked httpx client/response on the error path."""
+        _, _, client = await self._run(status=503)
+        client.aclose.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_error_body_is_not_logged(self):
+        """An upstream validation error can echo the caller's input text back,
+        so the body must never reach the logs."""
+        db = _make_mock_db()
+        user = _make_mock_user()
+        api_key = _make_mock_api_key()
+        http_request = _make_mock_request()
+        body = TTSRequest(input="my social security number is 123-45-6789")
+
+        sentinel = b'{"detail":"bad input: my social security number is 123-45-6789"}'
+        client, _ = _make_tts_upstream(status=422, error_body=sentinel)
+
+        emitted = []
+
+        class _CaptureLogger:
+            def warning(self, event, **kw):
+                emitted.append((event, kw))
+
+            def __getattr__(self, _):
+                return lambda *a, **k: None
+
+        p1, p2, p3, p4 = _tts_patches(client)
+        with p1, p2, p3, p4, patch.object(_voice_mod, "logger", _CaptureLogger()):
+            with pytest.raises(HTTPException):
+                await tts_speech(http_request, body, db=db, auth=(user, api_key))
+
+        assert emitted, "the upstream error should still be logged"
+        blob = repr(emitted)
+        assert "123-45-6789" not in blob, f"caller content leaked into logs: {blob}"
+
+    @pytest.mark.asyncio
+    async def test_success_still_bills_exactly_once(self):
+        """The fix must not double-charge or skip charging on the happy path."""
+        db = _make_mock_db()
+        user = _make_mock_user()
+        api_key = _make_mock_api_key()
+        http_request = _make_mock_request()
+        body = TTSRequest(input="Hello")
+
+        client, _ = _make_tts_upstream(status=200)
+        record = AsyncMock()
+        p1, p2, p3, p4 = _tts_patches(client, record=record)
+        with p1, p2, p3, p4:
             result = await tts_speech(http_request, body, db=db, auth=(user, api_key))
-            assert result is not None  # StreamingResponse returned
+            b"".join([c async for c in result.body_iterator])
+
+        record.assert_called_once()
+        kw = record.call_args[1]
+        assert kw["token_cost"] == 100
+        assert kw.get("error_message") is None
 
 
 # ================================================================

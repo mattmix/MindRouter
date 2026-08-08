@@ -33,6 +33,11 @@ logger = get_logger(__name__)
 router = APIRouter(prefix="/v1/audio", tags=["voice"])
 
 
+# Upstream TTS call budget.  Covers connect through the last audio chunk;
+# httpx applies it per-operation, so it is a gap timeout while streaming.
+TTS_TIMEOUT_SECONDS = 30.0
+
+
 class TTSRequest(BaseModel):
     """OpenAI-compatible TTS request body."""
 
@@ -166,25 +171,66 @@ async def tts_speech(
 
     token_cost = await crud.get_config_json(db, "voice_api.tts_quota_tokens", 100)
 
-    async def stream_audio():
-        try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                async with client.stream(
-                    "POST",
-                    f"{tts_url.rstrip('/')}/v1/audio/speech",
-                    json=payload,
-                    headers=headers,
-                ) as resp:
-                    if resp.status_code != 200:
-                        error_body = await resp.aread()
-                        logger.warning("tts_api_proxy_error", status=resp.status_code, body=error_body[:500])
-                        return
-                    async for chunk in resp.aiter_bytes(4096):
-                        yield chunk
-        except Exception as e:
-            logger.warning("tts_api_proxy_error", error=str(e))
+    # Send the upstream request and inspect its status BEFORE returning a
+    # response body or charging quota.  Previously the request was recorded
+    # completed (and the caller billed) before the generator ran at all, so a
+    # dead TTS service produced HTTP 200 with zero bytes, billed in full, and
+    # left nothing in the audit trail to show it had failed.
+    #
+    # The client and response are opened here rather than in an `async with`
+    # so the connection can outlive this function and be consumed by the
+    # streaming generator; the generator's `finally` closes both.
+    client = httpx.AsyncClient(timeout=TTS_TIMEOUT_SECONDS)
+    upstream_url = f"{tts_url.rstrip('/')}/v1/audio/speech"
 
-    # Record the request and deduct quota
+    async def _fail(detail: str, error_message: str, status_code: int = 502):
+        """Record the failure, charge nothing, and surface a real error.
+
+        The audit write must never mask the upstream failure — if it throws we
+        still raise, so the caller gets 502 rather than an unbound-variable 500.
+        """
+        try:
+            await _record_and_complete(
+                db, user, api_key, request,
+                endpoint="/v1/audio/speech",
+                modality=Modality.TTS,
+                token_cost=0,
+                model=body.model,
+                error_message=error_message,
+            )
+        except Exception:
+            logger.exception("tts_failure_record_failed")
+        raise HTTPException(status_code=status_code, detail=detail)
+
+    try:
+        upstream_req = client.build_request("POST", upstream_url, json=payload, headers=headers)
+        resp = await client.send(upstream_req, stream=True)
+    except httpx.TimeoutException:
+        await client.aclose()
+        logger.warning("tts_api_proxy_timeout", timeout_s=TTS_TIMEOUT_SECONDS)
+        await _fail("TTS service timed out", "TTS upstream timed out")
+    except Exception as e:
+        await client.aclose()
+        logger.warning("tts_api_proxy_error", error=str(e))
+        await _fail("TTS service is unavailable", f"TTS upstream unreachable: {e}")
+
+    if resp.status_code != 200:
+        # Deliberately not logging the body: an upstream validation error can
+        # echo the caller's input text back, which is user content.
+        error_body = await resp.aread()
+        await resp.aclose()
+        await client.aclose()
+        logger.warning(
+            "tts_api_proxy_error",
+            status=resp.status_code,
+            body_chars=len(error_body),
+        )
+        await _fail(
+            "TTS service returned an error",
+            f"TTS upstream returned HTTP {resp.status_code}",
+        )
+
+    # Upstream accepted the request — only now is it correct to bill.
     await _record_and_complete(
         db, user, api_key, request,
         endpoint="/v1/audio/speech",
@@ -192,6 +238,19 @@ async def tts_speech(
         token_cost=token_cost,
         model=body.model,
     )
+
+    async def stream_audio():
+        try:
+            async for chunk in resp.aiter_bytes(4096):
+                yield chunk
+        except Exception as e:
+            # The upstream accepted and we already billed; a break here means
+            # the caller gets truncated audio.  Nothing to un-charge, but it
+            # must not be silent.
+            logger.warning("tts_stream_interrupted", error=str(e))
+        finally:
+            await resp.aclose()
+            await client.aclose()
 
     content_type = "audio/mpeg" if body.response_format == "mp3" else f"audio/{body.response_format}"
     return StreamingResponse(stream_audio(), media_type=content_type)
