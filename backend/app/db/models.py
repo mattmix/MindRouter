@@ -66,6 +66,11 @@ class BackendEngine(str, PyEnum):
     VLLM = "vllm"
     DIFFUSION = "diffusion"
     VIDEO = "video"
+    # Voice services (migration 072). Both speak an OpenAI-compatible
+    # /health + /v1/models, so they reuse VLLMAdapter for health and
+    # discovery exactly as `diffusion` does.
+    TTS = "tts"
+    STT = "stt"
 
 
 class BackendStatus(str, PyEnum):

@@ -1148,6 +1148,13 @@ class BackendRegistry:
                                     modality = Modality.IMAGE_GENERATION
                                 elif backend.engine == BackendEngine.VIDEO:
                                     modality = Modality.VIDEO_GENERATION
+                                elif backend.engine == BackendEngine.TTS:
+                                    # Kokoro advertises tts-1 / tts-1-hd / kokoro
+                                    modality = Modality.TTS
+                                elif backend.engine == BackendEngine.STT:
+                                    # speaches advertises the whisper CT2 model
+                                    # and silero_vad_v5
+                                    modality = Modality.STT
                                 elif model_info.supports_multimodal:
                                     modality = Modality.MULTIMODAL
                                 elif "rerank" in model_info.name.lower():

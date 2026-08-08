@@ -151,15 +151,18 @@ async def tts_speech(
     if not tts_enabled:
         raise HTTPException(status_code=404, detail="TTS is not enabled")
 
-    tts_url = await crud.get_config_json(db, "voice.tts_url", None)
-    if not tts_url:
-        raise HTTPException(status_code=500, detail="TTS service URL not configured")
+    # Prefer a registered, health-checked TTS backend; fall back to the legacy
+    # single-URL config when none is registered (see services/voice_router.py).
+    from backend.app.services.voice_router import resolve_voice_backend
 
-    tts_api_key = await crud.get_config_json(db, "voice.tts_api_key", None)
+    target = await resolve_voice_backend(db, "tts")
+    if target is None:
+        raise HTTPException(status_code=500, detail="TTS service URL not configured")
+    tts_url = target.url
 
     headers = {"Content-Type": "application/json"}
-    if tts_api_key:
-        headers["Authorization"] = f"Bearer {tts_api_key}"
+    if target.api_key:
+        headers["Authorization"] = f"Bearer {target.api_key}"
 
     payload = {
         "model": body.model,
@@ -308,9 +311,14 @@ async def stt_transcriptions(
     if not stt_enabled:
         raise HTTPException(status_code=404, detail="STT is not enabled")
 
-    stt_url = await crud.get_config_json(db, "voice.stt_url", None)
-    if not stt_url:
+    # Prefer a registered, health-checked STT backend; fall back to the legacy
+    # single-URL config when none is registered (see services/voice_router.py).
+    from backend.app.services.voice_router import resolve_voice_backend
+
+    target = await resolve_voice_backend(db, "stt")
+    if target is None:
         raise HTTPException(status_code=500, detail="STT service URL not configured")
+    stt_url = target.url
 
     stt_default = await crud.get_config_json(db, "voice.stt_model", "whisper-large-v3-turbo")
     requested_model = (model or "").strip()
@@ -318,11 +326,10 @@ async def stt_transcriptions(
         stt_model = stt_default
     else:
         stt_model = requested_model
-    stt_api_key = await crud.get_config_json(db, "voice.stt_api_key", None)
 
     headers = {}
-    if stt_api_key:
-        headers["Authorization"] = f"Bearer {stt_api_key}"
+    if target.api_key:
+        headers["Authorization"] = f"Bearer {target.api_key}"
 
     audio_data = await file.read()
 
