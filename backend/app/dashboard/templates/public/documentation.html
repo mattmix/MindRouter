@@ -92,6 +92,7 @@
                 <li class="nav-item"><a class="nav-link" href="#app-config">AppConfig System</a></li>
                 <li class="nav-item"><a class="nav-link" href="#configuration-reference">Configuration Reference</a></li>
                 <li class="nav-item"><a class="nav-link ms-3" href="#sso">&mdash; Single Sign-On (SSO)</a></li>
+                <li class="nav-item"><a class="nav-link ms-3" href="#registered-apps">&mdash; Registered Applications</a></li>
                 <li class="nav-item"><a class="nav-link" href="#status-enums">Status Enums Reference</a></li>
                 <li class="nav-item"><a class="nav-link" href="#security-hardening">Security Hardening</a></li>
                 <li class="nav-item"><a class="nav-link" href="#data-loss-prevention">Data Loss Prevention</a></li>
@@ -3517,6 +3518,76 @@ Hello from MindRouter!</code></pre>
                         <tr><td><code>DEFAULT_TOKENIZER</code></td><td>str</td><td><code>cl100k_base</code></td><td>Default tokenizer encoding</td></tr>
                     </tbody>
                 </table>
+            </section>
+
+            <hr>
+
+            <!-- Registered Applications -->
+            <section id="registered-apps">
+                <h2>Registered Applications</h2>
+                <p>A <strong>registered application</strong> is a first-party app that signs its own users in against the same Entra tenant as MindRouter and then obtains a MindRouter API key <em>for each of those users</em>, server-side. Its users get per-user quota, telemetry and scheduler fair share, because they are ordinary MindRouter users &mdash; they simply never sign in here.</p>
+                <p>This exists because the alternatives are worse: one shared key collapses every user into a single identity (no per-person quota, no attribution, and one leak exposes everyone), asking users to paste their own key defeats single sign-on, and giving the app an admin key hands it the ability to read every stored prompt and revoke anyone&rsquo;s key. <strong>The complete integrator and administrator guide is <a href="https://github.com/ui-insight/MindRouter/blob/main/docs/registered-apps.md">docs/registered-apps.md</a>.</strong></p>
+
+                <h4>How it works</h4>
+                <p>The app calls one endpoint, once per user sign-in, with <strong>two</strong> credentials. Neither is sufficient alone: without the user token the app credential would be an unbounded impersonation primitive, and without the app credential a stolen token would be usable by anyone. Requiring both means a compromised app can only reach users who are actually signing in to it.</p>
+                <pre><code>POST /api/apps/{slug}/sessions
+X-API-Key: &lt;the application&rsquo;s provisioning credential&gt;
+Content-Type: application/json
+
+{"id_token": "&lt;the user&rsquo;s Entra id_token&gt;"}</code></pre>
+                <p>The response carries that user&rsquo;s inference key. Hold it server-side; it is a credential for a real user account and must never reach a browser.</p>
+                <pre><code>{
+  "api_key": "mr2_...",      // null when an existing key was reused
+  "key_prefix": "mr2_XXXXXXXX",
+  "expires_at": "2026-09-08T17:04:11+00:00",
+  "rotated": true,
+  "user_id": 412,
+  "username": "jdoe"
+}</code></pre>
+
+                <h4>No Entra administrator involvement is required</h4>
+                <p>The token the app already holds was minted for <em>its</em> client id, not MindRouter&rsquo;s. Entra signs every token in a tenant with the same keys, so MindRouter verifies it completely without having been party to the sign-in &mdash; signature against the tenant JWKS, audience equal to the client id recorded on the application&rsquo;s row, issuer pinned to the tenant, and <code>exp</code>/<code>nbf</code> with 60 seconds of clock-drift tolerance. Accepting it is a deliberate operator decision, not an inference from the token. No exposed API, no <code>knownClientApplications</code>, no on-behalf-of flow.</p>
+
+                <h4>Three requirements on the token</h4>
+                <table class="table table-bordered table-sm">
+                    <thead class="table-light">
+                        <tr><th>Requirement</th><th>Why</th></tr>
+                    </thead>
+                    <tbody>
+                        <tr><td><strong>v2.0 endpoint only</strong> &mdash; the issuer must be <code>https://login.microsoftonline.com/{tenant}/v2.0</code>; the v1.0 <code>sts.windows.net</code> issuer is refused</td><td>v1.0 <em>access</em> tokens carry the bare client-id GUID as their audience, exactly like an id_token, which makes the two hard to tell apart. MSAL and the v2.0 authorize endpoint give you v2.0 tokens by default.</td></tr>
+                        <tr><td><strong>An id_token, not an access token</strong> &mdash; a token carrying <code>scp</code>, <code>scope</code> or <code>roles</code> is rejected</td><td>An access token minted for your own API can share the audience of your id_tokens, and your backend receives one on every call. &ldquo;Somebody was authorised to call your API on this user&rsquo;s behalf&rdquo; is a weaker claim than &ldquo;this user just signed in&rdquo;.</td></tr>
+                        <tr><td><strong>It must carry an email address</strong> &mdash; <code>email</code>, <code>preferred_username</code> or <code>upn</code></td><td>Email is the account-linking key. The <code>email</code> claim is optional in Entra and off by default, so add it as an optional claim or request the <code>profile</code> scope.</td></tr>
+                    </tbody>
+                </table>
+
+                <h4>Response codes</h4>
+                <table class="table table-bordered table-sm">
+                    <thead class="table-light">
+                        <tr><th>Status</th><th>Meaning</th><th>What to do</th></tr>
+                    </thead>
+                    <tbody>
+                        <tr><td><code>400</code></td><td>The token carries no email address</td><td>Add the optional <code>email</code> claim, or request <code>profile</code>, in your Entra app registration.</td></tr>
+                        <tr><td><code>401</code></td><td>The <code>id_token</code> was not accepted</td><td>Re-run your own sign-in. The specific reason is logged server-side and deliberately not returned &mdash; including the two token rules above, so check those first if <em>every</em> call fails.</td></tr>
+                        <tr><td><code>403</code></td><td>Your credential does not belong to that application, or the account is inactive</td><td>Configuration error, or the user was deactivated. Do not retry.</td></tr>
+                        <tr><td><code>404</code></td><td>Unknown or disabled application</td><td>Identical response either way, so a stolen credential cannot enumerate what is registered.</td></tr>
+                        <tr><td><code>409</code></td><td>The account could not be provisioned</td><td>The email is already bound to a different identity provider. A human needs to resolve it.</td></tr>
+                        <tr><td><code>429</code></td><td>You forced a rotation moments ago</td><td>Only reachable with <code>force_rotate</code>. Honour <code>Retry-After</code>; minting is deliberately expensive, so it is allowed once a minute per user.</td></tr>
+                    </tbody>
+                </table>
+
+                <h4>Holding and rotating the key</h4>
+                <p>Call the endpoint <strong>once per user sign-in</strong> and cache the returned key server-side against that user&rsquo;s session. A response with <code>"rotated": false</code> means <em>keep what you have</em>: MindRouter stores only a hash, so the plaintext cannot be re-shown and <code>api_key</code> is <code>null</code>. Compare <code>key_prefix</code> against the key you hold to confirm you are in sync.</p>
+                <p><strong>If you lose your key cache</strong> &mdash; a restart with in-memory storage, a redeploy, a wiped Redis &mdash; send <code>"force_rotate": true</code>. Without it you would be handed back a key you can no longer see, and your users would be stuck until it aged past half its lifetime. Do not set it on every call; the ordinary path exists so concurrent sessions do not invalidate each other.</p>
+                <p>Per-user keys rotate silently: MindRouter hands back the existing key while it retains more than half its lifetime and mints a fresh one otherwise, so a leaked user key stops working within the application&rsquo;s configured TTL without anyone doing anything.</p>
+
+                <h4>What the credential can and cannot do</h4>
+                <p>An application&rsquo;s provisioning credential carries a single scope, <code>apps:provision</code>. It cannot call inference, cannot reach any administrative endpoint, and cannot act for another application &mdash; even though it is owned by the administrator account that issued it. Scopes intersect with the owner&rsquo;s group privilege and never extend it, so a key minted for an end user is inference-only even when that user is an administrator.</p>
+
+                <h4>Group classification</h4>
+                <p>MindRouter assigns a user&rsquo;s group from the Azure <code>jobTitle</code> attribute, which it reads from Microsoft Graph at sign-in. An <code>id_token</code> does not carry <code>jobTitle</code>, so a user an app creates lands in the default group and is marked for later classification; their group is settled automatically the first time they sign in to MindRouter directly. Administrators see the backlog under <strong>Admin &rarr; Applications</strong>. Reclassification never moves a user out of an admin or auditor group, and never touches an account that already existed before the app linked it.</p>
+
+                <h4>Administering applications</h4>
+                <p>Under <strong>Admin &rarr; Applications</strong> an administrator registers the app (slug, name, its Entra client and tenant IDs, per-user key lifetime), then issues its credential as a separate, separately audited action. The credential is displayed <strong>once</strong>. Rotation revokes the previous credential before minting the next, so there is never a window with two live credentials. <strong>Disabling an application revokes everything it holds</strong> &mdash; its credential and every per-user key &mdash; because status alone would stop only new sessions while existing keys ran their full lifetime. Every session an application provisions is written to the admin audit log with the application, not a person, as the actor.</p>
             </section>
 
             <hr>
