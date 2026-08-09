@@ -36,6 +36,7 @@ from backend.app.core.redis_client import (
 )
 from backend.app.core.scheduler.policy import init_scheduler, shutdown_scheduler
 from backend.app.core.telemetry.registry import init_registry, shutdown_registry
+from backend.app.dashboard.apps_routes import apps_admin_router
 from backend.app.dashboard.blog import blog_router
 from backend.app.dashboard.dlp_routes import dlp_router
 from backend.app.dashboard.email_routes import email_router
@@ -670,6 +671,7 @@ def create_app() -> FastAPI:
     app.include_router(blog_router)
     app.include_router(email_router)
     app.include_router(dlp_router)
+    app.include_router(apps_admin_router)
     # Proxy /mcp/* to the standalone MCP service (single-worker process
     # that avoids SseServerTransport session-affinity issues).
     try:

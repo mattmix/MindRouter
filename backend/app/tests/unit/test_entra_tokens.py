@@ -32,6 +32,7 @@ import time
 from pathlib import Path
 from unittest.mock import MagicMock
 
+import httpx
 import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
@@ -70,6 +71,10 @@ def _load_module():
 
 
 et = _load_module()
+
+# The autouse fixture below replaces _fetch_jwks for every test; the two that
+# exercise the fetcher itself put this back first.
+_REAL_FETCH_JWKS = et._fetch_jwks
 
 
 def _make_rsa(kid):
@@ -147,10 +152,19 @@ class TestAcceptsAGenuineToken:
         assert ident.email == "alice@uidaho.edu"
 
     @pytest.mark.asyncio
-    async def test_v1_issuer_form_accepted(self):
+    async def test_v1_issuer_form_is_refused(self):
+        """v2.0 only, deliberately.
+
+        The v1.0 issuer is the token generation whose ACCESS tokens carry the
+        bare client-id GUID as their audience — the same value an id_token
+        carries — which is exactly what makes an access token for the app's own
+        API hard to distinguish from a sign-in assertion. A registered app
+        controls its own token version, so the ambiguity is refused rather than
+        managed.
+        """
         tok = _token(iss=f"https://sts.windows.net/{TENANT}/")
-        ident = await et.verify_entra_id_token(tok, APP_CLIENT_ID, TENANT)
-        assert ident.oid == "abc-oid-123"
+        with pytest.raises(et.EntraTokenError):
+            await et.verify_entra_id_token(tok, APP_CLIENT_ID, TENANT)
 
     @pytest.mark.asyncio
     async def test_nonce_is_not_required(self):
@@ -314,6 +328,134 @@ class TestJwksHandling:
                     APP_CLIENT_ID, TENANT,
                 )
         assert calls["n"] <= 2, f"unknown kid caused {calls['n']} JWKS fetches"
+
+
+class TestMustBeAnIdTokenNotAnAccessToken:
+    """An access token minted for the app's OWN API can carry the same
+    audience as its id_tokens, and the app's backend receives one on every
+    call — so it is far more widely handled, logged and forwarded than a
+    sign-in assertion. Treating one as proof of sign-in silently weakens the
+    claim the whole design rests on."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "claim,value",
+        [
+            ("scp", "Files.Read User.Read"),
+            ("scope", "Files.Read"),
+            ("roles", ["App.Invoke"]),
+        ],
+    )
+    async def test_access_token_claims_are_refused(self, claim, value):
+        tok = _token(**{claim: value})
+        with pytest.raises(et.EntraTokenError) as e:
+            await et.verify_entra_id_token(tok, APP_CLIENT_ID, TENANT)
+        assert claim in str(e.value)
+
+    @pytest.mark.asyncio
+    async def test_authorized_party_must_match_when_present(self):
+        """Entra omits azp from most v2.0 id_tokens, so this validates rather
+        than requires — but a token naming a DIFFERENT client as the authorized
+        party was not obtained by the app we trust."""
+        tok = _token(azp=OTHER_CLIENT_ID)
+        with pytest.raises(et.EntraTokenError):
+            await et.verify_entra_id_token(tok, APP_CLIENT_ID, TENANT)
+
+    @pytest.mark.asyncio
+    async def test_matching_authorized_party_is_fine(self):
+        tok = _token(azp=APP_CLIENT_ID)
+        assert await et.verify_entra_id_token(tok, APP_CLIENT_ID, TENANT)
+
+    @pytest.mark.asyncio
+    async def test_appid_is_checked_the_same_way(self):
+        tok = _token(appid=OTHER_CLIENT_ID)
+        with pytest.raises(et.EntraTokenError):
+            await et.verify_entra_id_token(tok, APP_CLIENT_ID, TENANT)
+
+
+class TestUpstreamFailuresAreNot500s:
+    """Microsoft's discovery endpoint is rate limited and the network is not
+    guaranteed, so these are ordinary operating conditions. Letting them escape
+    turns a transient upstream problem into an unhandled 500 with no app or
+    tenant context — which reads to the calling app as a server fault worth
+    retrying hard."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            httpx.ConnectError("no route"),
+            httpx.ReadTimeout("slow"),
+            httpx.HTTPStatusError(
+                "429", request=httpx.Request("GET", "https://x"),
+                response=httpx.Response(429),
+            ),
+        ],
+    )
+    async def test_transport_failures_surface_as_token_errors(self, monkeypatch, exc):
+        async def _boom(_tenant):
+            raise exc
+
+        monkeypatch.setattr(et, "_fetch_jwks", _boom)
+        with pytest.raises(et.EntraTokenError):
+            await et.verify_entra_id_token(_token(), APP_CLIENT_ID, TENANT)
+
+    @pytest.mark.asyncio
+    async def test_real_fetch_wraps_transport_errors(self, monkeypatch):
+        """Exercise the wrapper itself, not a stub standing in for it."""
+        class _Client:
+            def __init__(self, *a, **k):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+            async def get(self, _url):
+                raise httpx.ConnectError("no route")
+
+        monkeypatch.setattr(et, "_fetch_jwks", _REAL_FETCH_JWKS)
+        monkeypatch.setattr(et.httpx, "AsyncClient", _Client)
+        with pytest.raises(et.EntraTokenError):
+            await et._fetch_jwks(TENANT)
+
+    @pytest.mark.asyncio
+    async def test_non_rsa_keys_are_filtered_out(self, monkeypatch):
+        """python-jose builds the key OUTSIDE its own try block, so a non-RSA
+        entry under our kid raises JWKError straight past the JWTError
+        handler."""
+        class _Resp:
+            status_code = 200
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {"keys": [
+                    {"kid": "test-key-1", "kty": "oct", "k": "AAAA"},
+                    {"kid": "enc-key", "kty": "RSA", "use": "enc",
+                     "n": _JWK["n"], "e": _JWK["e"]},
+                ]}
+
+        class _Client:
+            def __init__(self, *a, **k):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+            async def get(self, _url):
+                return _Resp()
+
+        monkeypatch.setattr(et, "_fetch_jwks", _REAL_FETCH_JWKS)
+        monkeypatch.setattr(et.httpx, "AsyncClient", _Client)
+        with pytest.raises(et.EntraTokenError):
+            await et._fetch_jwks(TENANT)
 
 
 class TestDoesNotReuseTheUnverifiedDecoder:

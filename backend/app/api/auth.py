@@ -58,13 +58,18 @@ async def get_api_key_from_request(
     return None
 
 
-async def authenticate_request(
+async def authenticate_credential(
     request: Request,
     db: AsyncSession = Depends(get_async_db),
     api_key_str: Optional[str] = Depends(get_api_key_from_request),
 ) -> Tuple[User, ApiKey]:
     """
-    Authenticate a request using API key.
+    Establish WHO is calling, without deciding what they may do.
+
+    Depend on this only from a route that applies its own scope check
+    (`require_scope`, `require_admin`). Anything that actually consumes the
+    service wants `authenticate_request`, which additionally requires the
+    `inference` scope.
 
     Args:
         request: The incoming request
@@ -130,6 +135,31 @@ async def authenticate_request(
     return api_key.user, api_key
 
 
+async def authenticate_request(
+    auth: Tuple[User, ApiKey] = Depends(authenticate_credential),
+) -> Tuple[User, ApiKey]:
+    """Authenticate a request that is going to USE the service.
+
+    Every endpoint reached this way — chat, embeddings, images, video, audio,
+    search, the model catalogs — is inference in the broad sense, so this is
+    the one place the `inference` scope has to be enforced. Doing it here
+    rather than on each router means a new inference endpoint is covered by
+    default instead of by remembering.
+
+    A legacy key (NULL scopes) satisfies this unchanged, and a key minted for a
+    registered app's user carries `inference` explicitly. What it stops is an
+    app's PROVISIONING credential: that exists only to exchange Entra tokens
+    for user keys, and it is owned by the administrator who issued it, so
+    without this check a leaked provisioning credential would be able to spend
+    that administrator's token budget.
+    """
+    from backend.app.security.scopes import SCOPE_INFERENCE
+
+    user, api_key = auth
+    _deny_unscoped(api_key, SCOPE_INFERENCE)
+    return user, api_key
+
+
 async def require_role(
     required_role: UserRole,
     user: User = Depends(lambda u=Depends(authenticate_request): u[0]),
@@ -188,7 +218,7 @@ def require_admin():
     alone is no longer sufficient for keys that declare a scope list.
     """
     async def check_admin(
-        auth_result: Tuple[User, ApiKey] = Depends(authenticate_request),
+        auth_result: Tuple[User, ApiKey] = Depends(authenticate_credential),
     ) -> User:
         from backend.app.security.scopes import SCOPE_ADMIN
 
@@ -206,7 +236,7 @@ def require_admin():
 def require_admin_read():
     """Dependency that requires admin or auditor role (read-only admin access)."""
     async def check_admin_read(
-        auth_result: Tuple[User, ApiKey] = Depends(authenticate_request),
+        auth_result: Tuple[User, ApiKey] = Depends(authenticate_credential),
     ) -> User:
         from backend.app.security.scopes import SCOPE_ADMIN
 
@@ -231,7 +261,7 @@ def require_scope(scope: str):
     never drift into them.
     """
     async def check_scope(
-        auth_result: Tuple[User, ApiKey] = Depends(authenticate_request),
+        auth_result: Tuple[User, ApiKey] = Depends(authenticate_credential),
     ) -> Tuple[User, ApiKey]:
         from backend.app.security.scopes import is_scoped, key_has_scope
 
@@ -386,20 +416,27 @@ class AuthenticatedUser:
 
     async def __call__(
         self,
-        auth_result: Tuple[User, ApiKey] = Depends(authenticate_request),
+        # Deliberately the pre-scope authenticator: which scope this dependency
+        # demands depends on how it was configured, so it is applied below
+        # rather than inherited.
+        auth_result: Tuple[User, ApiKey] = Depends(authenticate_credential),
     ) -> User:
+        from backend.app.security.scopes import SCOPE_ADMIN, SCOPE_INFERENCE
+
         user, _api_key = auth_result
 
         if self.require_admin_flag:
-            from backend.app.security.scopes import SCOPE_ADMIN
-
             if not user.group or not user.group.is_admin:
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
                     detail="Admin access required",
                 )
             _deny_unscoped(_api_key, SCOPE_ADMIN)
-        elif self.require_role:
+            return user
+
+        _deny_unscoped(_api_key, SCOPE_INFERENCE)
+
+        if self.require_role:
             # Legacy role hierarchy check (kept for backward compat)
             role_hierarchy = {
                 UserRole.STUDENT: 0,

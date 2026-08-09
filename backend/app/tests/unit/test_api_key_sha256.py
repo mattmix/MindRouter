@@ -324,10 +324,12 @@ class TestCallerEnforcement:
         assert await api_keys.verify_api_key(MagicMock(), full_key) is row
 
     def test_auth_checks_run_after_verify(self):
-        # auth.authenticate_request must apply the shared post-verify gate
-        # AFTER verify_api_key — fast path included
+        # The API-key authenticator must apply the shared post-verify gate
+        # AFTER verify_api_key — fast path included.  This lives in
+        # authenticate_credential, which authenticate_request wraps to add the
+        # inference-scope check; the gate itself did not move.
         src = (_APP_DIR / "api" / "auth.py").read_text()
-        body = src[src.index("async def authenticate_request"):]
+        body = src[src.index("async def authenticate_credential"):]
         verify_pos = body.index("await verify_api_key(db, api_key_str)")
         assert body.index("api_key_rejection_reason(api_key)") > verify_pos
         # The gate itself carries the status/expiry/user checks
@@ -470,6 +472,8 @@ class TestSourceContracts:
         [
             "dashboard/routes.py",
             "api/admin_api.py",
+            "api/apps_api.py",
+            "dashboard/apps_routes.py",
         ],
     )
     def test_callers_store_both_columns(self, rel_path):
@@ -486,7 +490,10 @@ class TestSourceContracts:
         }
         callers.discard("security/api_keys.py")  # the definition itself
         callers.discard("scripts/seed_dev_data.py")
-        assert callers == {"dashboard/routes.py", "api/admin_api.py"}, (
+        assert callers == {
+            "dashboard/routes.py", "api/admin_api.py", "api/apps_api.py",
+            "dashboard/apps_routes.py",
+        }, (
             f"generate_api_key() callers changed: {sorted(callers)} — update the "
             "parametrize list above so each new caller is checked."
         )

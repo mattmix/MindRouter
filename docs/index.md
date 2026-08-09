@@ -40,6 +40,7 @@ the in-app [`/documentation`](#api-reference) page):
 
 - [UI branding & theming](branding.md) — rebrand a deployment for one institution: organization name, logos (navbar / footer / login), favicon, and accessible light/dark accent colors, from Admin → Branding
 - [Single sign-on configuration](sso-configuration.md) — step-by-step IdP setup for the four SSO providers (Azure AD / Entra ID, Google, generic OIDC including InCommon via CILogon, and native SAML 2.0), plus JIT provisioning and security notes
+- [Registered applications](registered-apps.md) — let a first-party app (e.g. VandalChat) exchange its users' Entra `id_token`s for their own MindRouter keys, so its users get per-user quota, telemetry and fair share without ever signing in here. No Entra administrator involvement required
 
 ---
 

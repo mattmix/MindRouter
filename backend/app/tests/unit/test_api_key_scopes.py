@@ -172,6 +172,59 @@ class TestEveryAdminPathChecksScope:
         )
 
 
+class TestInferenceScopeIsEnforced:
+    """`inference` was declared before it was checked anywhere, which made the
+    scope list deny-admin only. An app's provisioning credential is owned by
+    the administrator who issued it, so until this was wired a leaked one could
+    spend that administrator's token budget on /v1/chat/completions."""
+
+    def _auth_src(self):
+        return (_APP / "api" / "auth.py").read_text()
+
+    def test_the_shared_inference_dependency_demands_the_scope(self):
+        src = self._auth_src()
+        i = src.index("async def authenticate_request(")
+        block = src[i:i + 1800]
+        assert "_deny_unscoped(api_key, SCOPE_INFERENCE)" in block, (
+            "authenticate_request must require the inference scope — it is the "
+            "one dependency every inference endpoint shares"
+        )
+
+    def test_scope_gated_routes_do_not_inherit_the_inference_requirement(self):
+        """An app credential carries `apps:provision` and NOT `inference`, so
+        provisioning would be impossible if require_scope sat downstream of the
+        inference check."""
+        src = self._auth_src()
+        i = src.index("def require_scope(")
+        block = src[i:i + 1400]
+        assert "Depends(authenticate_credential)" in block
+        assert "Depends(authenticate_request)" not in block
+
+    def test_admin_dependencies_do_not_inherit_it_either(self):
+        src = self._auth_src()
+        for fn in ("def check_admin(", "def check_admin_read("):
+            i = src.index(fn)
+            block = src[i:i + 400]
+            assert "Depends(authenticate_credential)" in block, fn
+
+    def test_no_route_module_bypasses_the_inference_check(self):
+        """authenticate_credential establishes identity without authorising
+        anything. If a router depended on it directly, that endpoint would
+        accept a provisioning credential."""
+        offenders = []
+        for path in sorted((_APP / "api").rglob("*.py")) + sorted(
+            (_APP / "dashboard").rglob("*.py")
+        ):
+            if path.name == "auth.py":
+                continue
+            if "authenticate_credential" in path.read_text():
+                offenders.append(str(path.relative_to(_APP)))
+        assert not offenders, (
+            "these modules use the pre-authorisation authenticator directly: "
+            f"{offenders} — depend on authenticate_request instead"
+        )
+
+
 class TestRequireScopeIsOptIn:
     def test_legacy_key_cannot_satisfy_require_scope(self):
         """Provisioning is a capability no group confers, so a broad old key

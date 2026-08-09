@@ -146,18 +146,9 @@ def _get_session_serializer() -> URLSafeTimedSerializer:
     return URLSafeTimedSerializer(settings.secret_key, salt="session")
 
 
-def get_client_ip(request: Request) -> Optional[str]:
-    """Extract the real client IP from proxy headers, falling back to direct connection.
-
-    Checks X-Forwarded-For (first entry) → X-Real-IP → request.client.host.
-    """
-    forwarded_for = request.headers.get("x-forwarded-for")
-    if forwarded_for:
-        return forwarded_for.split(",")[0].strip()
-    real_ip = request.headers.get("x-real-ip")
-    if real_ip:
-        return real_ip.strip()
-    return request.client.host if request.client else None
+# Re-exported: this module is where the rest of the dashboard has always
+# imported it from, and the API layer now shares the same definition.
+from backend.app.core.client_ip import get_client_ip  # noqa: E402,F401
 
 
 def get_session_user_id(request: Request) -> Optional[int]:

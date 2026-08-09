@@ -60,7 +60,11 @@ def upgrade() -> None:
         "apps",
         sa.Column("id", sa.Integer, primary_key=True, autoincrement=True),
         # Stable identifier used in API paths, e.g. "vandalchat".
-        sa.Column("slug", sa.String(64), nullable=False, unique=True),
+        # Uniqueness comes from the explicit ix_apps_slug index below, NOT from
+        # unique=True here: both would emit an index over the same column, and
+        # MariaDB refuses to drop an index backing a constraint (error 1553),
+        # so the spare would be unremovable by a later autogenerate.
+        sa.Column("slug", sa.String(64), nullable=False),
         sa.Column("name", sa.String(200), nullable=False),
         sa.Column("description", sa.Text, nullable=True),
         sa.Column(

@@ -268,6 +268,53 @@ async def find_or_create_azure_user(db: AsyncSession, profile: dict):
             user.department = department
         if college:
             user.college = college
+
+        # Settle the group for accounts provisioned WITHOUT jobTitle — a
+        # registered app provisions from an id_token, which does not carry it,
+        # so those users land in the default group. This sign-in is the first
+        # point where Graph data is available. Groups are otherwise never
+        # re-evaluated, and deliberately so: this runs only for accounts
+        # explicitly marked unclassified, never for anyone else.
+        #
+        # NEVER out of a privileged group. jobTitle maps to exactly four names
+        # and "admin" is not among them, so an administrator who reached
+        # MindRouter through an app first would be demoted here on their first
+        # direct sign-in — silently, since losing admin produces no error, only
+        # 403s later. A deliberate placement outranks an inferred one.
+        current_group = user.group
+        privileged = bool(
+            current_group
+            and (current_group.is_admin or current_group.has_admin_read)
+        )
+        if not getattr(user, "group_classified", True) and job_title and not privileged:
+            mapped_name = _map_job_title_to_group(job_title)
+            mapped = await crud.get_group_by_name(db, mapped_name)
+            if mapped:
+                previous = user.group_id
+                user.group_id = mapped.id
+                user.role = _map_group_to_role(mapped_name)
+                user.group_classified = True
+                # RPM is the one limit that is NOT read from the group at
+                # request time — it is copied into the user's quota row when
+                # the account is created. Without this the reclassification is
+                # two-thirds applied and the remaining third is invisible.
+                quota = await crud.get_user_quota(db, user.id)
+                if quota is not None and mapped.rpm_limit is not None:
+                    quota.rpm_limit = mapped.rpm_limit
+                logger.info(
+                    "user_group_classified user_id=%s from_group=%s to_group=%s"
+                    " job_title=%s rpm_limit=%s",
+                    user.id, previous, mapped_name, job_title, mapped.rpm_limit,
+                )
+        elif not getattr(user, "group_classified", True) and privileged:
+            # Settle the flag so this never fires later, and record why.
+            user.group_classified = True
+            logger.info(
+                "user_group_classification_skipped user_id=%s group_id=%s"
+                " reason=%s",
+                user.id, user.group_id, "privileged group set deliberately",
+            )
+
         user.last_login_at = datetime.now(timezone.utc)
         await db.flush()
         return user

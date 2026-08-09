@@ -44,7 +44,12 @@ from typing import Any, Dict, Optional, Tuple
 
 import httpx
 from jose import jwt
-from jose.exceptions import ExpiredSignatureError, JWTClaimsError, JWTError
+from jose.exceptions import (
+    ExpiredSignatureError,
+    JWKError,
+    JWTClaimsError,
+    JWTError,
+)
 
 from backend.app.logging_config import get_logger
 
@@ -86,22 +91,53 @@ class EntraIdentity:
 def _acceptable_issuers(tenant_id: str) -> Tuple[str, ...]:
     """Issuers Entra uses for a given tenant.
 
-    v2.0 endpoints issue the first form; some v1.0-era tokens use the second.
-    Both are pinned to the tenant, which is the property that matters.
+    v2.0 ONLY, deliberately. The v1.0 issuer (`sts.windows.net/{tid}/`) is the
+    token generation whose ACCESS tokens carry the bare client-id GUID as their
+    audience — the same value an id_token carries — which is what makes an
+    access token for the app's own API hard to tell from a sign-in assertion.
+    A registered app controls its own token version, and a new integration has
+    no reason to use v1.0, so the ambiguity is refused rather than managed.
     """
-    return (
-        f"https://login.microsoftonline.com/{tenant_id}/v2.0",
-        f"https://sts.windows.net/{tenant_id}/",
-    )
+    return (f"https://login.microsoftonline.com/{tenant_id}/v2.0",)
 
 
 async def _fetch_jwks(tenant_id: str) -> Dict[str, dict]:
+    """Fetch a tenant's signing keys.
+
+    Every failure leaves as an EntraTokenError. Microsoft's discovery endpoint
+    is rate limited and the network is not guaranteed, so httpx and JSON errors
+    are ordinary operating conditions here — letting them escape would turn a
+    transient upstream problem into an unhandled 500 with no application or
+    tenant context in the log, which reads to the calling app as a server fault
+    worth retrying hard.
+    """
     url = _JWKS_URL.format(tenant=tenant_id)
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        resp = await client.get(url)
-        resp.raise_for_status()
-        data = resp.json()
-    keys = {k["kid"]: k for k in data.get("keys", []) if k.get("kid")}
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(url)
+            resp.raise_for_status()
+            data = resp.json()
+    except httpx.HTTPError as e:
+        raise EntraTokenError(
+            f"could not fetch tenant JWKS: {type(e).__name__}"
+        ) from e
+    except ValueError as e:  # malformed JSON body
+        raise EntraTokenError("tenant JWKS was not valid JSON") from e
+
+    if not isinstance(data, dict):
+        raise EntraTokenError("tenant JWKS was not an object")
+
+    # Only RSA signing keys. The algorithms are pinned to RS* below, and
+    # python-jose builds the key OUTSIDE its own try block — a non-RSA entry
+    # sharing our kid would raise JWKError straight past the handlers here.
+    keys = {
+        k["kid"]: k
+        for k in data.get("keys", [])
+        if isinstance(k, dict)
+        and k.get("kid")
+        and k.get("kty") == "RSA"
+        and k.get("use", "sig") == "sig"
+    }
     if not keys:
         raise EntraTokenError("tenant JWKS contained no usable keys")
     return keys
@@ -123,7 +159,19 @@ async def _key_for_kid(tenant_id: str, kid: str) -> dict:
     if cached and kid not in cached[1] and (now - cached[0]) < JWKS_MIN_REFETCH_SECONDS:
         raise EntraTokenError("token signed by an unknown key")
 
-    keys = await _fetch_jwks(tenant_id)
+    try:
+        keys = await _fetch_jwks(tenant_id)
+    except EntraTokenError:
+        raise
+    except Exception as e:
+        # The contract of this module is that it raises EntraTokenError and
+        # nothing else, so the route can turn every failure into a logged 401
+        # instead of an unhandled 500. Belt and braces with _fetch_jwks's own
+        # handling: this holds even if that function grows a new failure mode.
+        raise EntraTokenError(
+            f"could not fetch tenant JWKS: {type(e).__name__}"
+        ) from e
+
     _jwks_cache[tenant_id] = (now, keys)
 
     if kid not in keys:
@@ -187,8 +235,39 @@ async def verify_entra_id_token(
     except JWTClaimsError as e:
         # Wrong audience or issuer lands here — the interesting rejection.
         raise EntraTokenError(f"token claims rejected: {e}") from e
+    except JWKError as e:
+        # NOT a subclass of JWTError, and raised from outside python-jose's own
+        # try block, so it would otherwise escape unsanitised.
+        raise EntraTokenError("signing key could not be constructed") from e
     except JWTError as e:
         raise EntraTokenError(f"token signature invalid: {e}") from e
+
+    # THIS MUST BE AN ID TOKEN, not an access token.
+    #
+    # An access token minted for the app's OWN API can carry the same audience
+    # as its id_tokens, and the app's backend receives one on every call — so
+    # it is far more widely handled, logged, and passed around than a sign-in
+    # assertion. Accepting one would mean "somebody was authorised to call
+    # VandalChat's API on this user's behalf" is treated as "this user just
+    # signed in to VandalChat", which is a much weaker claim.
+    #
+    # `scp` (delegated) and `roles` (app-only) appear on access tokens and
+    # never on an id_token, so their presence is the discriminator.
+    for access_only in ("scp", "scope", "roles"):
+        if claims.get(access_only) is not None:
+            raise EntraTokenError(
+                f"token carries the access-token claim '{access_only}';"
+                " an id_token is required"
+            )
+
+    # When present, the authorized party must be the app we trust. Entra omits
+    # `azp` from most v2.0 id_tokens, so this validates rather than requires.
+    for party_claim in ("azp", "appid"):
+        party = claims.get(party_claim)
+        if party is not None and party != expected_client_id:
+            raise EntraTokenError(
+                f"token '{party_claim}' does not match the app registration"
+            )
 
     # Defense in depth: the issuer check already pins the tenant, but a token
     # whose tid disagrees with where we fetched keys from is malformed enough

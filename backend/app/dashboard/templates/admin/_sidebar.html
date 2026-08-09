@@ -61,6 +61,11 @@
             </a>
         </li>
         <li class="nav-item">
+            <a class="nav-link {% if active == 'apps' %}active{% endif %}" href="/admin/apps" {% if active == 'apps' %}aria-current="page"{% endif %}>
+                <i class="bi bi-app-indicator"></i> Applications
+            </a>
+        </li>
+        <li class="nav-item">
             <a class="nav-link {% if active == 'requests' %}active{% endif %}{% if pending_requests_total %} text-danger fw-bold{% endif %}" href="/admin/requests" {% if active == 'requests' %}aria-current="page"{% endif %}>
                 <i class="bi bi-inbox{% if pending_requests_total %}-fill{% endif %}"></i> Requests
                 {% if pending_requests_total %}

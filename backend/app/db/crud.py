@@ -78,6 +78,7 @@ from backend.app.db.models import (
     VideoShotType,
     VideoTransition,
 )
+from backend.app.security.scopes import APP_CREDENTIAL_SCOPES, format_scopes
 
 
 def _ensure_aware(dt: Optional[datetime]) -> Optional[datetime]:
@@ -818,13 +819,266 @@ async def create_api_key(
     return api_key
 
 
+async def get_app_by_slug(db: AsyncSession, slug: str) -> Optional[App]:
+    """Look up a registered app by its slug."""
+    result = await db.execute(select(App).where(App.slug == slug))
+    return result.scalar_one_or_none()
+
+
+async def get_app_by_id(db: AsyncSession, app_id: int) -> Optional[App]:
+    """Look up a registered app by id."""
+    result = await db.execute(select(App).where(App.id == app_id))
+    return result.scalar_one_or_none()
+
+
+async def get_apps(db: AsyncSession) -> List[App]:
+    """All registered apps, newest first."""
+    result = await db.execute(select(App).order_by(App.created_at.desc()))
+    return list(result.scalars().all())
+
+
+async def create_app(
+    db: AsyncSession,
+    slug: str,
+    name: str,
+    description: Optional[str] = None,
+    entra_client_id: Optional[str] = None,
+    entra_tenant_id: Optional[str] = None,
+    key_ttl_days: int = 30,
+    created_by: Optional[int] = None,
+) -> App:
+    """Register an application. No credential is minted here."""
+    app = App(
+        slug=slug,
+        name=name,
+        description=description,
+        entra_client_id=entra_client_id,
+        entra_tenant_id=entra_tenant_id,
+        key_ttl_days=key_ttl_days,
+        created_by=created_by,
+        status="active",
+    )
+    db.add(app)
+    await db.flush()
+    return app
+
+
+async def delete_app(db: AsyncSession, app_id: int) -> bool:
+    """Remove an app row.
+
+    Callers must revoke and detach its keys first: api_keys.app_id is a foreign
+    key, and those keys carry request history that should outlive the
+    registration.
+    """
+    result = await db.execute(delete(App).where(App.id == app_id))
+    await db.flush()
+    return (result.rowcount or 0) > 0
+
+
+async def get_active_app_user_key(
+    db: AsyncSession, app_id: int, user_id: int
+) -> Optional[ApiKey]:
+    """Most recently issued live key this app holds for this user.
+
+    Used to decide whether to hand back the existing credential or rotate.
+    Expired rows are ignored rather than revoked: they fail the shared
+    post-verify gate anyway, and leaving them lets the audit trail show what
+    the app issued and when.
+    """
+    now = datetime.now(timezone.utc)
+    result = await db.execute(
+        select(ApiKey)
+        .where(
+            ApiKey.app_id == app_id,
+            ApiKey.user_id == user_id,
+            ApiKey.status == ApiKeyStatus.ACTIVE,
+            ApiKey.expires_at.isnot(None),
+            ApiKey.expires_at > now,
+        )
+        .order_by(ApiKey.expires_at.desc())
+    )
+    return result.scalars().first()
+
+
+async def count_active_app_user_keys(
+    db: AsyncSession, app_id: int, user_id: int
+) -> int:
+    """How many live keys this app currently holds for this user."""
+    now = datetime.now(timezone.utc)
+    result = await db.execute(
+        select(func.count(ApiKey.id)).where(
+            ApiKey.app_id == app_id,
+            ApiKey.user_id == user_id,
+            ApiKey.status == ApiKeyStatus.ACTIVE,
+            ApiKey.expires_at.isnot(None),
+            ApiKey.expires_at > now,
+        )
+    )
+    return result.scalar() or 0
+
+
+async def revoke_app_keys(
+    db: AsyncSession, app_id: int, user_id: Optional[int] = None
+) -> int:
+    """Revoke an app's keys — all of them, or just one user's.
+
+    Called when an app is disabled or deregistered, and when a user is
+    deactivated: an app credential that outlives the thing that authorised it
+    is how a revoked account keeps working.
+    """
+    stmt = update(ApiKey).where(
+        ApiKey.app_id == app_id, ApiKey.status == ApiKeyStatus.ACTIVE
+    )
+    if user_id is not None:
+        stmt = stmt.where(ApiKey.user_id == user_id)
+    result = await db.execute(stmt.values(status=ApiKeyStatus.REVOKED))
+    await db.flush()
+    return result.rowcount or 0
+
+
+# The canonical stored form of a provisioning credential's scope list.
+# format_scopes sorts and joins, so the string is deterministic and an exact
+# match cleanly separates an app's OWN credential from the per-user keys it
+# mints, which carry "inference".
+_APP_CREDENTIAL_SCOPES = format_scopes(APP_CREDENTIAL_SCOPES)
+
+
+async def get_app_provision_keys(db: AsyncSession) -> Dict[int, ApiKey]:
+    """The live provisioning credential for each app, keyed by app id."""
+    result = await db.execute(
+        select(ApiKey)
+        .where(
+            ApiKey.app_id.isnot(None),
+            ApiKey.scopes == _APP_CREDENTIAL_SCOPES,
+            ApiKey.status == ApiKeyStatus.ACTIVE,
+        )
+        .order_by(ApiKey.created_at.desc())
+    )
+    creds: Dict[int, ApiKey] = {}
+    for key in result.scalars().all():
+        creds.setdefault(key.app_id, key)
+    return creds
+
+
+async def get_app_key_stats(db: AsyncSession) -> Dict[int, dict]:
+    """Per-app count of provisioned users and of their still-live keys."""
+    now = datetime.now(timezone.utc)
+    result = await db.execute(
+        select(
+            ApiKey.app_id,
+            func.count(func.distinct(ApiKey.user_id)),
+            func.sum(
+                case(
+                    (
+                        and_(
+                            ApiKey.status == ApiKeyStatus.ACTIVE,
+                            or_(ApiKey.expires_at.is_(None), ApiKey.expires_at > now),
+                        ),
+                        1,
+                    ),
+                    else_=0,
+                )
+            ),
+        )
+        .where(ApiKey.app_id.isnot(None), ApiKey.scopes != _APP_CREDENTIAL_SCOPES)
+        .group_by(ApiKey.app_id)
+    )
+    return {
+        app_id: {"users": users or 0, "live_keys": int(live or 0)}
+        for app_id, users, live in result.all()
+    }
+
+
+async def revoke_app_provision_keys(db: AsyncSession, app_id: int) -> int:
+    """Revoke an app's own provisioning credentials, leaving user keys alone.
+
+    Rotation revokes before it mints: an app holding two live provisioning
+    credentials means a leaked one keeps working after the operator believes
+    they replaced it.
+    """
+    result = await db.execute(
+        update(ApiKey)
+        .where(
+            ApiKey.app_id == app_id,
+            ApiKey.scopes == _APP_CREDENTIAL_SCOPES,
+            ApiKey.status == ApiKeyStatus.ACTIVE,
+        )
+        .values(status=ApiKeyStatus.REVOKED)
+    )
+    await db.flush()
+    return result.rowcount or 0
+
+
+async def revoke_app_user_keys(db: AsyncSession, app_id: int) -> int:
+    """Revoke the per-user keys an app minted, leaving its credential alone."""
+    result = await db.execute(
+        update(ApiKey)
+        .where(
+            ApiKey.app_id == app_id,
+            ApiKey.scopes != _APP_CREDENTIAL_SCOPES,
+            ApiKey.status == ApiKeyStatus.ACTIVE,
+        )
+        .values(status=ApiKeyStatus.REVOKED)
+    )
+    await db.flush()
+    return result.rowcount or 0
+
+
+async def detach_app_keys(db: AsyncSession, app_id: int) -> int:
+    """Clear app_id on an app's keys so the app row can be removed.
+
+    The keys are kept: the caller has already revoked them, and their request
+    history is what explains what the app did.
+    """
+    result = await db.execute(
+        update(ApiKey).where(ApiKey.app_id == app_id).values(app_id=None)
+    )
+    await db.flush()
+    return result.rowcount or 0
+
+
+async def get_unclassified_users(
+    db: AsyncSession, limit: int = 50
+) -> Tuple[List[User], int]:
+    """Users whose group has not been settled from directory data yet.
+
+    An id_token carries no jobTitle, so an account an app created lands in the
+    default group until its owner signs in to MindRouter directly. Surfacing
+    the backlog is what keeps that from being invisible.
+    """
+    total_result = await db.execute(
+        select(func.count(User.id)).where(User.group_classified.is_(False))
+    )
+    total = total_result.scalar() or 0
+    result = await db.execute(
+        select(User)
+        .options(selectinload(User.group))
+        .where(User.group_classified.is_(False))
+        .order_by(User.created_at.desc())
+        .limit(limit)
+    )
+    return list(result.scalars().all()), total
+
+
 async def get_user_api_keys(
-    db: AsyncSession, user_id: int, include_revoked: bool = False
+    db: AsyncSession,
+    user_id: int,
+    include_revoked: bool = False,
+    include_hidden: bool = False,
 ) -> List[ApiKey]:
-    """Get all API keys for a user."""
+    """Get a user's API keys.
+
+    App-minted keys are excluded by default. Beyond not showing the user a
+    credential they never chose, this matters because the dashboard's chat,
+    image, and video pages call this and use the FIRST key returned to make
+    requests on the user's behalf — with an app key in the list, web-UI traffic
+    would be attributed to the app.
+    """
     query = select(ApiKey).where(ApiKey.user_id == user_id)
     if not include_revoked:
         query = query.where(ApiKey.status == ApiKeyStatus.ACTIVE)
+    if not include_hidden:
+        query = query.where(ApiKey.hidden.is_(False))
     result = await db.execute(query)
     return list(result.scalars().all())
 
@@ -2482,11 +2736,17 @@ async def delete_expired_api_keys(
 
 
 async def count_user_active_api_keys(db: AsyncSession, user_id: int) -> int:
-    """Count active (non-revoked) API keys for a user."""
+    """Count a user's own active API keys.
+
+    This backs the group's max_api_keys allowance, so app-minted keys are
+    excluded: a user should not lose the ability to create their own key
+    because an application provisioned some on their behalf.
+    """
     result = await db.execute(
         select(func.count(ApiKey.id)).where(
             ApiKey.user_id == user_id,
             ApiKey.status == ApiKeyStatus.ACTIVE,
+            ApiKey.hidden.is_(False),
         )
     )
     return result.scalar() or 0
@@ -3056,7 +3316,13 @@ async def get_all_api_keys(
 
 
 async def update_user(db: AsyncSession, user_id: int, **kwargs) -> Optional[User]:
-    """Update user fields."""
+    """Update user fields.
+
+    Setting group_id here settles the account's classification: an
+    administrator choosing a group is a deliberate decision, and it must not be
+    overwritten later by the group inferred from the directory's jobTitle when
+    that user next signs in (see azure_auth.find_or_create_azure_user).
+    """
     result = await db.execute(
         select(User).options(selectinload(User.group)).where(User.id == user_id)
     )
@@ -3066,6 +3332,8 @@ async def update_user(db: AsyncSession, user_id: int, **kwargs) -> Optional[User
     for key, value in kwargs.items():
         if hasattr(user, key):
             setattr(user, key, value)
+    if kwargs.get("group_id") is not None:
+        user.group_classified = True
     await db.flush()
     return user
 

@@ -233,6 +233,13 @@ class User(Base, TimestampMixin, SoftDeleteMixin):
     )
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     last_login_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    # False when the group was assigned without the directory attribute that
+    # normally decides it — an app can provision from an id_token, which does
+    # not carry jobTitle. Settled on the user's first direct MindRouter
+    # sign-in, where Graph data is available (migration 074).
+    group_classified: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default=text("1")
+    )
 
     # Group membership
     # NOT NULL in the database since migration 009 — the model must match,

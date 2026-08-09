@@ -78,8 +78,12 @@
                             <td>
                                 {% if entry.user %}
                                 <code>{{ entry.user.username }}</code>
-                                {% else %}
+                                {% elif entry.user_id %}
+                                {# Actor deleted; the row is retained by policy. #}
                                 <span class="text-muted">ID {{ entry.user_id }}</span>
+                                {% else %}
+                                {# No person acted: a registered app did. #}
+                                <span class="text-muted"><i class="bi bi-app-indicator"></i> application</span>
                                 {% endif %}
                             </td>
                             <td><span class="badge bg-primary">{{ entry.action }}</span></td>

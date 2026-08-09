@@ -1,0 +1,296 @@
+{% extends "base.html" %}
+
+{% block title %}Applications - Admin - MindRouter{% endblock %}
+
+{% block content %}
+<div class="container-fluid py-4">
+    <div class="row">
+        {% set active = "apps" %}
+        {% include "admin/_sidebar.html" %}
+
+        <div class="col-md-10 py-3">
+            <h1><i class="bi bi-app-indicator"></i> Registered Applications</h1>
+            <p class="text-muted">
+                A registered application signs its own users in against Entra and exchanges each
+                user's <code>id_token</code> for a MindRouter key on their behalf, so those users
+                never sign in here. The application's credential can do nothing except provision
+                for the application it belongs to.
+            </p>
+
+            {% if success %}
+            <div class="alert alert-success alert-dismissible fade show" role="alert">
+                {{ success }}
+                <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
+            </div>
+            {% endif %}
+            {% if error %}
+            <div class="alert alert-danger alert-dismissible fade show" role="alert">
+                {{ error }}
+                <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
+            </div>
+            {% endif %}
+
+            <div class="card mb-4">
+                <div class="card-header"><h5 class="mb-0"><i class="bi bi-list-check"></i> Applications</h5></div>
+                <div class="card-body p-0">
+                    {% if not apps %}
+                    <p class="text-muted p-3 mb-0">No applications registered.</p>
+                    {% else %}
+                    <div class="table-responsive">
+                        <table class="table table-sm align-middle mb-0">
+                            <thead>
+                                <tr>
+                                    <th>Application</th>
+                                    <th>Status</th>
+                                    <th>Entra registration</th>
+                                    <th class="text-end">Key life</th>
+                                    <th>Credential</th>
+                                    <th class="text-end">Users</th>
+                                    <th class="text-end">Live keys</th>
+                                    <th class="text-end">Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {% for app in apps %}
+                                {% set st = stats.get(app.id, {}) %}
+                                {% set cred = credentials.get(app.id) %}
+                                <tr>
+                                    <td>
+                                        <code>{{ app.slug }}</code><br>
+                                        <span class="small text-muted">{{ app.name }}</span>
+                                    </td>
+                                    <td>
+                                        {% if app.status == 'active' %}
+                                        <span class="badge bg-success">active</span>
+                                        {% else %}
+                                        <span class="badge bg-secondary">{{ app.status }}</span>
+                                        {% endif %}
+                                    </td>
+                                    <td class="small">
+                                        {% if app.entra_client_id and app.entra_tenant_id %}
+                                        <span class="text-muted">client</span> <code>{{ app.entra_client_id[:8] }}…</code><br>
+                                        <span class="text-muted">tenant</span> <code>{{ app.entra_tenant_id[:8] }}…</code>
+                                        {% else %}
+                                        <span class="badge bg-warning text-dark">not configured</span>
+                                        {% endif %}
+                                    </td>
+                                    <td class="text-end">{{ app.key_ttl_days }}d</td>
+                                    <td class="small">
+                                        {% if cred %}
+                                        <code>{{ cred.key_prefix }}…</code><br>
+                                        {% if cred.expires_at and cred.expires_at.replace(tzinfo=None) < now_utc.replace(tzinfo=None) %}
+                                        <span class="text-danger">expired</span>
+                                        {% else %}
+                                        <span class="text-muted">expires {{ cred.expires_at.strftime('%Y-%m-%d') if cred.expires_at else 'never' }}</span>
+                                        {% endif %}
+                                        {% else %}
+                                        <span class="badge bg-warning text-dark">none issued</span>
+                                        {% endif %}
+                                    </td>
+                                    <td class="text-end">{{ st.get('users', 0) }}</td>
+                                    <td class="text-end">{{ st.get('live_keys', 0) }}</td>
+                                    <td class="text-end text-nowrap">
+                                        {% if not is_read_only %}
+                                        <button class="btn btn-sm btn-outline-secondary" type="button"
+                                                data-bs-toggle="collapse" data-bs-target="#edit-app-{{ app.id }}"
+                                                aria-expanded="false" aria-controls="edit-app-{{ app.id }}">
+                                            <i class="bi bi-pencil"></i> Edit
+                                        </button>
+                                        {% endif %}
+                                    </td>
+                                </tr>
+                                {% if not is_read_only %}
+                                <tr class="collapse" id="edit-app-{{ app.id }}">
+                                    <td colspan="8" class="bg-body-tertiary">
+                                        <div class="row g-3">
+                                            <div class="col-lg-7">
+                                                <form method="post" action="/admin/apps/{{ app.id }}/update">
+                                                    <div class="row g-2">
+                                                        <div class="col-md-6">
+                                                            <label class="form-label small" for="name-{{ app.id }}">Name</label>
+                                                            <input class="form-control form-control-sm" id="name-{{ app.id }}"
+                                                                   name="name" value="{{ app.name }}" required>
+                                                        </div>
+                                                        <div class="col-md-6">
+                                                            <label class="form-label small" for="ttl-{{ app.id }}">Per-user key lifetime (days)</label>
+                                                            <input class="form-control form-control-sm" id="ttl-{{ app.id }}"
+                                                                   name="key_ttl_days" type="number" min="1" max="365"
+                                                                   value="{{ app.key_ttl_days }}">
+                                                        </div>
+                                                        <div class="col-md-6">
+                                                            <label class="form-label small" for="client-{{ app.id }}">Entra client ID</label>
+                                                            <input class="form-control form-control-sm font-monospace" id="client-{{ app.id }}"
+                                                                   name="entra_client_id" value="{{ app.entra_client_id or '' }}"
+                                                                   placeholder="00000000-0000-0000-0000-000000000000">
+                                                        </div>
+                                                        <div class="col-md-6">
+                                                            <label class="form-label small" for="tenant-{{ app.id }}">Entra tenant ID</label>
+                                                            <input class="form-control form-control-sm font-monospace" id="tenant-{{ app.id }}"
+                                                                   name="entra_tenant_id" value="{{ app.entra_tenant_id or '' }}"
+                                                                   placeholder="00000000-0000-0000-0000-000000000000">
+                                                        </div>
+                                                        <div class="col-12">
+                                                            <label class="form-label small" for="desc-{{ app.id }}">Description</label>
+                                                            <textarea class="form-control form-control-sm" id="desc-{{ app.id }}"
+                                                                      name="description" rows="2">{{ app.description or '' }}</textarea>
+                                                        </div>
+                                                    </div>
+                                                    <button class="btn btn-sm btn-primary mt-2" type="submit">Save</button>
+                                                </form>
+                                            </div>
+
+                                            <div class="col-lg-5">
+                                                <div class="d-flex flex-column gap-2">
+                                                    <form method="post" action="/admin/apps/{{ app.id }}/credential"
+                                                          onsubmit="return confirm('Issue a new provisioning credential? The current one stops working immediately.');">
+                                                        <div class="input-group input-group-sm">
+                                                            <span class="input-group-text">Credential life</span>
+                                                            <input class="form-control" name="ttl_days" type="number"
+                                                                   min="1" max="365" value="{{ default_credential_ttl }}">
+                                                            <button class="btn btn-outline-primary" type="submit">
+                                                                <i class="bi bi-key"></i> {{ 'Rotate' if credentials.get(app.id) else 'Issue' }}
+                                                            </button>
+                                                        </div>
+                                                        <div class="form-text">Shown once. Rotating revokes the previous credential.</div>
+                                                    </form>
+
+                                                    <form method="post" action="/admin/apps/{{ app.id }}/revoke-user-keys"
+                                                          onsubmit="return confirm('Revoke every session key this application holds? Users re-provision on their next sign-in.');">
+                                                        <button class="btn btn-sm btn-outline-warning w-100" type="submit">
+                                                            <i class="bi bi-arrow-counterclockwise"></i> Revoke all session keys
+                                                        </button>
+                                                    </form>
+
+                                                    {% if app.status == 'active' %}
+                                                    <form method="post" action="/admin/apps/{{ app.id }}/status"
+                                                          onsubmit="return confirm('Disable this application? Every key it holds — its own credential and every user session key — is revoked immediately.');">
+                                                        <input type="hidden" name="status_value" value="disabled">
+                                                        <button class="btn btn-sm w-100 btn-outline-danger" type="submit">
+                                                            <i class="bi bi-pause-circle"></i> Disable and revoke keys
+                                                        </button>
+                                                    </form>
+                                                    {% else %}
+                                                    <form method="post" action="/admin/apps/{{ app.id }}/status">
+                                                        <input type="hidden" name="status_value" value="active">
+                                                        <button class="btn btn-sm w-100 btn-outline-success" type="submit">
+                                                            <i class="bi bi-play-circle"></i> Enable
+                                                        </button>
+                                                    </form>
+                                                    {% endif %}
+
+                                                    <form method="post" action="/admin/apps/{{ app.id }}/delete">
+                                                        <div class="input-group input-group-sm">
+                                                            <input class="form-control" name="confirm_slug"
+                                                                   placeholder="type {{ app.slug }} to confirm" required>
+                                                            <button class="btn btn-outline-danger" type="submit">
+                                                                <i class="bi bi-trash"></i> Deregister
+                                                            </button>
+                                                        </div>
+                                                    </form>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </td>
+                                </tr>
+                                {% endif %}
+                                {% endfor %}
+                            </tbody>
+                        </table>
+                    </div>
+                    {% endif %}
+                </div>
+            </div>
+
+            {% if not is_read_only %}
+            <div class="card mb-4">
+                <div class="card-header"><h5 class="mb-0"><i class="bi bi-plus-circle"></i> Register an application</h5></div>
+                <div class="card-body">
+                    <form method="post" action="/admin/apps/create">
+                        <div class="row g-3">
+                            <div class="col-md-3">
+                                <label class="form-label" for="new_slug">Slug</label>
+                                <input class="form-control" id="new_slug" name="slug" required
+                                       pattern="[a-z0-9][a-z0-9-]*[a-z0-9]" placeholder="vandalchat">
+                                <div class="form-text">Used in the provisioning URL.</div>
+                            </div>
+                            <div class="col-md-4">
+                                <label class="form-label" for="new_name">Name</label>
+                                <input class="form-control" id="new_name" name="name" required placeholder="VandalChat">
+                            </div>
+                            <div class="col-md-2">
+                                <label class="form-label" for="new_ttl">Key lifetime</label>
+                                <input class="form-control" id="new_ttl" name="key_ttl_days" type="number"
+                                       min="1" max="365" value="30">
+                                <div class="form-text">Days.</div>
+                            </div>
+                            <div class="col-md-3">
+                                <label class="form-label" for="new_client">Entra client ID</label>
+                                <input class="form-control font-monospace" id="new_client" name="entra_client_id"
+                                       placeholder="00000000-0000-…">
+                            </div>
+                            <div class="col-md-3">
+                                <label class="form-label" for="new_tenant">Entra tenant ID</label>
+                                <input class="form-control font-monospace" id="new_tenant" name="entra_tenant_id"
+                                       placeholder="00000000-0000-…">
+                                <div class="form-text">The tenant whose tokens this app presents.</div>
+                            </div>
+                            <div class="col-md-9">
+                                <label class="form-label" for="new_desc">Description</label>
+                                <input class="form-control" id="new_desc" name="description">
+                            </div>
+                        </div>
+                        <button class="btn btn-primary mt-3" type="submit">
+                            <i class="bi bi-plus-lg"></i> Register
+                        </button>
+                        <span class="text-muted small ms-2">
+                            No credential is issued yet — that is a separate step so it is separately audited.
+                        </span>
+                    </form>
+                </div>
+            </div>
+            {% endif %}
+
+            <div class="card">
+                <div class="card-header d-flex justify-content-between align-items-center">
+                    <h5 class="mb-0"><i class="bi bi-person-badge"></i> Awaiting group classification</h5>
+                    <span class="badge bg-secondary">{{ unclassified_total }}</span>
+                </div>
+                <div class="card-body">
+                    <p class="text-muted small">
+                        An <code>id_token</code> carries no job title, so an account first created by an
+                        application lands in the default group. Their group is settled automatically the
+                        first time they sign in to MindRouter directly, where the full directory profile
+                        is available. Until then they hold default limits.
+                    </p>
+                    {% if not unclassified %}
+                    <p class="text-muted mb-0">Nobody is waiting.</p>
+                    {% else %}
+                    <div class="table-responsive">
+                        <table class="table table-sm align-middle mb-0">
+                            <thead>
+                                <tr><th>User</th><th>Email</th><th>Group</th><th>Created</th></tr>
+                            </thead>
+                            <tbody>
+                                {% for u in unclassified %}
+                                <tr>
+                                    <td><a href="/admin/users/{{ u.id }}"><code>{{ u.username }}</code></a></td>
+                                    <td class="small text-muted">{{ u.email }}</td>
+                                    <td class="small">{{ u.group.name if u.group else '—' }}</td>
+                                    <td class="small text-muted">{{ u.created_at.strftime('%Y-%m-%d') if u.created_at else '' }}</td>
+                                </tr>
+                                {% endfor %}
+                            </tbody>
+                        </table>
+                    </div>
+                    {% if unclassified_total > unclassified|length %}
+                    <p class="text-muted small mt-2 mb-0">
+                        Showing {{ unclassified|length }} of {{ unclassified_total }}.
+                    </p>
+                    {% endif %}
+                    {% endif %}
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
