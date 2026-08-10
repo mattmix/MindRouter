@@ -1020,3 +1020,78 @@ async def image_edits(
     service = InferenceService(db)
     response = await service.image_generation(canonical, user, api_key, request)
     return response
+
+
+_MODERATION_MAX_INPUT = 10_000
+
+
+@router.post("/moderations")
+async def moderations(
+    request: Request,
+    db: AsyncSession = Depends(get_async_db),
+    auth: Tuple[User, ApiKey] = Depends(authenticate_request),
+):
+    """Standalone check of a text against the central image content policy.
+
+    Judges a prompt or an image caption with the same LLM judge and
+    ``img.policy`` text used by ``/images/generations`` and
+    ``/images/edits`` — without generating anything. Client apps use this
+    to vet user-supplied reference images (via a vision-model caption)
+    before submitting an img2img edit.
+
+    Body: ``{"input": "<text>", "context": "prompt" | "edit"}`` — "edit"
+    applies the edit-aware judge template (deictic references expected).
+
+    Response: ``{"passed": bool, "reason": str, "judge_model": str,
+    "policy_configured": bool}``. With no policy configured the check
+    passes (matching image generation, which also skips the judge).
+    """
+    user, api_key = auth
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid JSON body"
+        )
+    text = str(body.get("input") or "").strip()
+    if not text:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="'input' is required"
+        )
+    if len(text) > _MODERATION_MAX_INPUT:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"'input' exceeds {_MODERATION_MAX_INPUT} characters",
+        )
+    context = body.get("context") or "prompt"
+    if context not in ("prompt", "edit"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="'context' must be 'prompt' or 'edit'",
+        )
+
+    request_id = f"mod-{uuid.uuid4().hex[:24]}"
+    bind_request_context(request_id=request_id, user_id=user.id)
+
+    policy_text = await crud.get_config_json(db, "img.policy", "")
+    if not policy_text or not policy_text.strip():
+        return {
+            "passed": True,
+            "reason": "No policy configured",
+            "judge_model": "",
+            "policy_configured": False,
+        }
+
+    from backend.app.services.image_policy import evaluate_prompt
+
+    primary_judge = await crud.get_config_json(db, "img.judge_model", "")
+    secondary_judge = await crud.get_config_json(db, "img.judge_model_secondary", "")
+    verdict = await evaluate_prompt(
+        prompt=text,
+        policy=policy_text,
+        primary_model=primary_judge,
+        secondary_model=secondary_judge,
+        is_edit=(context == "edit"),
+    )
+    return {**verdict.to_dict(), "policy_configured": True}
