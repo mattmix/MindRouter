@@ -381,10 +381,18 @@ async def chat_list_models(
     registry = get_registry()
     backends = await registry.get_healthy_backends()
 
+    # Only models a user can talk to belong in the picker: no embedding,
+    # reranking, image, video or voice models (each has its own surface).
+    # Fails open on NULL modality; the embed-name heuristic below covers
+    # embedding models discovery hasn't classified.
+    from backend.app.api.models_api import is_chat_model
+
     model_data: dict = {}
     for backend in backends:
         backend_models = await registry.get_backend_models(backend.id)
         for model in backend_models:
+            if not is_chat_model(model):
+                continue
             if model.name not in model_data:
                 model_data[model.name] = {
                     "capabilities": {
@@ -945,10 +953,13 @@ async def chat_completions(
             if model_context:
                 max_file_tokens = int(model_context * 0.75)
                 if estimated_tokens > max_file_tokens:
-                    # Find models that could handle this file
+                    # Find chat models that could handle this file
+                    from backend.app.api.models_api import is_chat_model
                     suggestions = set()
                     for b in await registry.get_healthy_backends():
                         for m in await registry.get_backend_models(b.id):
+                            if not is_chat_model(m):
+                                continue
                             if m.context_length and int(m.context_length * 0.75) >= estimated_tokens:
                                 suggestions.add((m.name, m.context_length))
 

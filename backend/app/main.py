@@ -212,8 +212,11 @@ async def _warm_page_caches(force_seed: bool = False) -> None:
         from backend.app.db import crud
 
         async with get_async_db_context() as db:
-            # Model token totals (used by /models popularity chart)
-            token_totals = await crud.get_model_token_totals(db, limit=15)
+            # Model token totals (used by /models popularity chart). The
+            # page filters this to visible catalog models at render time and
+            # shows a top-15; overfetch so hidden voice/image/retired names
+            # don't eat chart slots — filtered rows backfill from the extras.
+            token_totals = await crud.get_model_token_totals(db, limit=50)
             if _rc._redis:
                 await _rc._redis.set(
                     "cache:model_token_totals",

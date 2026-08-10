@@ -279,12 +279,17 @@ async def public_dashboard(
         all_backends = []
         healthy_backends = []
 
-    # Get models
+    # Get models. Same catalog filter as /status (which refreshes this list
+    # client-side): image/video/voice models have their own surfaces and are
+    # not presented as LLMs. Fails open on NULL modality.
+    from backend.app.api.models_api import is_catalog_model
+
     models = set()
     for backend in healthy_backends:
         backend_models = await registry.get_backend_models(backend.id)
         for m in backend_models:
-            models.add(m.name)
+            if is_catalog_model(m):
+                models.add(m.name)
 
     # Get scheduler stats
     try:
@@ -370,10 +375,18 @@ async def models_catalog(
     registry = get_registry()
     backends = await registry.get_healthy_backends()
 
+    # Same modality filter as the API catalogs (/v1/models etc., 2.9.10):
+    # image/video/voice models are browsable on their own surfaces, not here,
+    # where picking one for chat gives a confusing failure. Fails open on
+    # NULL modality so a discovery gap never hides a working chat model.
+    from backend.app.api.models_api import is_catalog_model
+
     model_data: dict = {}
     for backend in backends:
         backend_models = await registry.get_backend_models(backend.id)
         for model in backend_models:
+            if not is_catalog_model(model):
+                continue
             if model.name not in model_data:
                 model_data[model.name] = {
                     "capabilities": {
@@ -506,6 +519,18 @@ async def models_catalog(
                 token_totals = _json.loads(cached)
     except Exception:
         token_totals = []
+
+    # The cache is unfiltered usage data (top 50 across every modality — see
+    # _warm_page_caches); narrow it to the models the grid shows, then take
+    # the top 15 so filtered-out rows backfill instead of leaving holes.
+    # Casefold both sides: Request.model keeps client-sent casing and MariaDB
+    # groups it case-insensitively, so a usage row's name can differ in case
+    # from the registry name it belongs to.
+    visible_names = {m["name"].casefold() for m in models_list}
+    token_totals = [
+        t for t in token_totals
+        if (t.get("model") or "").casefold() in visible_names
+    ][:15]
 
     return templates.TemplateResponse(
         "public/models.html",
@@ -3962,14 +3987,19 @@ async def admin_chat_config(
     if not user or (not user.group or not user.group.has_admin_read):
         return RedirectResponse(url="/dashboard", status_code=302)
 
-    # Get distinct model names from healthy backends (exclude embedding)
+    # Get distinct model names from healthy backends. This list exists to
+    # pick core/default CHAT models, so exclude everything that can't chat
+    # (embedding/reranking/image/video/voice); the name heuristic still
+    # covers embed models whose modality is NULL (filter fails open there).
+    from backend.app.api.models_api import is_chat_model
+
     registry = get_registry()
     backends = await registry.get_healthy_backends()
     available_models = set()
     for backend in backends:
         backend_models = await registry.get_backend_models(backend.id)
         for m in backend_models:
-            if "embed" not in m.name.lower():
+            if is_chat_model(m) and "embed" not in m.name.lower():
                 available_models.add(m.name)
 
     core_models = await crud.get_config_json(db, "chat.core_models", [])

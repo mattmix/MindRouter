@@ -54,6 +54,29 @@ def is_catalog_model(model) -> bool:
         return True
     return modality in CATALOG_MODALITIES
 
+
+# Modalities a user can hold a conversation with. Narrower than
+# CATALOG_MODALITIES: embedding and reranking models belong in the API
+# catalogs but cannot chat, so pickers that exist to start a conversation
+# (the chat UI, the admin core-model config) use this set instead.
+CHAT_MODALITIES = frozenset({
+    Modality.CHAT,
+    Modality.COMPLETION,
+    Modality.MULTIMODAL,
+})
+
+
+def is_chat_model(model) -> bool:
+    """True when a model can serve a chat conversation.
+
+    Fails open on unknown/NULL modality, same as is_catalog_model: a
+    discovery gap must never hide a working chat model from the picker.
+    """
+    modality = getattr(model, "modality", None)
+    if modality is None:
+        return True
+    return modality in CHAT_MODALITIES
+
 router = APIRouter(tags=["models"])
 
 

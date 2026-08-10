@@ -1776,11 +1776,16 @@ document.addEventListener('mr-theme-changed', function(e) {
                 }
                 modelSelect.appendChild(opt);
             });
-            // Selection priority: current -> localStorage -> server default -> first
+            // Selection priority: current -> localStorage -> server default -> first.
+            // Cascade past candidates no longer offered (hidden or offline
+            // models) rather than short-circuiting on the first truthy value,
+            // so a stale localStorage entry can't shadow the server default.
             const lastModel = localStorage.getItem('mindrouter_last_model');
-            const preferred = currentValue || lastModel || serverDefaultModel;
-            if (preferred && modelSelect.querySelector(`option[value="${CSS.escape(preferred)}"]`)) {
-                modelSelect.value = preferred;
+            for (const candidate of [currentValue, lastModel, serverDefaultModel]) {
+                if (candidate && modelSelect.querySelector(`option[value="${CSS.escape(candidate)}"]`)) {
+                    modelSelect.value = candidate;
+                    break;
+                }
             }
         } else {
             modelSelect.innerHTML = '<option value="">No models available</option>';
