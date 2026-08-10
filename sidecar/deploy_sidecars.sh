@@ -24,11 +24,91 @@ DOCKER_NETWORK="mindrouter-sidecar"
 DOCKER_SUBNET="10.200.0.0/24"
 DOCKER_GATEWAY="10.200.0.1"
 SSH_USER="sheneman"
+# Identity for the aspen jump; override if your key lives elsewhere.
+ASPEN_KEY="${ASPEN_KEY:-$HOME/.ssh/id_aspen}"
 
-ALL_NODES="aspen1 aspen2 aspen3 aspen4 aspen5 marten lynx calvin eunice webbyg1 webbyg2 neuromancer"
+ALL_NODES="aspen1 aspen2 aspen3 aspen4 aspen5 marten lynx calvin eunice webbyg1 webbyg2 neuromancer wintermute"
 
-# Per-node sidecar keys (from MindRouter DB)
+# SSH target. Most nodes resolve by bare hostname from the operator's
+# ~/.ssh/config; wintermute does not, and is only reachable through the
+# gateway, so it carries its FQDN and a ProxyJump below.
+node_host() {
+    case "$1" in
+        aspen[1-5]) echo "$1.hpc.uidaho.edu" ;;
+        wintermute) echo "wintermute.nkn.uidaho.edu" ;;
+        *)          echo "$1" ;;
+    esac
+}
+
+# Host port the sidecar container publishes, and therefore the port the node's
+# reverse proxy points at. The aspens were standardised on 18207; every other
+# node uses 18007. Deploying with the wrong one starts the container somewhere
+# the node's own nginx is not looking, which takes the node offline in
+# MindRouter with a perfectly healthy container running.
+sidecar_port() {
+    case "$1" in
+        aspen[1-5]) echo "18207" ;;
+        *)          echo "18007" ;;
+    esac
+}
+
+# Fully-qualified name, used for TLS probes. The node certificates are issued
+# for the hostname, so a probe against a bare name or 127.0.0.1 fails
+# verification even when the proxy is healthy — which reads as an outage.
+node_fqdn() {
+    case "$1" in
+        aspen[1-5]|marten|lynx|webbyg1|webbyg2) echo "$1.hpc.uidaho.edu" ;;
+        calvin|eunice|aurora|neuromancer|wintermute) echo "$1.nkn.uidaho.edu" ;;
+        *) echo "$1" ;;
+    esac
+}
+
+# Extra ssh/scp options per node. Deliberately empty for the existing nodes —
+# they already work via ~/.ssh/config and changing that would risk breaking a
+# working deploy path for a cosmetic gain.
+ssh_opts() {
+    case "$1" in
+        # The aspens do not accept SSH from outside the cluster (port 22 times
+        # out), so a bare `ssh sheneman@aspenN` — what this script used to do —
+        # reports every one of them as an unreachable, dead sidecar.
+        aspen[1-5]) echo "-o ProxyJump=$SSH_USER@lynx.hpc.uidaho.edu -i $ASPEN_KEY" ;;
+        wintermute) echo "-o ProxyJump=mindrouter@mindrouter.uidaho.edu" ;;
+        *)          echo "" ;;
+    esac
+}
+
+# Wrappers so every remote call picks up the host mapping and jump host.
+nssh() { local n="$1"; shift; ssh $(ssh_opts "$n") "$SSH_USER@$(node_host "$n")" "$@"; }
+nscp() { local n="$1"; local dst="$1"; shift; local last="${@: -1}"; set -- "${@:1:$#-1}";
+         scp -q $(ssh_opts "$n") "$@" "$SSH_USER@$(node_host "$n"):$last"; }
+
+# Per-node sidecar keys.
+#
+# SECURITY: the table below is checked into the repository, so every key in it
+# should be considered compromised to anyone with repo access — and a sidecar
+# key is not read-only, it also gates the node's model pull/delete endpoints.
+# Prefer supplying keys OUT of band; the table is a fallback for the nodes that
+# predate this and should be emptied as they are rotated. Resolution order:
+#
+#   1. $SIDECAR_KEY_<NODE>            e.g. SIDECAR_KEY_WINTERMUTE=...
+#   2. $SIDECAR_KEY_FILE              lines of "<node> <key>", default
+#                                     /etc/mindrouter/sidecar-keys (mode 0600)
+#   3. the in-repo table below
+#
+# New nodes (wintermute onward) are deliberately NOT added to the table.
+SIDECAR_KEY_FILE="${SIDECAR_KEY_FILE:-/etc/mindrouter/sidecar-keys}"
+
 node_key() {
+    local envvar
+    envvar="SIDECAR_KEY_$(printf '%s' "$1" | tr '[:lower:]-' '[:upper:]_')"
+    if [ -n "${!envvar:-}" ]; then echo "${!envvar}"; return 0; fi
+
+    if [ -r "$SIDECAR_KEY_FILE" ]; then
+        local k
+        k=$(awk -v n="$1" '$1 == n { print $2; exit }' "$SIDECAR_KEY_FILE")
+        if [ -n "$k" ]; then echo "$k"; return 0; fi
+    fi
+
     case "$1" in
         marten)      echo "b0447d8d7efefac27a761783447e37dce366395b802f69c5e578014966507953" ;;
         aspen1)      echo "dd4bb8de54cb3ee1f732b1d21ac428180b0a76c6e5b740dcde5daf8e33d5fcbc" ;;
@@ -50,6 +130,9 @@ node_key() {
 old_paths() {
     case "$1" in
         aspen[1-5]) echo "/scratch/mindrouter2/sidecar" ;;
+        # Never had a pre-standardisation location; returning REMOTE_DIR makes
+        # the cleanup step a no-op by construction rather than by luck.
+        wintermute) echo "$REMOTE_DIR" ;;
         *)          echo "/space/mindrouter/sidecar" ;;
     esac
 }
@@ -60,19 +143,30 @@ verify_node() {
     key="$(node_key "$node")"
 
     # Internal (container direct)
+    local iport
+    iport="$(sidecar_port "$node")"
     local internal
-    internal=$(ssh $SSH_USER@"$node" \
-        "curl -sf -m5 -H 'X-Sidecar-Key: $key' http://127.0.0.1:18007/health 2>&1" || echo "UNREACHABLE")
+    internal=$(nssh "$node" \
+        "curl -sf -m5 -H 'X-Sidecar-Key: $key' http://127.0.0.1:$iport/health 2>&1" || echo "UNREACHABLE")
 
-    # Via nginx proxy
+    # Via the reverse proxy. Some nodes terminate TLS on 8007 (neuromancer,
+    # wintermute) and some serve it plain, so try https first and fall back —
+    # probing only http reports a working TLS node as UNREACHABLE.
+    #    The TLS probe must use the FQDN: the node certificate is issued for
+    #    the hostname, so hitting 127.0.0.1 fails verification even when the
+    #    proxy is perfectly healthy.
+    local fqdn
+    fqdn="$(node_fqdn "$node")"
     local external
-    external=$(ssh $SSH_USER@"$node" \
-        "curl -sf -m5 -H 'X-Sidecar-Key: $key' http://127.0.0.1:8007/health 2>&1" || echo "UNREACHABLE")
+    external=$(nssh "$node" \
+        "curl -sf -m5 -H 'X-Sidecar-Key: $key' https://$fqdn:8007/health 2>/dev/null \
+         || curl -sf -m5 -H 'X-Sidecar-Key: $key' http://127.0.0.1:8007/health 2>&1" || echo "UNREACHABLE")
 
     # Server power
     local power
-    power=$(ssh $SSH_USER@"$node" \
-        "curl -sf -m10 -H 'X-Sidecar-Key: $key' http://127.0.0.1:8007/gpu-info 2>/dev/null" \
+    power=$(nssh "$node" \
+        "curl -sf -m10 -H 'X-Sidecar-Key: $key' https://$fqdn:8007/gpu-info 2>/dev/null \
+         || curl -sf -m10 -H 'X-Sidecar-Key: $key' http://127.0.0.1:8007/gpu-info 2>/dev/null" \
         | python3 -c "import sys,json; d=json.load(sys.stdin); sp=d.get('server_power',{}); print(sp.get('instantaneous_watts', sp.get('error','N/A')))" 2>/dev/null \
         || echo "N/A")
 
@@ -91,25 +185,25 @@ deploy_node() {
 
     # 1. Copy sidecar files to /opt/mindrouter/sidecar/
     echo "  [$node] Copying files..."
-    scp -q "$SCRIPT_DIR/gpu_agent.py" \
-           "$SCRIPT_DIR/Dockerfile.sidecar" \
-           "$SCRIPT_DIR/requirements.txt" \
-           "$SCRIPT_DIR/VERSION" \
-           $SSH_USER@"$node":~/
-    ssh $SSH_USER@"$node" "sudo mkdir -p $REMOTE_DIR && sudo cp ~/gpu_agent.py ~/Dockerfile.sidecar ~/requirements.txt ~/VERSION $REMOTE_DIR/"
+    nscp "$node" "$SCRIPT_DIR/gpu_agent.py" \
+                 "$SCRIPT_DIR/Dockerfile.sidecar" \
+                 "$SCRIPT_DIR/requirements.txt" \
+                 "$SCRIPT_DIR/VERSION" \
+                 "~/"
+    nssh "$node" "sudo mkdir -p $REMOTE_DIR && sudo cp ~/gpu_agent.py ~/Dockerfile.sidecar ~/requirements.txt ~/VERSION $REMOTE_DIR/"
 
     # 2. Create Docker network (10.200.0.0/24)
     #    neuromancer already has a 'mindrouter' network on this subnet (shared with voice containers)
     local net_name="$DOCKER_NETWORK"
-    if ssh $SSH_USER@"$node" "sudo docker network inspect mindrouter >/dev/null 2>&1" && \
+    if nssh "$node" "sudo docker network inspect mindrouter >/dev/null 2>&1" && \
        [ "$node" != "" ] && \
-       ! ssh $SSH_USER@"$node" "sudo docker network inspect $DOCKER_NETWORK >/dev/null 2>&1"; then
+       ! nssh "$node" "sudo docker network inspect $DOCKER_NETWORK >/dev/null 2>&1"; then
         # An existing 'mindrouter' network on the same subnet — reuse it
         net_name="mindrouter"
         echo "  [$node] Reusing existing 'mindrouter' Docker network..."
     else
         echo "  [$node] Ensuring Docker network ($DOCKER_SUBNET)..."
-        ssh $SSH_USER@"$node" "sudo docker network inspect $DOCKER_NETWORK >/dev/null 2>&1 || \
+        nssh "$node" "sudo docker network inspect $DOCKER_NETWORK >/dev/null 2>&1 || \
             sudo docker network create --driver bridge \
             --subnet $DOCKER_SUBNET --gateway $DOCKER_GATEWAY \
             $DOCKER_NETWORK"
@@ -117,42 +211,49 @@ deploy_node() {
 
     # 3. Build Docker image
     echo "  [$node] Building Docker image..."
-    ssh $SSH_USER@"$node" "cd $REMOTE_DIR && sudo docker build --network host --no-cache \
+    nssh "$node" "cd $REMOTE_DIR && sudo docker build --network host --no-cache \
         -t mindrouter-sidecar:latest -f Dockerfile.sidecar . >/dev/null 2>&1"
 
     # 4. Stop and remove old container
     echo "  [$node] Removing old container..."
-    ssh $SSH_USER@"$node" "sudo docker rm -f gpu-sidecar 2>/dev/null || true"
+    nssh "$node" "sudo docker rm -f gpu-sidecar 2>/dev/null || true"
 
     # 5. Start new container
     local ipmi_flag=""
-    if ssh $SSH_USER@"$node" "test -c /dev/ipmi0" 2>/dev/null; then
+    if nssh "$node" "test -c /dev/ipmi0" 2>/dev/null; then
         ipmi_flag="--device /dev/ipmi0:/dev/ipmi0"
     else
         echo "  [$node] WARNING: /dev/ipmi0 not found, skipping IPMI"
     fi
 
     echo "  [$node] Starting container (key=${key:0:8}...)..."
-    ssh $SSH_USER@"$node" "sudo docker run -d \
+    nssh "$node" "sudo docker run -d \
         --name gpu-sidecar \
         --restart unless-stopped \
         --gpus all \
         $ipmi_flag \
         --network $net_name \
-        -p 127.0.0.1:18007:8007 \
+        -p 127.0.0.1:$(sidecar_port "$node"):8007 \
         -e SIDECAR_SECRET_KEY='$key' \
         mindrouter-sidecar:latest"
 
     # 6. Install/configure reverse proxy (:8007 → :18007)
     #    webbyg2 uses Apache (httpd) for multiple services — skip nginx there
-    if ssh $SSH_USER@"$node" "test -f /etc/httpd/conf.d/sidecar-proxy.conf" 2>/dev/null; then
+    if nssh "$node" "test -f /etc/httpd/conf.d/sidecar-proxy.conf" 2>/dev/null; then
         echo "  [$node] Apache sidecar proxy already configured, skipping nginx..."
-        ssh $SSH_USER@"$node" "sudo systemctl reload httpd 2>/dev/null || true"
+        nssh "$node" "sudo systemctl reload httpd 2>/dev/null || true"
+    elif nssh "$node" "sudo grep -qi ' ssl' /etc/nginx/conf.d/sidecar-proxy.conf" 2>/dev/null; then
+        # The node already terminates TLS on 8007. The template in this repo is
+        # plain HTTP, so copying it over would silently downgrade the node and
+        # break the https:// sidecar_url MindRouter has registered for it.
+        echo "  [$node] Existing TLS sidecar proxy kept (template is plaintext)."
+        nssh "$node" "sudo nginx -t >/dev/null 2>&1 && sudo systemctl reload nginx"
     else
         echo "  [$node] Configuring nginx..."
-        ssh $SSH_USER@"$node" "command -v nginx >/dev/null 2>&1 || sudo dnf install -y nginx >/dev/null 2>&1"
-        scp -q "$SCRIPT_DIR/mindrouter-sidecar-nginx.conf" $SSH_USER@"$node":/tmp/mindrouter-sidecar.conf
-        ssh $SSH_USER@"$node" "sudo cp /tmp/mindrouter-sidecar.conf /etc/nginx/conf.d/sidecar-proxy.conf && \
+        nssh "$node" "command -v nginx >/dev/null 2>&1 || sudo dnf install -y nginx >/dev/null 2>&1"
+        nscp "$node" "$SCRIPT_DIR/mindrouter-sidecar-nginx.conf" "/tmp/mindrouter-sidecar.conf"
+        nssh "$node" "sudo cp /tmp/mindrouter-sidecar.conf /etc/nginx/conf.d/sidecar-proxy.conf && \
+            sudo sed -i 's/127\\.0\\.0\\.1:18007/127.0.0.1:$(sidecar_port "$node")/' /etc/nginx/conf.d/sidecar-proxy.conf && \
             sudo nginx -t 2>/dev/null && sudo systemctl enable nginx >/dev/null 2>&1 && \
             (sudo systemctl is-active nginx >/dev/null 2>&1 && sudo systemctl reload nginx || sudo systemctl start nginx)"
     fi
@@ -161,7 +262,7 @@ deploy_node() {
     local old_path
     old_path="$(old_paths "$node")"
     if [ "$old_path" != "$REMOTE_DIR" ]; then
-        ssh $SSH_USER@"$node" "[ -d '$old_path' ] && sudo rm -rf '$old_path' && echo '  [$node] Cleaned up $old_path' || true"
+        nssh "$node" "[ -d '$old_path' ] && sudo rm -rf '$old_path' && echo '  [$node] Cleaned up $old_path' || true"
     fi
 
     # 8. Verify
@@ -177,8 +278,11 @@ echo "MindRouter Sidecar Deployment (v$VERSION)"
 echo ""
 
 if [ "${1:-}" = "--verify" ]; then
+    # Optional node list after --verify, so a single node can be checked
+    # without walking all of them over SSH.
+    shift
     echo "Verification only:"
-    for node in $ALL_NODES; do
+    for node in ${*:-$ALL_NODES}; do
         verify_node "$node"
     done
     exit 0
