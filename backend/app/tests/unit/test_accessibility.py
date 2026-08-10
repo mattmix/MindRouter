@@ -358,6 +358,7 @@ ADMIN_TEMPLATES = [
     "admin/nodes.html",
     "admin/metrics.html",
     "admin/video_config.html",
+    "admin/images_config.html",
 ]
 
 
@@ -403,6 +404,7 @@ TEMPLATES_WITH_TABLES = [
     "admin/api_keys.html",
     "admin/audit.html",
     "admin/video_config.html",
+    "admin/images_config.html",
     "user/dashboard.html",
 ]
 

@@ -54,6 +54,11 @@ templates.env.globals["version"] = get_settings().app_version
 # authenticated pages (chat) 500 with "'branding' is undefined".
 from backend.app.services import branding as _branding  # noqa: E402
 templates.env.globals["branding"] = _branding.get_branding
+# base.html gates the Images nav link on image_access(user): the flag is
+# tri-state, so a raw truthiness test hides the link from every inheriting
+# user. Nav visibility only — the routes re-resolve against the database.
+from backend.app.services import feature_access as _feature_access  # noqa: E402
+templates.env.globals["image_access"] = _feature_access.image_access
 
 
 # ---------------------------------------------------------------------------

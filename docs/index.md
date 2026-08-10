@@ -1110,7 +1110,7 @@ The admin dashboard has a persistent sidebar with links to all admin pages:
 | Voice Config | `/admin/voice-config` | Configure TTS/STT backend connections, available voices, and API quota token costs |
 | Search | `/admin/search-config` | Web search provider (Brave or SearXNG), endpoint, API key, max results, per-search quota token cost, plus a test query |
 | OCR | `/admin/ocr-config` | OCR enable toggle, default model, prompts, DPI, page/file limits, chunk size and overlap, chunk concurrency, retries |
-| Images | `/admin/images-config` | Image generation enable toggle, default model, default/allowed sizes, steps and guidance defaults, safety judge models and policy, per-user access grants |
+| Images | `/admin/images-config` | Image generation enable toggle, default model, default/allowed sizes, steps and guidance defaults, safety judge models and policy, and user access as a **global default plus per-user allow/deny exceptions** (on by default; new SSO- and app-provisioned accounts inherit it) |
 | Video | `/admin/video-config` | Video generation enable toggle, default model, allowed sizes and durations, per-user concurrent job cap and storage cap, token cost per second, per-user access grants |
 | Blog Posts | `/admin/blog` | Blog/CMS management -- create, edit, publish, delete posts |
 | Email | `/admin/email` | Compose and send announcement email to selected users or groups, with recipient count preview and test send |

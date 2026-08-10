@@ -110,6 +110,11 @@ templates.env.globals["version"] = get_settings().app_version
 # through each route. See backend/app/services/branding.py.
 from backend.app.services import branding as branding_service  # noqa: E402
 templates.env.globals["branding"] = branding_service.get_branding
+# base.html gates the Images nav link on image_access(user): the flag is
+# tri-state, so a raw truthiness test hides the link from every inheriting
+# user. Nav visibility only — the routes re-resolve against the database.
+from backend.app.services import feature_access as _feature_access  # noqa: E402
+templates.env.globals["image_access"] = _feature_access.image_access
 
 # ---------------------------------------------------------------------------
 # Timezone filter — converts UTC datetimes to the configured app timezone
@@ -4424,6 +4429,7 @@ async def admin_images_config(
     success: Optional[str] = None,
     error: Optional[str] = None,
     search: Optional[str] = None,
+    override: Optional[str] = None,
     page: int = 1,
     db: AsyncSession = Depends(get_async_db),
 ):
@@ -4450,23 +4456,75 @@ async def admin_images_config(
         if m.modality in (Modality.CHAT, Modality.MULTIMODAL)
     })
 
-    # User list with pagination
-    per_page = 50
-    users_list, total_count = await crud.get_users(
-        db, skip=(page - 1) * per_page, limit=per_page,
-        search=search, is_active=True, sort_by="username", sort_dir="asc",
-    )
-    total_pages = max(1, (total_count + per_page - 1) // per_page)
+    # Image access is a global default plus per-user exceptions. The list below
+    # is ONLY the exceptions, and which exception it is depends on the global:
+    # with the default ON the interesting users are the denied, with it OFF the
+    # allowed. A redundant override (equal to the global) resolves to the same
+    # answer as inheriting, so it is excluded by the query rather than hidden in
+    # the template.
+    from backend.app.services import feature_access
 
-    # Count enabled users
-    enabled_result = await db.execute(
-        select(func.count()).select_from(UserModel).where(
-            UserModel.image_generation_enabled == True,  # noqa: E712
-            UserModel.deleted_at.is_(None),
-            UserModel.is_active == True,  # noqa: E712
-        )
+    default_enabled = await feature_access.image_default_enabled(db)
+    exception_kind = feature_access.exception_kind(default_enabled)
+
+    # By default the list shows the EXCEPTIONS. But an override in the same
+    # direction as the global is still a real row that outranks a future flip
+    # of the default — migration 075 deliberately preserves 49 of them — so the
+    # counter badges are filters, and every override is reachable from the UI
+    # in whichever direction it points.
+    list_kind = override if override in ("on", "off", "set") else exception_kind
+    filtered = list_kind != exception_kind
+
+    # The list is searchable: with a large exception population, restoring one
+    # named person's access must not mean paging 50 at a time looking for them.
+    per_page = 50
+    exceptions_list, exception_total = await crud.get_users(
+        db, skip=(page - 1) * per_page, limit=per_page,
+        is_active=True, sort_by="username", sort_dir="asc",
+        image_override=list_kind, search=search,
     )
-    enabled_count = enabled_result.scalar() or 0
+    total_pages = max(1, (exception_total + per_page - 1) // per_page)
+
+    # Search also matches users who are NOT currently exceptions, so an admin
+    # can add one. Capped, with the true total reported so a truncated result
+    # never reads as "no such person".
+    search_results = []
+    search_total = 0
+    search_limit = 20
+    if search:
+        search_results, search_total = await crud.get_users(
+            db, skip=0, limit=search_limit, search=search, is_active=True,
+            sort_by="username", sort_dir="asc",
+        )
+
+    _active = [UserModel.deleted_at.is_(None), UserModel.is_active == True]  # noqa: E712
+
+    async def _count(*extra):
+        result = await db.execute(
+            select(func.count()).select_from(UserModel).where(*_active, *extra)
+        )
+        return result.scalar() or 0
+
+    active_total = await _count()
+    effective_count = await _count(
+        feature_access.access_filter(UserModel.image_generation_enabled, default_enabled)
+    )
+    forced_on_count = await _count(UserModel.image_generation_enabled.is_(True))
+    forced_off_count = await _count(UserModel.image_generation_enabled.is_(False))
+
+    # Effective state is resolved server-side, with the same function the gates
+    # use, so the template cannot drift from the enforcement decision.
+    def _row(u):
+        return {
+            "user": u,
+            "override": u.image_generation_enabled,
+            "effective": feature_access.resolve_feature_access(
+                u.image_generation_enabled, default_enabled
+            ),
+        }
+
+    exception_rows = [_row(u) for u in exceptions_list]
+    search_rows = [_row(u) for u in search_results]
 
     masq = await _admin_masquerade_context(request, user, db)
     return templates.TemplateResponse(
@@ -4490,12 +4548,22 @@ async def admin_images_config(
             "policy": await crud.get_config_json(db, "img.policy", ""),
             "judge_model": await crud.get_config_json(db, "img.judge_model", ""),
             "judge_model_secondary": await crud.get_config_json(db, "img.judge_model_secondary", ""),
-            "users": users_list,
-            "total_users": total_count,
+            "enabled_by_default": default_enabled,
+            "exception_rows": exception_rows,
+            "exception_total": exception_total,
+            "exception_kind": exception_kind,
+            "list_kind": list_kind,
+            "filtered": filtered,
+            "search_rows": search_rows,
+            "search_total": search_total,
+            "search_limit": search_limit,
             "total_pages": total_pages,
             "page": page,
             "search": search,
-            "enabled_count": enabled_count,
+            "active_total": active_total,
+            "effective_count": effective_count,
+            "forced_on_count": forced_on_count,
+            "forced_off_count": forced_off_count,
             "success": success,
             "error": error,
         },
@@ -4522,6 +4590,12 @@ async def admin_images_config_post(
 
     if action == "save_config":
         await crud.set_config(db, "img.enabled", "enabled" in form)
+        # The per-user DEFAULT, distinct from the kill switch above. Flipping it
+        # must NOT rewrite users.image_generation_enabled — see the comment on
+        # the redirect below.
+        await crud.set_config(
+            db, "img.enabled_by_default", "enabled_by_default" in form
+        )
         await crud.set_config(db, "img.default_model", form.get("default_model", "").strip() or "black-forest-labs/FLUX.2-dev")
         await crud.set_config(db, "img.default_size", form.get("default_size", "").strip() or "1024x1024")
         await crud.set_config(db, "img.allowed_sizes", form.get("allowed_sizes", "").strip())
@@ -4555,31 +4629,67 @@ async def admin_images_config_post(
         await crud.log_admin_action(
             db, user_id=user_id, action="images_config.save",
             entity_type="config",
-            after_value={"enabled": "enabled" in form, "model": form.get("default_model")},
+            after_value={
+                "enabled": "enabled" in form,
+                "enabled_by_default": "enabled_by_default" in form,
+                "model": form.get("default_model"),
+            },
             ip_address=_ip,
         )
         await db.commit()
+        # Propagate to this worker's nav cache immediately; the background
+        # refresh loop converges the others within its interval.
+        from backend.app.services import feature_access
+
+        await feature_access.refresh_feature_access_cache(db)
         return RedirectResponse(url="/admin/images-config?success=config_updated", status_code=302)
 
-    elif action == "toggle_user":
-        target_id = int(form.get("user_id", 0))
+    elif action == "set_user_override":
+        # Explicit three-way set, NOT a negation of the current value. The old
+        # `not target_user.image_generation_enabled` is actively wrong on a
+        # tri-state column: `not None` is True, so touching an inheriting user
+        # silently wrote a force-ON that would survive the global being turned
+        # off. This is the only failure in the feature that fails OPEN.
+        try:
+            target_id = int(form.get("user_id", 0))
+        except (TypeError, ValueError):
+            return RedirectResponse(url="/admin/images-config?error=Invalid+user", status_code=302)
+
+        value_raw = (form.get("value") or "").strip()
+        if value_raw not in ("allow", "deny", "inherit"):
+            return RedirectResponse(url="/admin/images-config?error=Invalid+value", status_code=302)
+        new_val = {"allow": True, "deny": False, "inherit": None}[value_raw]
+
         target_user = await crud.get_user_by_id(db, target_id)
         if not target_user:
             return RedirectResponse(url="/admin/images-config?error=User+not+found", status_code=302)
 
-        new_val = not target_user.image_generation_enabled
+        # Record what was actually there, rather than inferring it from the new
+        # value; None must survive into the log as null so "was inheriting" is
+        # distinguishable from "was explicitly off".
+        before_val = target_user.image_generation_enabled
         target_user.image_generation_enabled = new_val
 
         await crud.log_admin_action(
-            db, user_id=user_id, action="images_config.toggle_user",
+            db, user_id=user_id, action="images_config.set_user_override",
             entity_type="user", entity_id=str(target_id),
-            before_value={"image_generation_enabled": not new_val},
+            before_value={"image_generation_enabled": before_val},
             after_value={"image_generation_enabled": new_val},
             ip_address=_ip,
         )
         await db.commit()
-        status_msg = "user_enabled" if new_val else "user_disabled"
-        return RedirectResponse(url=f"/admin/images-config?success={status_msg}", status_code=302)
+        status_msg = {
+            "allow": "user_allowed", "deny": "user_denied", "inherit": "user_inherit",
+        }[value_raw]
+        # Carry the admin's search context back so acting on a searched user
+        # does not dump them to an unfiltered page 1.
+        suffix = ""
+        keep_search = (form.get("user_search") or "").strip()
+        if keep_search:
+            suffix = f"&search={quote_plus(keep_search)}"
+        return RedirectResponse(
+            url=f"/admin/images-config?success={status_msg}{suffix}", status_code=302
+        )
 
     return RedirectResponse(url="/admin/images-config?error=Unknown+action", status_code=302)
 

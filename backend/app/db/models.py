@@ -252,7 +252,19 @@ class User(Base, TimestampMixin, SoftDeleteMixin):
     intended_use: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
     # Feature access
-    image_generation_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, server_default="0")
+    #
+    # image_generation_enabled is TRI-STATE (migration 075): NULL inherits the
+    # `img.enabled_by_default` global, True forces ON, False forces OFF. Never
+    # read it directly — a nullable boolean is falsy, so `if not user.x` denies
+    # every inheriting user. Resolve through services/feature_access.py.
+    #
+    # NEITHER `default=` NOR `server_default=` may come back. Both defeat
+    # inheritance for new accounts, and the second is the subtle one: with a
+    # server default present SQLAlchemy omits the column from the INSERT even
+    # when it is explicitly assigned None, so every SSO- and app-provisioned
+    # user would be written force-OFF.
+    image_generation_enabled: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    # Video remains a plain opt-in boolean — deliberately not changed here.
     video_generation_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, server_default="0")
 
     # Agreement tracking

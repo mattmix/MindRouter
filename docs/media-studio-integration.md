@@ -60,11 +60,16 @@ X-API-Key: <key>
 Authorization: Bearer <key>
 ```
 
-Your account must additionally have the relevant capability flags enabled by an
-administrator:
+Your account must additionally have the relevant capability:
 
-- `image_generation_enabled` — for `/v1/images/*`
-- `video_generation_enabled` — for `/v1/videos/*`
+- **Images** (`/v1/images/*`) — on by default for every account since 2.9.13,
+  including accounts created by single sign-on and by a registered
+  application. An administrator can override it per user in either direction
+  from **Admin → Images**, and can change the default itself
+  (`img.enabled_by_default`). Ask to be added as an exception only if you have
+  been explicitly denied.
+- **Video** (`/v1/videos/*`) — `video_generation_enabled`, still opt-in and
+  granted per user by an administrator.
 
 and the corresponding service must be enabled server-side (`img.enabled`,
 `vid.enabled`, `voice.tts_enabled`, `voice.stt_enabled`). If a capability is off

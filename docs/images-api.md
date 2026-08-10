@@ -39,8 +39,13 @@ Additional account gating (both must be true or the request is rejected):
 - The image subsystem must be enabled globally (admin key `img.enabled`,
   default `true`). If disabled: **503 Service Unavailable** —
   `"Image generation is currently disabled"`.
-- Your account must have image generation enabled
-  (`user.image_generation_enabled`). If not: **403 Forbidden** —
+- Your account must have image generation access. Since 2.9.13 this is
+  **on by default for every account**, including accounts created by single
+  sign-on and by a registered application. An administrator can override it
+  per user from **Admin → Images**, in either direction, and can flip the
+  default itself (admin key `img.enabled_by_default`, default `true`). If you
+  have been explicitly denied — or if the default is off and you have not been
+  explicitly allowed: **403 Forbidden** —
   `"Image generation is not enabled for your account. Contact an
   administrator."`
 

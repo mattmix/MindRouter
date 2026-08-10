@@ -1,0 +1,13 @@
+{#- Renders a user's image-access OVERRIDE, distinct from their effective access.
+
+     The test MUST be `is none`, never truthiness: the column is tri-state and
+     an inheriting user (NULL) is falsy, so a plain `{% if %}` would render
+     "Force OFF" for someone who is actually following the default — the exact
+     confusion that makes an operator revoke access they never granted.        -#}
+{% if row.override is none %}
+<span class="badge bg-light text-dark border">Inherit</span>
+{% elif row.override %}
+<span class="badge bg-primary">Force ON</span>
+{% else %}
+<span class="badge bg-danger">Force OFF</span>
+{% endif %}

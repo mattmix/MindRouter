@@ -441,8 +441,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
 
     # Load UI branding into the in-memory cache before serving any page
     from backend.app.services import branding as branding_service
+    from backend.app.services import feature_access as feature_access_service
     async with AsyncSessionLocal() as db:
         await branding_service.refresh_branding_cache(db)
+        # Nav visibility for the tri-state image flag. Without this preload the
+        # cache serves its module fallback until the first refresh tick.
+        await feature_access_service.refresh_feature_access_cache(db)
 
     # Initialize archive database if configured
     settings_ref = get_settings()
@@ -485,6 +489,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
 
     # Keep the branding cache fresh so an admin save propagates across workers
     _branding_task = asyncio.create_task(branding_service.branding_refresh_loop())
+    _feature_access_task = asyncio.create_task(
+        feature_access_service.feature_access_refresh_loop()
+    )
 
     # Start video generation runner (claims queued video jobs, drives the worker)
     _video_task = None
@@ -538,6 +545,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
         _branding_task.cancel()
         try:
             await _branding_task
+        except asyncio.CancelledError:
+            pass
+    if _feature_access_task:
+        _feature_access_task.cancel()
+        try:
+            await _feature_access_task
         except asyncio.CancelledError:
             pass
     # Final flush of Redis counters to DB before shutdown

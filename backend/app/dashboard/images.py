@@ -29,6 +29,7 @@ from backend.app.db.models import ApiKey, User, UserImage
 from backend.app.db.session import get_async_db
 from backend.app.dashboard.routes import get_session_user_id, get_effective_user_id, get_masquerade_user_id
 from backend.app.logging_config import get_logger
+from backend.app.services import feature_access
 from backend.app.services.inference import InferenceService
 from backend.app.settings import get_settings
 from backend.app.storage.artifacts import get_artifact_storage
@@ -44,6 +45,10 @@ templates.env.globals["version"] = get_settings().app_version
 # base.html calls branding() on every page — this env needs the global too.
 from backend.app.services import branding as _branding  # noqa: E402
 templates.env.globals["branding"] = _branding.get_branding
+# base.html gates the Images nav link on image_access(user): the flag is
+# tri-state, so a raw truthiness test hides the link from every inheriting
+# user. Nav visibility only — the routes re-resolve against the database.
+templates.env.globals["image_access"] = feature_access.image_access
 
 
 # ---------------------------------------------------------------------------
@@ -62,7 +67,11 @@ async def _get_image_user(
     if not user:
         raise HTTPException(status_code=401, detail="Not authenticated")
 
-    if not user.image_generation_enabled:
+    # Tri-state; NULL inherits the global default. This dependency gates the
+    # whole playground — check-policy, generate, save and history — and the
+    # video page's keyframe picker fetches /images/history too, so reading the
+    # column directly here would empty that picker for every inheriting user.
+    if not await feature_access.image_generation_allowed(db, user):
         raise HTTPException(status_code=403, detail="Image generation not enabled for your account")
 
     api_keys = await crud.get_user_api_keys(db, user_id, include_revoked=False)
@@ -90,7 +99,10 @@ async def images_page(
         return RedirectResponse(url="/login", status_code=302)
 
     user = await crud.get_user_by_id(db, user_id)
-    if not user or not user.image_generation_enabled:
+    # Conditions kept separate so a missing user short-circuits before the
+    # resolver dereferences it. A bare 302 with no message is the least
+    # debuggable failure in this feature — "the Images page just bounces me".
+    if not user or not await feature_access.image_generation_allowed(db, user):
         return RedirectResponse(url="/dashboard", status_code=302)
 
     # Load config

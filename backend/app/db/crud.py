@@ -78,7 +78,10 @@ from backend.app.db.models import (
     VideoShotType,
     VideoTransition,
 )
+from backend.app.logging_config import get_logger
 from backend.app.security.scopes import APP_CREDENTIAL_SCOPES, format_scopes
+
+logger = get_logger(__name__)
 
 
 def _ensure_aware(dt: Optional[datetime]) -> Optional[datetime]:
@@ -285,11 +288,20 @@ async def get_users(
     sort_by: Optional[str] = None,
     sort_dir: str = "desc",
     account_type: Optional[str] = None,
+    image_override: Optional[str] = None,
 ) -> Tuple[List[User], int]:
     """Get list of users with optional filtering and sorting. Returns (users, total_count).
 
     account_type filters by badge classification ("admin" | "sso" | "local"),
     mutually exclusive with precedence admin > sso > local.
+
+    image_override selects on the TRI-STATE image flag, which cannot be
+    expressed with a plain boolean filter because NULL means "inherit the
+    global default":
+        "on"     explicitly forced ON
+        "off"    explicitly forced OFF
+        "set"    has any explicit override
+        "unset"  inherits the global default
     """
     conditions = [User.deleted_at.is_(None)]
     if role:
@@ -311,6 +323,14 @@ async def get_users(
                 conditions.append(User.azure_oid.isnot(None))
             else:
                 conditions.append(User.azure_oid.is_(None))
+    if image_override in ("on", "off", "set", "unset"):
+        col = User.image_generation_enabled
+        conditions.append({
+            "on": col.is_(True),
+            "off": col.is_(False),
+            "set": col.isnot(None),
+            "unset": col.is_(None),
+        }[image_override])
     if search:
         search_pattern = f"%{search}%"
         conditions.append(
@@ -4154,6 +4174,13 @@ async def import_config_tables(db: AsyncSession, data: dict) -> dict:
             "This backup was downloaded without credentials and cannot be restored. "
             "Use a full export taken by an administrator."
         )
+
+    # Image access is tri-state since migration 075; a pre-075 backup encodes
+    # "never granted" as an explicit force-OFF for nearly every user, which
+    # would hard-deny the whole user base if restored into a fresh database.
+    from backend.app.services.feature_access import normalize_legacy_image_access
+
+    normalize_legacy_image_access(data)
 
     summary: dict[str, dict[str, int]] = {}
 

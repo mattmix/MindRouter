@@ -708,7 +708,13 @@ async def _prepare_image_canonical(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Image generation is currently disabled",
         )
-    if not user.image_generation_enabled:
+    # Tri-state: NULL inherits `img.enabled_by_default`. Resolved centrally —
+    # reading the column directly treats an inheriting user as denied.
+    # Deliberately AFTER the img.enabled check above so a subsystem that is
+    # globally down reports 503 rather than blaming the caller's account.
+    from backend.app.services import feature_access
+
+    if not await feature_access.image_generation_allowed(db, user):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Image generation is not enabled for your account. Contact an administrator.",
