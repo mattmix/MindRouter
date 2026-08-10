@@ -64,8 +64,12 @@ dependencies = [
     "pdf2image>=1.17.0",
     "Pillow>=10.0.0",
     "python-pptx>=0.6.23",
-    # MCP (Model Context Protocol) server-side SSE support
-    "mcp>=1.20.0",
+    # MCP (Model Context Protocol) server-side SSE support.
+    # <2: mcp 2.0.0 (2026-07-28) removed mcp.server.fastmcp, which both MCP
+    # servers import; 1.x is the officially security-maintained line. Lift
+    # the cap only together with the in-SDK migration to MCPServer
+    # (https://py.sdk.modelcontextprotocol.io/migration/).
+    "mcp>=1.20.0,<2",
     # OpenTelemetry
     "opentelemetry-api>=1.24.0",
     "opentelemetry-sdk>=1.24.0",
