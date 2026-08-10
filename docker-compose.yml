@@ -246,7 +246,10 @@ services:
     environment:
       - GPU_AGENT_PORT=8007
       - GPU_AGENT_HOST=0.0.0.0
-      - SIDECAR_SECRET_KEY=${SIDECAR_SECRET_KEY}
+      # Explicit empty default: hosts that never start the gpu profile (the
+      # gateway) otherwise get an unset-variable warning on every compose
+      # command. gpu_agent.py refuses to start on a blank key regardless.
+      - SIDECAR_SECRET_KEY=${SIDECAR_SECRET_KEY:-}
     profiles:
       - gpu
     deploy:
