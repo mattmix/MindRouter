@@ -363,6 +363,27 @@ async def stt_transcriptions(
 
     audio_data = await file.read()
 
+    # An empty upload is a client bug — most often a recorder stopped before it
+    # flushed its first chunk. Upstream answers it with a 500 ("Failed to decode
+    # audio"), which this endpoint used to pass through as "STT service error",
+    # pointing the operator at a healthy speech service instead of at the
+    # recording. Reject it here, in the caller's terms.
+    #
+    # Only a genuinely EMPTY body is rejected on size. A short-but-real clip can
+    # be surprisingly small, so anything with bytes in it still goes upstream —
+    # a frameless-but-non-empty container is caught by the decode check on the
+    # response instead. Validation-style failure, so it is not recorded as a
+    # request, matching the response_format check above.
+    if not audio_data:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "No audio detected — the uploaded file is empty. If you were "
+                "recording, the capture may have stopped before any audio was "
+                "written."
+            ),
+        )
+
     token_cost = await crud.get_config_json(db, "voice_api.stt_quota_tokens", 200)
 
     data = {"model": stt_model, "response_format": fmt}
@@ -385,9 +406,28 @@ async def stt_transcriptions(
                     modality=Modality.STT,
                     token_cost=0,
                     model=stt_model,
-                    error_message=f"STT service error: {resp.status_code}",
+                    error_message=(
+                        "STT rejected the audio: could not decode"
+                        if (resp.status_code == 415 or "decode audio" in (resp.text or "").lower())
+                        else f"STT service error: {resp.status_code}"
+                    ),
                     backend_id=target.backend_id if target else None,
                 )
+                # Undecodable audio is the CALLER's problem, not the
+                # service's. speaches reports it two different ways depending on
+                # version — 415 with a helpful message, or a bare 500 — and both
+                # used to surface as "STT service error", which reads as a
+                # backend fault and sends people to check GPUs.
+                body_lc = (resp.text or "").lower()
+                if resp.status_code == 415 or "decode audio" in body_lc:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            "The audio could not be decoded. It may be empty, "
+                            "truncated, or in an unsupported format — if you were "
+                            "recording, try a longer capture."
+                        ),
+                    )
                 if resp.status_code == 404:
                     # The Whisper server doesn't know this model name — tell the
                     # caller what IS valid instead of an opaque 502.
