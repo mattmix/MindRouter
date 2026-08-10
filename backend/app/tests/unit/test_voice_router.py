@@ -291,3 +291,40 @@ class TestContract:
         assert set(vr._LEGACY_KEYS) == {"tts", "stt"}
         assert vr._LEGACY_KEYS["tts"] == ("voice.tts_url", "voice.tts_api_key")
         assert vr._LEGACY_KEYS["stt"] == ("voice.stt_url", "voice.stt_api_key")
+
+
+class TestBackendAttributionIsRecorded:
+    """Registry routing is only half the win if the request row cannot say
+    which backend served it.
+
+    Before this, every voice row had `backend_id` NULL — the exact gap
+    registry routing was introduced to close — so per-backend latency, failure
+    attribution and "which GPU did the work" were blind for TTS and STT while
+    every other modality had them.
+    """
+
+    def _src(self):
+        from pathlib import Path
+        return (Path(__file__).resolve().parents[2] / "api" / "voice_api.py").read_text()
+
+    def test_recorder_accepts_and_persists_backend_id(self):
+        src = self._src()
+        i = src.index("async def _record_and_complete")
+        block = src[i:i + 2000]
+        assert "backend_id: Optional[int] = None" in block
+        assert "db_request.backend_id = backend_id" in block
+
+    def test_every_call_site_passes_it(self):
+        """A missed call site silently reverts that path to a NULL backend."""
+        src = self._src()
+        calls = src.count("await _record_and_complete(")
+        passes = src.count("backend_id=target.backend_id")
+        assert calls == passes, (
+            f"{calls} _record_and_complete call sites but only {passes} pass "
+            "backend_id — the others record a NULL backend"
+        )
+
+    def test_legacy_fallback_records_null_not_a_crash(self):
+        """A config-fallback target has backend_id None by construction, which
+        must stay a NULL column rather than an error."""
+        assert "target.backend_id if target else None" in self._src()

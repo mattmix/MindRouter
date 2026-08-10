@@ -89,8 +89,16 @@ async def _record_and_complete(
     token_cost: int,
     model: str,
     error_message: Optional[str] = None,
+    backend_id: Optional[int] = None,
 ):
-    """Create a request record, mark it completed, update quota, and commit."""
+    """Create a request record, mark it completed, update quota, and commit.
+
+    ``backend_id`` is which registered voice backend served the call, or None
+    when it went to the legacy single-URL config. Without it every voice row
+    reports a NULL backend, so per-backend latency, failure attribution and
+    "which GPU is doing the work" are all blind for TTS and STT while every
+    other modality has them.
+    """
     client_ip = http_request.client.host if http_request.client else None
     user_agent = http_request.headers.get("user-agent")
 
@@ -104,6 +112,9 @@ async def _record_and_complete(
         client_ip=client_ip,
         user_agent=user_agent,
     )
+    if backend_id is not None:
+        db_request.backend_id = backend_id
+        await db.flush()
 
     if error_message:
         await crud.update_request_failed(db, db_request.id, error_message)
@@ -206,6 +217,7 @@ async def tts_speech(
                 token_cost=0,
                 model=body.model,
                 error_message=error_message,
+                backend_id=target.backend_id if target else None,
             )
         except Exception:
             logger.exception("tts_failure_record_failed")
@@ -257,6 +269,7 @@ async def tts_speech(
         modality=Modality.TTS,
         token_cost=token_cost,
         model=body.model,
+        backend_id=target.backend_id if target else None,
     )
 
     async def stream_audio():
@@ -373,6 +386,7 @@ async def stt_transcriptions(
                     token_cost=0,
                     model=stt_model,
                     error_message=f"STT service error: {resp.status_code}",
+                    backend_id=target.backend_id if target else None,
                 )
                 if resp.status_code == 404:
                     # The Whisper server doesn't know this model name — tell the
@@ -396,6 +410,7 @@ async def stt_transcriptions(
             token_cost=0,
             model=stt_model,
             error_message=f"STT timeout: {e}",
+            backend_id=target.backend_id if target else None,
         )
         raise HTTPException(status_code=502, detail="STT service timed out (model may be loading)")
     except httpx.HTTPError as e:
@@ -407,6 +422,7 @@ async def stt_transcriptions(
             token_cost=0,
             model=stt_model,
             error_message=f"STT unavailable: {e}",
+            backend_id=target.backend_id if target else None,
         )
         raise HTTPException(status_code=502, detail=f"STT service unavailable: {e}")
 
@@ -417,6 +433,7 @@ async def stt_transcriptions(
         modality=Modality.STT,
         token_cost=token_cost,
         model=stt_model,
+        backend_id=target.backend_id if target else None,
     )
 
     if fmt in _STT_TEXT_FORMATS:
