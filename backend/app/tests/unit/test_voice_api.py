@@ -40,45 +40,93 @@ from fastapi import HTTPException
 # ----------------------------------------------------------------
 
 _api_dir = Path(__file__).resolve().parents[2] / "api"
-
-# Stub out heavy dependencies before loading the module
-sys.modules.setdefault("backend", MagicMock())
-sys.modules.setdefault("backend.app", MagicMock())
-sys.modules.setdefault("backend.app.api", MagicMock())
-sys.modules.setdefault("backend.app.api.auth", MagicMock())
-sys.modules.setdefault("backend.app.db", MagicMock())
-sys.modules.setdefault("backend.app.db.crud", MagicMock())
-sys.modules.setdefault("backend.app.db.models", MagicMock())
-sys.modules.setdefault("backend.app.db.session", MagicMock())
-sys.modules.setdefault("backend.app.logging_config", MagicMock(get_logger=MagicMock(return_value=MagicMock())))
-
-# voice_api resolves its upstream through services/voice_router. Other unit
-# modules stub sys.modules["backend.app.services"] with a bare MagicMock, which
-# has no __path__, so a later `from backend.app.services.voice_router import ...`
-# raises ImportError purely as a function of collection order. Spec-load the REAL
-# resolver and register it under its own name so the lookup always succeeds and
-# these tests exercise production resolution logic rather than a stand-in.
 _services_dir = Path(__file__).resolve().parents[2] / "services"
-_vr_spec = importlib.util.spec_from_file_location(
-    "backend.app.services.voice_router", _services_dir / "voice_router.py",
-    submodule_search_locations=[],
-)
-_vr_mod = importlib.util.module_from_spec(_vr_spec)
-_vr_spec.loader.exec_module(_vr_mod)
-sys.modules["backend.app.services.voice_router"] = _vr_mod
-_services_pkg = sys.modules.get("backend.app.services")
-if _services_pkg is None or not hasattr(_services_pkg, "__path__"):
-    _services_pkg = MagicMock()
-    _services_pkg.__path__ = [str(_services_dir)]
-    sys.modules["backend.app.services"] = _services_pkg
-_services_pkg.voice_router = _vr_mod
+_models_dir = Path(__file__).resolve().parents[2] / "db"
 
-_voice_spec = importlib.util.spec_from_file_location(
-    "voice_api", _api_dir / "voice_api.py",
-    submodule_search_locations=[],
-)
-_voice_mod = importlib.util.module_from_spec(_voice_spec)
-_voice_spec.loader.exec_module(_voice_mod)
+
+def _load_voice_modules():
+    """Direct-load voice_api.py + the REAL services/voice_router.py against
+    FORCED stubs, then restore sys.modules.
+
+    Two lessons are baked in here:
+    - `setdefault` stubbing binds this file's modules to whatever happened to
+      be imported first, so behavior depended on suite order (43/43 alone,
+      20 failures after files that imported the real db chain). Stubs are
+      installed unconditionally now — loading is deterministic — and every
+      touched key is snapshotted and restored, so nothing leaks into other
+      files' collection either (the leaked stubs previously broke five other
+      files' collection outright).
+    - voice_router is spec-loaded from source (not a stand-in) so these tests
+      exercise the production resolution logic.
+    """
+    _KEYS = (
+        "backend.app.api", "backend.app.api.auth",
+        "backend.app.db", "backend.app.db.crud", "backend.app.db.models",
+        "backend.app.db.session", "backend.app.db.base",
+        "backend.app.logging_config",
+        "backend.app.services", "backend.app.services.voice_router",
+    )
+    saved = {k: sys.modules.get(k) for k in _KEYS}
+    try:
+        sys.modules["backend.app.api"] = MagicMock()
+        sys.modules["backend.app.api.auth"] = MagicMock()
+        db_stub = MagicMock()
+        sys.modules["backend.app.db"] = db_stub
+        sys.modules["backend.app.db.crud"] = db_stub.crud
+        sys.modules["backend.app.db.models"] = MagicMock()
+        sys.modules["backend.app.db.session"] = MagicMock()
+        sys.modules["backend.app.logging_config"] = MagicMock(
+            get_logger=MagicMock(return_value=MagicMock()))
+
+        vr_spec = importlib.util.spec_from_file_location(
+            "backend.app.services.voice_router", _services_dir / "voice_router.py",
+            submodule_search_locations=[],
+        )
+        vr_mod = importlib.util.module_from_spec(vr_spec)
+        vr_spec.loader.exec_module(vr_mod)
+
+        services_stub = MagicMock()
+        services_stub.__path__ = [str(_services_dir)]
+        services_stub.voice_router = vr_mod
+        sys.modules["backend.app.services"] = services_stub
+        sys.modules["backend.app.services.voice_router"] = vr_mod
+
+        voice_spec = importlib.util.spec_from_file_location(
+            "voice_api_under_test", _api_dir / "voice_api.py",
+            submodule_search_locations=[],
+        )
+        voice_mod = importlib.util.module_from_spec(voice_spec)
+        voice_spec.loader.exec_module(voice_mod)
+
+        # Real Modality enum from db/models.py, with Base stubbed out. Forced
+        # (not setdefault): with the real declarative Base already imported,
+        # re-executing models.py would collide on its MetaData.
+        sys.modules["backend.app.db.base"] = MagicMock(
+            Base=type("Base", (), {"__tablename__": "", "metadata": MagicMock()}),
+            TimestampMixin=type("TimestampMixin", (), {}),
+            SoftDeleteMixin=type("SoftDeleteMixin", (), {}),
+        )
+        models_spec = importlib.util.spec_from_file_location(
+            "models_enum", _models_dir / "models.py",
+            submodule_search_locations=[],
+        )
+        models_mod = importlib.util.module_from_spec(models_spec)
+        try:
+            models_spec.loader.exec_module(models_mod)
+            modality = models_mod.Modality
+        except Exception:
+            # Fallback if models.py can't load due to SQLAlchemy deps
+            modality = None
+        return voice_mod, vr_mod, db_stub, modality
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                sys.modules.pop(k, None)
+            else:
+                sys.modules[k] = v
+
+
+_voice_mod, _vr_mod, _db_stub, Modality = _load_voice_modules()
 
 # Pull out testable items
 TTSRequest = _voice_mod.TTSRequest
@@ -90,25 +138,47 @@ stt_transcriptions = _voice_mod.stt_transcriptions
 # Also get module-level references so we can patch them
 _crud = _voice_mod.crud
 
-# Get the real Modality enum (safe to import directly from the .py file)
-_models_dir = Path(__file__).resolve().parents[2] / "db"
-_models_spec = importlib.util.spec_from_file_location(
-    "models_enum", _models_dir / "models.py",
-    submodule_search_locations=[],
-)
-# We need Base for models.py — stub it
-sys.modules.setdefault("backend.app.db.base", MagicMock(
-    Base=type("Base", (), {"__tablename__": "", "metadata": MagicMock()}),
-    TimestampMixin=type("TimestampMixin", (), {}),
-    SoftDeleteMixin=type("SoftDeleteMixin", (), {}),
-))
-_models_mod = importlib.util.module_from_spec(_models_spec)
-try:
-    _models_spec.loader.exec_module(_models_mod)
-    Modality = _models_mod.Modality
-except Exception:
-    # Fallback if models.py can't load due to SQLAlchemy deps
-    Modality = None
+
+@pytest.fixture(autouse=True)
+def _pin_call_time_imports():
+    """voice_api and voice_router resolve their collaborators with imports
+    INSIDE the request handlers (voice_api.py `from ...voice_router import`,
+    voice_router.py `from backend.app.db import crud` / registry), so what
+    they bind depends on sys.modules at CALL time, not at load. Pin those
+    keys to this file's stubs for the duration of every test — suite order
+    and other files' leftovers can no longer rebind them — and restore
+    afterwards so nothing leaks out of this file."""
+    registry_stub = MagicMock()
+    registry_stub.get_registry = MagicMock(side_effect=RuntimeError(
+        "registry stubbed — voice tests exercise the config fallback"))
+    overrides = {
+        "backend.app.db": _db_stub,
+        "backend.app.db.crud": _crud,
+        "backend.app.services.voice_router": _vr_mod,
+        "backend.app.core.telemetry.registry": registry_stub,
+    }
+    # Ancestor packages must exist in sys.modules or resolving the keys
+    # above would import the real (heavy) packages mid-test.
+    import types as _types
+    for anc in ("backend.app.core", "backend.app.core.telemetry",
+                "backend.app.services"):
+        if anc not in sys.modules:
+            stub = _types.ModuleType(anc)
+            stub.__path__ = []
+            overrides[anc] = stub
+    saved = {k: sys.modules.get(k) for k in overrides}
+    sys.modules.update(overrides)
+    # Re-pin the attribute path too: `from backend.app.db import crud`
+    # resolves via getattr on the parent, and another test once rebound it.
+    _db_stub.crud = _crud
+    try:
+        yield
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                sys.modules.pop(k, None)
+            else:
+                sys.modules[k] = v
 
 
 # ================================================================

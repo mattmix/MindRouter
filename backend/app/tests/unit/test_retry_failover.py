@@ -46,48 +46,65 @@ _MOCKED_MODULES = [
     "backend.app.settings",
 ]
 
-# Save originals before mocking
-_saved_modules = {k: sys.modules[k] for k in _MOCKED_MODULES if k in sys.modules}
+# The scoring module must be imported FRESH against mocks. If an earlier
+# test file already imported the real scheduler (services.inference pulls it
+# in), the import below would be a sys.modules cache hit bound to the REAL
+# BackendStatus/Modality — and every sentinel comparison in these tests
+# would fail, with all hard constraints reporting failure at once.
+_EVICT_MODULES = [
+    "backend.app.core.scheduler.scoring",
+    "backend.app.core.scheduler",
+]
 
-for mod_name in [
-    "backend.app.db",
-    "backend.app.db.session",
-    "backend.app.db.crud",
-]:
-    if mod_name not in sys.modules:
-        sys.modules[mod_name] = MagicMock()
-
-# Set db.models to our controlled mock
-sys.modules["backend.app.db.models"] = _mock_db_models
-
-# Mock settings to avoid pydantic_settings import
 _mock_settings = MagicMock()
 _mock_settings.scheduler_score_model_loaded = 100
 _mock_settings.scheduler_score_low_utilization = 50
 _mock_settings.scheduler_score_latency = 40
 _mock_settings.scheduler_score_short_queue = 30
 _mock_settings.scheduler_score_high_throughput = 20
-sys.modules.setdefault("backend.app.settings", MagicMock())
 
-# Now safe to import
-with patch("backend.app.core.scheduler.scoring.get_settings", return_value=_mock_settings):
-    from backend.app.core.scheduler.scoring import BackendScorer, BackendScore
+# Save originals before touching sys.modules; the finally below restores
+# them even when the import raises — without it, a broken scheduler import
+# would leak five MagicMock modules into every later-collected file and
+# bury the real error under a cascade of unrelated failures.
+_saved_modules = {k: sys.modules[k] for k in _MOCKED_MODULES if k in sys.modules}
+_saved_evicted = {k: sys.modules.get(k) for k in _EVICT_MODULES}
 
-# Restore sys.modules so subsequent test modules get real imports.
-# Also evict the scoring module itself — it was loaded with mocked references
-# to BackendStatus/Modality in its global namespace, so test_scheduler.py
-# (which uses the real db.models) needs a fresh import.
-_EVICT_MODULES = [
-    "backend.app.core.scheduler.scoring",
-    "backend.app.core.scheduler",
-]
-for mod_name in _MOCKED_MODULES:
-    if mod_name in _saved_modules:
-        sys.modules[mod_name] = _saved_modules[mod_name]
-    else:
+try:
+    for mod_name in [
+        "backend.app.db",
+        "backend.app.db.session",
+        "backend.app.db.crud",
+    ]:
+        if mod_name not in sys.modules:
+            sys.modules[mod_name] = MagicMock()
+
+    # Set db.models to our controlled mock
+    sys.modules["backend.app.db.models"] = _mock_db_models
+
+    # Mock settings to avoid pydantic_settings import
+    sys.modules.setdefault("backend.app.settings", MagicMock())
+
+    for mod_name in _EVICT_MODULES:
         sys.modules.pop(mod_name, None)
-for mod_name in _EVICT_MODULES:
-    sys.modules.pop(mod_name, None)
+
+    with patch("backend.app.core.scheduler.scoring.get_settings", return_value=_mock_settings):
+        from backend.app.core.scheduler.scoring import BackendScorer, BackendScore
+finally:
+    # Restore sys.modules so subsequent test modules get real imports.
+    # The mock-bound scoring module must not stay registered —
+    # test_scheduler.py (which uses the real db.models) needs the original
+    # back, or a fresh import.
+    for mod_name in _MOCKED_MODULES:
+        if mod_name in _saved_modules:
+            sys.modules[mod_name] = _saved_modules[mod_name]
+        else:
+            sys.modules.pop(mod_name, None)
+    for mod_name in _EVICT_MODULES:
+        if _saved_evicted.get(mod_name) is not None:
+            sys.modules[mod_name] = _saved_evicted[mod_name]
+        else:
+            sys.modules.pop(mod_name, None)
 
 
 def _make_backend(bid, name="test", throughput_score=1.0):

@@ -27,29 +27,84 @@ import types
 from pathlib import Path
 from unittest.mock import MagicMock
 
-# Direct-load email_service, stubbing its heavy imports.
-sys.modules.setdefault("aiosmtplib", MagicMock())
-for _name in [
-    "backend", "backend.app", "backend.app.db", "backend.app.db.crud",
-    "backend.app.db.session", "backend.app.core",
-    "backend.app.core.redis_client", "backend.app.settings",
-    "backend.app.logging_config",
-]:
-    if _name not in sys.modules:
-        _m = types.ModuleType(_name)
-        _m.__path__ = []
-        sys.modules[_name] = _m
-sys.modules["backend.app.db.crud"].get_config_json = lambda *a, **k: None
-sys.modules["backend.app.db.session"].get_async_db_context = lambda *a, **k: None
-sys.modules["backend.app.logging_config"].get_logger = lambda *a, **k: MagicMock()
-sys.modules["backend.app.settings"].get_settings = lambda: MagicMock()
 
-_spec = importlib.util.spec_from_file_location(
-    "email_service",
-    Path(__file__).resolve().parents[2] / "services" / "email_service.py",
-)
-_es = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(_es)
+def _load_email_service():
+    """Direct-load email_service.py, stubbing its heavy imports — and RESTORE
+    sys.modules afterwards.
+
+    An earlier version of this preamble left its stubs in sys.modules for the
+    rest of the session. Because this file collects early (alphabetically),
+    the leaked bare `backend.app.core`/`backend.app.db` stubs broke the
+    collection of five later test files and errored twelve more tests — 157
+    tests silently ran zero times, while the stub set itself rotted out of
+    sync with the real import chain and broke this file's own load too.
+    Everything installed here is snapshotted and restored in the finally.
+
+    `backend.app.services` is stubbed as well, so the real services package
+    (which drags in inference → redis_client) is never imported; the branding
+    stub returns the keys _wrap_html and _render_blog_email actually read.
+    `markdown` stays real — rendering it is what these tests cover.
+    """
+    _KEYS = (
+        "aiosmtplib",
+        "backend", "backend.app",
+        "backend.app.db", "backend.app.db.crud", "backend.app.db.session",
+        "backend.app.services", "backend.app.services.branding",
+        "backend.app.settings",
+    )
+    saved = {k: sys.modules.get(k) for k in _KEYS}
+
+    def _stub(name):
+        m = types.ModuleType(name)
+        m.__path__ = []
+        sys.modules[name] = m
+        return m
+
+    try:
+        sys.modules.setdefault("aiosmtplib", MagicMock())
+        for name in ("backend", "backend.app"):
+            if name not in sys.modules:
+                _stub(name)
+
+        db = _stub("backend.app.db")
+        db.crud = _stub("backend.app.db.crud")
+        db.crud.get_config_json = lambda *a, **k: None
+        session = _stub("backend.app.db.session")
+        session.get_async_db_context = lambda *a, **k: None
+
+        services = _stub("backend.app.services")
+        branding = _stub("backend.app.services.branding")
+        services.branding = branding
+        branding.get_branding = lambda: {
+            "app_name": "MindRouter",
+            "primary_light": "#f1b300",
+            "primary_light_ink": "#8a6a00",
+            "primary_light_on": "#231f20",
+            "headline_color": None,
+            "tagline": None,
+            "email_logo_file": None,
+        }
+        branding.read_email_logo = lambda: None
+
+        settings = _stub("backend.app.settings")
+        settings.get_settings = lambda: MagicMock()
+
+        spec = importlib.util.spec_from_file_location(
+            "email_service_under_test",
+            Path(__file__).resolve().parents[2] / "services" / "email_service.py",
+        )
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                sys.modules.pop(k, None)
+            else:
+                sys.modules[k] = v
+
+
+_es = _load_email_service()
 
 
 def _render(md: str) -> str:

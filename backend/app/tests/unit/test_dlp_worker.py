@@ -383,9 +383,14 @@ class TestAlertEmailBody:
 
         saved = {k: sys.modules.get(k) for k in
                  ("backend.app.db", "backend.app.services", "backend.app.db.crud")}
-        sys.modules.setdefault("backend.app.db", MagicMock())
-        sys.modules["backend.app.db.crud"] = MagicMock(get_config_json=_get_config_json)
-        sys.modules["backend.app.db"].crud = sys.modules["backend.app.db.crud"]
+        # Fresh stub modules only — never set an attribute on a PRE-EXISTING
+        # sys.modules entry: the finally below restores the keys, but an
+        # attribute planted on someone else's module object survives it.
+        # (`sys.modules["backend.app.db"].crud = ...` here once rebound the
+        # crud that voice_api resolves at call time and broke 20 voice tests.)
+        crud_stub = MagicMock(get_config_json=_get_config_json)
+        sys.modules["backend.app.db"] = MagicMock(crud=crud_stub)
+        sys.modules["backend.app.db.crud"] = crud_stub
         sys.modules["backend.app.services"] = MagicMock(email_service=email_service)
         try:
             alert = MagicMock(request_id=42, categories=categories)
