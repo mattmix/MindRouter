@@ -53,6 +53,20 @@ _THINK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL)
 _GEMMA4_THOUGHT_RE = re.compile(r"^thought\n(.*?)(?=\n(?:[A-Z]|\d|$))", re.DOTALL)
 
 
+def reasoning_promotion_applies(model: str) -> bool:
+    """True when the disabled-thinking reasoning→content promotion may fire.
+
+    The promotion works around a vLLM/Qwen3.5 bug: with enable_thinking
+    false, the model sometimes emits its ANSWER in reasoning_content and
+    leaves content empty. That premise only holds for qwen-family models,
+    whose chat template actually honors the disable switch. Models whose
+    reasoning cannot be switched off (e.g. Muse Glimmer's harmony-style
+    channels) emit GENUINE reasoning in that field — promoting it would
+    present the model's internal monologue as the answer.
+    """
+    return "qwen" in (model or "").lower()
+
+
 def _extract_think_tags(content: str) -> tuple:
     """Extract <think>...</think> from content, returning (reasoning, cleaned_content).
 
@@ -330,9 +344,15 @@ class VLLMOutTranslator:
             # vLLM/Qwen3.5 bug: when thinking is disabled the model
             # may put all output into reasoning_content with content
             # empty.  Promote reasoning to content in that case.
-            # Only do this when thinking was explicitly disabled (think=False),
-            # not for always-thinking models like gpt-oss (think=None).
-            if not thinking_enabled and not content and reasoning and not tool_calls:
+            # Only when thinking was explicitly disabled (think=False) AND
+            # the model is one whose template honors the disable switch —
+            # for always-reasoning models (Muse Glimmer's channel format)
+            # the reasoning field is GENUINE reasoning, and promoting it
+            # presents the internal monologue as the answer.
+            if (
+                not thinking_enabled and not content and reasoning and not tool_calls
+                and reasoning_promotion_applies(openai_response.get("model", ""))
+            ):
                 content = reasoning
                 reasoning = None
 
@@ -452,9 +472,16 @@ class VLLMOutTranslator:
 
                             # Same Qwen 3.5 workaround as non-streaming:
                             # if content is empty but reasoning has data,
-                            # promote reasoning to content.
-                            # Only when thinking was explicitly disabled.
-                            if not thinking_enabled and not content_delta and reasoning_delta and not tc_deltas:
+                            # promote reasoning to content. Only when
+                            # thinking was explicitly disabled AND the
+                            # model honors the disable switch — an
+                            # always-reasoning model's reasoning deltas
+                            # are genuine and must stay reasoning_content.
+                            if (
+                                not thinking_enabled and not content_delta
+                                and reasoning_delta and not tc_deltas
+                                and reasoning_promotion_applies(model)
+                            ):
                                 content_delta = reasoning_delta
                                 reasoning_delta = None
 

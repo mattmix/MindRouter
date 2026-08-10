@@ -657,7 +657,8 @@
       ],
       "expected_full_content": "promoted text",
       "expected_finish_reason": "stop",
-      "expected_real_usage": null
+      "expected_real_usage": null,
+      "model": "qwen/qwen3.5-122b"
     },
     {
       "name": "tools",
@@ -776,6 +777,80 @@
         "total_tokens": 12,
         "is_estimated": false
       }
+    },
+    {
+      "name": "muse_always_reasoning_not_promoted",
+      "thinking_enabled": false,
+      "include_usage": false,
+      "input_chunks": [
+        "data: {\"id\": \"chatcmpl-golden\", \"object\": \"chat.completion.chunk\", \"created\": 1700000000, \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"role\": \"assistant\"}, \"finish_reason\": null}]}\n\n",
+        "data: {\"id\": \"chatcmpl-golden\", \"object\": \"chat.completion.chunk\", \"created\": 1700000000, \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"reasoning_content\": \"promoted \"}, \"finish_reason\": null}]}\n\n",
+        "data: {\"id\": \"chatcmpl-golden\", \"object\": \"chat.completion.chunk\", \"created\": 1700000000, \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {\"reasoning_content\": \"text\"}, \"finish_reason\": null}]}\n\n",
+        "data: {\"id\": \"chatcmpl-golden\", \"object\": \"chat.completion.chunk\", \"created\": 1700000000, \"model\": \"test-model\", \"choices\": [{\"index\": 0, \"delta\": {}, \"finish_reason\": \"stop\"}]}\n\n",
+        "data: [DONE]\n\n"
+      ],
+      "expected_events": [
+        {
+          "id": "chatcmpl-golden",
+          "object": "chat.completion.chunk",
+          "created": 1700000000,
+          "model": "test-model",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "role": "assistant"
+              }
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-golden",
+          "object": "chat.completion.chunk",
+          "created": 1700000000,
+          "model": "test-model",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning_content": "promoted "
+              }
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-golden",
+          "object": "chat.completion.chunk",
+          "created": 1700000000,
+          "model": "test-model",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {
+                "reasoning_content": "text"
+              }
+            }
+          ]
+        },
+        {
+          "id": "chatcmpl-golden",
+          "object": "chat.completion.chunk",
+          "created": 1700000000,
+          "model": "test-model",
+          "choices": [
+            {
+              "index": 0,
+              "delta": {},
+              "finish_reason": "stop"
+            }
+          ]
+        },
+        "[DONE]"
+      ],
+      "expected_full_content": "",
+      "expected_finish_reason": "stop",
+      "expected_real_usage": null,
+      "model": "meta-models/muse-glimmer-30b"
     }
   ]
 }

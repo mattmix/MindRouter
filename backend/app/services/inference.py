@@ -49,6 +49,9 @@ from backend.app.core.scheduler.queue import Job, JobModality
 from backend.app.core.stream_coalesce import StreamCoalescer
 from backend.app.core.telemetry.registry import get_registry
 from backend.app.core.translators import DiffusionOutTranslator, OllamaOutTranslator, VLLMOutTranslator
+from backend.app.core.translators.vllm_out import (
+    reasoning_promotion_applies as _reasoning_promotion_applies,
+)
 from backend.app.db import crud
 from backend.app.db.models import ApiKey, Backend, BackendEngine, Modality, User
 from backend.app.logging_config import get_logger
@@ -2118,7 +2121,10 @@ class InferenceService:
             # vLLM/Qwen3.5 bug: when thinking is disabled the model may
             # put all output into reasoning_content with content empty.
             # Promote reasoning to content in that case.
-            if not thinking_enabled and not content and reasoning:
+            if (
+                not thinking_enabled and not content and reasoning
+                and _reasoning_promotion_applies(openai_response.get("model", ""))
+            ):
                 content = reasoning
                 reasoning = None
 
@@ -2228,8 +2234,14 @@ class InferenceService:
 
         # vLLM/Qwen3.5 bug: when thinking is disabled the model may
         # put all output into reasoning_content with content empty.
-        # Promote reasoning to content in that case.
-        if not thinking_enabled and not content and reasoning:
+        # Promote reasoning to content in that case — but only for models
+        # whose template honors the disable switch (see
+        # reasoning_promotion_applies); an always-reasoning model's
+        # reasoning is genuine and must stay separate.
+        if (
+            not thinking_enabled and not content and reasoning
+            and _reasoning_promotion_applies(openai_chunk.get("model", ""))
+        ):
             content = reasoning
             reasoning = None
 

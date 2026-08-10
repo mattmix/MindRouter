@@ -106,7 +106,9 @@ async def test_golden_scenario(name):
         VLLMOutTranslator.translate_chat_stream(
             _aiter(scenario["input_chunks"]),
             "req-golden",
-            "test-model",
+            # Promotion is model-gated (qwen-family only), so scenarios
+            # that pin promotion behavior must name a qwen model.
+            scenario.get("model", "test-model"),
             thinking_enabled=scenario["thinking_enabled"],
         ),
         include_usage=scenario["include_usage"],
@@ -249,3 +251,82 @@ class TestStreamCoalescer:
     def test_force_on_first_event_single_write(self):
         c = StreamCoalescer(8, 50)
         assert c.add(b"only", force=True) == b"only"
+
+
+class TestReasoningPromotionGate:
+    """The disabled-thinking reasoning->content promotion is a QWEN bug
+    workaround; firing it for always-reasoning models (Muse Glimmer)
+    presented the internal monologue as the answer. The gate is
+    model-scoped at all four sites (two translator paths here, two
+    ollama-conversion copies in inference.py guarded structurally)."""
+
+    def test_helper_is_qwen_scoped(self):
+        from backend.app.core.translators.vllm_out import reasoning_promotion_applies
+
+        assert reasoning_promotion_applies("qwen/qwen3.5-122b")
+        assert reasoning_promotion_applies("Qwen/Qwen3.5-35B-A3B-FP8")
+        assert not reasoning_promotion_applies("meta-models/muse-glimmer-30b")
+        assert not reasoning_promotion_applies("openai/gpt-oss-120b")
+        assert not reasoning_promotion_applies("")
+        assert not reasoning_promotion_applies(None)
+
+    def _resp(self, model):
+        return {
+            "id": "x", "model": model, "created": 1,
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": None,
+                            "reasoning": "internal monologue"},
+                "finish_reason": "stop",
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        }
+
+    def test_non_streaming_muse_reasoning_stays_reasoning(self):
+        out = VLLMOutTranslator.translate_chat_response(
+            self._resp("meta-models/muse-glimmer-30b"), thinking_enabled=False
+        )
+        msg = out.choices[0].message
+        assert not msg.content
+        assert msg.reasoning == "internal monologue"
+
+    def test_non_streaming_qwen_promotion_preserved(self):
+        out = VLLMOutTranslator.translate_chat_response(
+            self._resp("qwen/qwen3.5-122b"), thinking_enabled=False
+        )
+        msg = out.choices[0].message
+        assert msg.content == "internal monologue"
+        assert not msg.reasoning
+
+    def test_inference_ollama_conversion_sites_are_gated(self):
+        """The two ollama-conversion copies in inference.py must carry the
+        same model gate. Comment-stripped, call-anchored (repo guard
+        hygiene: imports and comments must not satisfy the assert)."""
+        import io as _io
+        import tokenize as _tokenize
+        from pathlib import Path
+
+        path = Path(__file__).resolve().parents[2] / "services" / "inference.py"
+        source = path.read_text()
+        lines = source.splitlines(keepends=True)
+        try:
+            for tok in _tokenize.generate_tokens(_io.StringIO(source).readline):
+                if tok.type == _tokenize.COMMENT:
+                    row, col = tok.start
+                    line = lines[row - 1]
+                    keep = line[:col]
+                    lines[row - 1] = keep + "\n" if line.endswith("\n") else keep
+        except (_tokenize.TokenError, IndentationError):
+            pass
+        stripped = "".join(lines)
+
+        i = stripped.index("def _openai_response_to_ollama")
+        j = stripped.index("def _openai_chunk_to_ollama")
+        resp_seg = stripped[i:j] if i < j else stripped[i:]
+        k = stripped.find("def ", j + 10)
+        chunk_seg = stripped[j:k] if k != -1 else stripped[j:]
+        # The leading "and " pins the CONJUNCTION: an and->or mutant
+        # degenerates to the ungated pre-fix predicate for non-qwen models
+        # (reintroducing the Muse bug) while still containing the call.
+        assert 'and _reasoning_promotion_applies(openai_response.get("model"' in resp_seg
+        assert 'and _reasoning_promotion_applies(openai_chunk.get("model"' in chunk_seg
