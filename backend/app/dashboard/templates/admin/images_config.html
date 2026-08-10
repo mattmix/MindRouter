@@ -136,6 +136,27 @@
                         </div>
                     </div>
 
+                    <!-- Invisible Provenance Watermark -->
+                    <div class="col-12">
+                        <div class="card">
+                            <div class="card-header"><h5 class="mb-0"><i class="bi bi-fingerprint"></i> Invisible Watermark (TrustMark)</h5></div>
+                            <div class="card-body">
+                                <p class="text-muted small">Every generated image (both txt2img and img2img) is invisibly watermarked at the gateway using <a href="https://github.com/adobe/trustmark" target="_blank" rel="noopener">Adobe TrustMark</a> — the Content Authenticity Initiative watermark. The mark is imperceptible, survives PNG/JPEG re-encoding, and can be verified by anyone with the open-source TrustMark decoder. Watermarking is <strong>fail-open</strong>: if encoding fails, the unmarked image is still returned.</p>
+
+                                <div class="mb-3 form-check form-switch">
+                                    <input class="form-check-input" type="checkbox" id="watermark_enabled" name="watermark_enabled" {% if watermark_enabled %}checked{% endif %}>
+                                    <label class="form-check-label" for="watermark_enabled">Watermark all generated images</label>
+                                </div>
+
+                                <div class="mb-2">
+                                    <label for="watermark_text" class="form-label">Watermark Payload</label>
+                                    <input type="text" class="form-control" id="watermark_text" name="watermark_text" value="{{ watermark_text }}" maxlength="{{ watermark_max_chars }}" style="max-width: 240px;">
+                                    <div class="form-text">At most {{ watermark_max_chars }} printable ASCII characters — TrustMark carries 61 bits of payload. Decodes back to exactly this string.</div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
                     <!-- LLM Content Policy -->
                     <div class="col-12">
                         <div class="card border-warning">

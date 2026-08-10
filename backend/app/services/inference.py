@@ -1986,6 +1986,39 @@ class InferenceService:
         route = "edits" if request.image else "generations"
         url = f"{backend.url}/v1/images/{route}"
 
+        # Invisible provenance watermark (TrustMark) config. Read BEFORE
+        # dispatch, and fail-safe: the image path must never 500 on a config
+        # read — the GPU seconds are already spent by the time marking runs,
+        # so a DB blip falls back to marking with the defaults.
+        from backend.app.services import image_watermark
+
+        wm_text = image_watermark.WATERMARK_DEFAULT_TEXT
+        wm_enabled = True
+        try:
+            from backend.app.db.session import get_async_db_context
+
+            async with get_async_db_context() as wm_db:
+                wm_enabled = bool(
+                    await crud.get_config_json(wm_db, "img.watermark_enabled", True)
+                )
+                wm_text = str(
+                    await crud.get_config_json(
+                        wm_db, "img.watermark_text", image_watermark.WATERMARK_DEFAULT_TEXT
+                    )
+                )
+        except Exception:
+            logger.warning("watermark_config_read_failed_using_defaults")
+        if image_watermark.validate_watermark_text(wm_text) is not None:
+            wm_text = image_watermark.WATERMARK_DEFAULT_TEXT
+
+        # Watermarking needs the bytes, so force b64 from the backend. This
+        # also closes the response_format="url" bypass: url mode returned a
+        # RELATIVE link into the backend node's public static mount — dead
+        # through the gateway AND an unmarked copy left on the node — so
+        # clients get b64_json entries whenever marking is on.
+        if wm_enabled:
+            payload["response_format"] = "b64_json"
+
         # Image generation can be slow — use a longer timeout
         timeout = max(
             float(self._settings.backend_request_timeout_per_attempt),
@@ -1998,6 +2031,18 @@ class InferenceService:
             data = response.json()
 
         canonical = DiffusionOutTranslator.translate_image_response(data)
+
+        # Apply the watermark at the gateway so every diffusion backend and
+        # both routes (generations/edits) return marked bytes — and the
+        # gallery stores exactly what the client received.
+        # apply_watermark_b64 fails open: unmarked beats failed.
+        if wm_enabled:
+            for item in canonical.data:
+                if item.b64_json:
+                    item.b64_json = await image_watermark.apply_watermark_b64(
+                        item.b64_json, wm_text
+                    )
+
         return canonical.model_dump(exclude_none=True, by_alias=True)
 
     async def _proxy_ollama_chat(

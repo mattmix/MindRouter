@@ -36,6 +36,25 @@ COPY backend/app/__init__.py backend/app/
 RUN pip install --upgrade pip setuptools wheel && \
     pip install -e .[saml]
 
+# TrustMark invisible image watermarking (Adobe, MIT). Installed --no-deps:
+# its numpy<2 pin conflicts with this image's numpy 2.x and is empirically
+# unnecessary (encode/decode roundtrip verified on numpy 2.4); its real
+# runtime deps (torchvision/einops/omegaconf/lightning) are in pyproject.
+# The bake downloads the Q-model weights (MD5-verified) into the image so
+# nothing is fetched at runtime — and PROVES they work with an actual
+# encode/decode roundtrip, because TrustMark swallows download failures
+# and constructs a half-built model instead of raising: without the
+# roundtrip a CDN outage would produce an image that can never watermark.
+RUN pip install --no-cache-dir --no-deps trustmark==0.9.1 && \
+    python -c "\
+from trustmark import TrustMark; \
+from PIL import Image; \
+tm = TrustMark(verbose=True, model_type='Q', loadRemover=False, device='cpu'); \
+assert tm.encoder is not None and tm.decoder is not None, 'TrustMark weights missing'; \
+s, ok, _ = tm.decode(tm.encode(Image.new('RGB', (256, 256), (128, 64, 32)), 'BAKETEST')); \
+assert ok and s == 'BAKETEST', f'TrustMark roundtrip failed: {ok} {s!r}'; \
+print('TrustMark bake verified')"
+
 # Copy application code
 COPY backend/ backend/
 COPY scripts/ scripts/

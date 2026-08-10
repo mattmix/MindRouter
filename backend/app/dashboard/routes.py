@@ -4466,6 +4466,7 @@ async def admin_images_config(
     """Admin image generation configuration page."""
     from sqlalchemy import select, func
     from backend.app.db.models import Modality, User as UserModel
+    from backend.app.services import image_watermark as _image_watermark
 
     user_id = get_session_user_id(request)
     if not user_id:
@@ -4576,6 +4577,11 @@ async def admin_images_config(
             "max_width": await crud.get_config_json(db, "img.max_width", 1024),
             "max_height": await crud.get_config_json(db, "img.max_height", 1024),
             "policy": await crud.get_config_json(db, "img.policy", ""),
+            "watermark_enabled": await crud.get_config_json(db, "img.watermark_enabled", True),
+            "watermark_text": await crud.get_config_json(
+                db, "img.watermark_text", _image_watermark.WATERMARK_DEFAULT_TEXT
+            ),
+            "watermark_max_chars": _image_watermark.WATERMARK_MAX_CHARS,
             "judge_model": await crud.get_config_json(db, "img.judge_model", ""),
             "judge_model_secondary": await crud.get_config_json(db, "img.judge_model_secondary", ""),
             "enabled_by_default": default_enabled,
@@ -4619,6 +4625,26 @@ async def admin_images_config_post(
     _ip = get_client_ip(request)
 
     if action == "save_config":
+        # Watermark payload is validated BEFORE anything is written so a bad
+        # value can't land half a save. TrustMark carries 61 bits = 8 ASCII
+        # chars; the service enforces the same rule at encode time. A cleared
+        # text field with the toggle OFF is fine — the toggle saves and the
+        # stored payload is left untouched, so re-enabling later still has a
+        # valid value.
+        from urllib.parse import quote_plus as _qp
+        from backend.app.services.image_watermark import validate_watermark_text
+
+        wm_on = "watermark_enabled" in form
+        wm_text = (form.get("watermark_text") or "").strip()
+        if wm_on or wm_text:
+            wm_error = validate_watermark_text(wm_text)
+            if wm_error:
+                return RedirectResponse(
+                    url=f"/admin/images-config?error={_qp(wm_error)}", status_code=302
+                )
+            await crud.set_config(db, "img.watermark_text", wm_text)
+        await crud.set_config(db, "img.watermark_enabled", wm_on)
+
         await crud.set_config(db, "img.enabled", "enabled" in form)
         # The per-user DEFAULT, distinct from the kill switch above. Flipping it
         # must NOT rewrite users.image_generation_enabled — see the comment on
