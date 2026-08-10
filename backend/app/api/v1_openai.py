@@ -1076,12 +1076,23 @@ async def moderations(
 
     policy_text = await crud.get_config_json(db, "img.policy", "")
     if not policy_text or not policy_text.strip():
+        # No LLM call happens on this path, so it is deliberately unmetered.
         return {
             "passed": True,
             "reason": "No policy configured",
             "judge_model": "",
             "policy_configured": False,
         }
+
+    # Metering BEFORE the judge call. Every endpoint that dispatches GPU
+    # work outside InferenceService (voice, video) enforces quota+RPM and
+    # records an audited Request row — without this, any inference-scoped
+    # key could drive the judge models in an invisible, unthrottled loop,
+    # and saturating the judges fail-closes image generation for everyone.
+    from backend.app.api.voice_api import _check_quota as _shared_quota_check
+    from backend.app.api.voice_api import _record_and_complete
+
+    await _shared_quota_check(db, user, api_key)
 
     from backend.app.services.image_policy import evaluate_prompt
 
@@ -1094,4 +1105,19 @@ async def moderations(
         secondary_model=secondary_judge,
         is_edit=(context == "edit"),
     )
+
+    # Flat, admin-configurable token cost (default 0: visible in the request
+    # log and RPM-throttled, but free — judge tokens are not charged on the
+    # image paths either).
+    token_cost = int(
+        await crud.get_config_json(db, "img.moderation_quota_tokens", 0) or 0
+    )
+    await _record_and_complete(
+        db, user, api_key, request,
+        endpoint="/v1/moderations",
+        modality=Modality.CHAT,
+        token_cost=token_cost,
+        model=verdict.judge_model or primary_judge or "",
+    )
+
     return {**verdict.to_dict(), "policy_configured": True}
