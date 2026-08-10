@@ -1023,6 +1023,35 @@ async def image_edits(
 
 
 _MODERATION_MAX_INPUT = 10_000
+_MODERATION_MAX_INPUTS = 4
+
+# OpenAI's omni-moderation category taxonomy. Our verdicts come from the
+# admin's natural-language policy, not this taxonomy, so these are always
+# reported false / 0.0 — the verdict rides in `flagged` and the extension
+# fields. They exist so openai-python's moderations.create() parses the
+# response (its pydantic models require every category key).
+_MODERATION_CATEGORIES = (
+    "harassment", "harassment/threatening", "hate", "hate/threatening",
+    "illicit", "illicit/violent", "self-harm", "self-harm/instructions",
+    "self-harm/intent", "sexual", "sexual/minors", "violence",
+    "violence/graphic",
+)
+
+
+def _moderation_result(flagged: bool, reason: str, judge_model: str) -> Dict[str, Any]:
+    """One OpenAI-shaped moderation result + MindRouter extension fields.
+
+    openai-python preserves unknown fields (model_extra), so policy_reason
+    and judge_model survive SDK parsing — verified against openai 2.45.0.
+    """
+    return {
+        "flagged": flagged,
+        "categories": {c: False for c in _MODERATION_CATEGORIES},
+        "category_scores": {c: 0.0 for c in _MODERATION_CATEGORIES},
+        "category_applied_input_types": {c: [] for c in _MODERATION_CATEGORIES},
+        "policy_reason": reason,
+        "judge_model": judge_model,
+    }
 
 
 @router.post("/moderations")
@@ -1031,20 +1060,27 @@ async def moderations(
     db: AsyncSession = Depends(get_async_db),
     auth: Tuple[User, ApiKey] = Depends(authenticate_request),
 ):
-    """Standalone check of a text against the central image content policy.
+    """OpenAI-shaped moderation of text against the image content policy.
 
-    Judges a prompt or an image caption with the same LLM judge and
+    Judges prompts or image captions with the same LLM judge and
     ``img.policy`` text used by ``/images/generations`` and
     ``/images/edits`` — without generating anything. Client apps use this
     to vet user-supplied reference images (via a vision-model caption)
     before submitting an img2img edit.
 
-    Body: ``{"input": "<text>", "context": "prompt" | "edit"}`` — "edit"
-    applies the edit-aware judge template (deictic references expected).
-
-    Response: ``{"passed": bool, "reason": str, "judge_model": str,
-    "policy_configured": bool}``. With no policy configured the check
-    passes (matching image generation, which also skips the judge).
+    Body: ``{"input": str | [str], "context": "prompt" | "edit"}`` —
+    "context" is a MindRouter extension ("edit" applies the edit-aware
+    judge template; pass it via the SDK's ``extra_body``); a ``model``
+    field is accepted and ignored. Response: the standard OpenAI
+    moderations envelope — ``{id, model, results: [{flagged, categories,
+    category_scores, category_applied_input_types}]}`` — parseable by
+    openai-python's ``moderations.create()``, with MindRouter extensions
+    ``policy_reason``/``judge_model`` on each result and
+    ``policy_configured`` at the top level. A policy violation reports
+    ``flagged: true``; the OpenAI category booleans are always false
+    because verdicts come from the institutional policy, not that
+    taxonomy. With no policy configured nothing is flagged (matching
+    image generation, which also skips the judge).
     """
     user, api_key = auth
 
@@ -1054,15 +1090,37 @@ async def moderations(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid JSON body"
         )
-    text = str(body.get("input") or "").strip()
-    if not text:
+    if not isinstance(body, dict):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="Body must be a JSON object"
+        )
+
+    raw_input = body.get("input")
+    if isinstance(raw_input, str):
+        inputs = [raw_input]
+    elif isinstance(raw_input, list) and raw_input and all(
+        isinstance(x, str) for x in raw_input
+    ):
+        inputs = list(raw_input)
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="'input' must be a non-empty string or array of strings",
+        )
+    if len(inputs) > _MODERATION_MAX_INPUTS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"'input' accepts at most {_MODERATION_MAX_INPUTS} items",
+        )
+    inputs = [t.strip() for t in inputs]
+    if any(not t for t in inputs):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail="'input' is required"
         )
-    if len(text) > _MODERATION_MAX_INPUT:
+    if any(len(t) > _MODERATION_MAX_INPUT for t in inputs):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"'input' exceeds {_MODERATION_MAX_INPUT} characters",
+            detail=f"'input' items exceed {_MODERATION_MAX_INPUT} characters",
         )
     context = body.get("context") or "prompt"
     if context not in ("prompt", "edit"):
@@ -1071,16 +1129,18 @@ async def moderations(
             detail="'context' must be 'prompt' or 'edit'",
         )
 
-    request_id = f"mod-{uuid.uuid4().hex[:24]}"
+    request_id = f"modr-{uuid.uuid4().hex[:24]}"
     bind_request_context(request_id=request_id, user_id=user.id)
 
     policy_text = await crud.get_config_json(db, "img.policy", "")
     if not policy_text or not policy_text.strip():
         # No LLM call happens on this path, so it is deliberately unmetered.
         return {
-            "passed": True,
-            "reason": "No policy configured",
-            "judge_model": "",
+            "id": request_id,
+            "model": "",
+            "results": [
+                _moderation_result(False, "No policy configured", "") for _ in inputs
+            ],
             "policy_configured": False,
         }
 
@@ -1098,26 +1158,39 @@ async def moderations(
 
     primary_judge = await crud.get_config_json(db, "img.judge_model", "")
     secondary_judge = await crud.get_config_json(db, "img.judge_model_secondary", "")
-    verdict = await evaluate_prompt(
-        prompt=text,
-        policy=policy_text,
-        primary_model=primary_judge,
-        secondary_model=secondary_judge,
-        is_edit=(context == "edit"),
-    )
+    verdicts = []
+    for text in inputs:
+        verdicts.append(
+            await evaluate_prompt(
+                prompt=text,
+                policy=policy_text,
+                primary_model=primary_judge,
+                secondary_model=secondary_judge,
+                is_edit=(context == "edit"),
+            )
+        )
 
-    # Flat, admin-configurable token cost (default 0: visible in the request
-    # log and RPM-throttled, but free — judge tokens are not charged on the
-    # image paths either).
+    # Flat, admin-configurable token cost PER JUDGED INPUT (default 0:
+    # visible in the request log and RPM-throttled, but free — judge tokens
+    # are not charged on the image paths either).
     token_cost = int(
         await crud.get_config_json(db, "img.moderation_quota_tokens", 0) or 0
-    )
+    ) * len(inputs)
+    judged_model = verdicts[0].judge_model or primary_judge or ""
     await _record_and_complete(
         db, user, api_key, request,
         endpoint="/v1/moderations",
         modality=Modality.CHAT,
         token_cost=token_cost,
-        model=verdict.judge_model or primary_judge or "",
+        model=judged_model,
     )
 
-    return {**verdict.to_dict(), "policy_configured": True}
+    return {
+        "id": request_id,
+        "model": judged_model,
+        "results": [
+            _moderation_result(not v.passed, v.reason, v.judge_model)
+            for v in verdicts
+        ],
+        "policy_configured": True,
+    }
