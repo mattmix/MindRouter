@@ -88,6 +88,7 @@ class ImageGenerationResponse(BaseModel):
 pipe = None
 model_id = None
 device_str = None
+quantize_mode = "none"
 gen_lock = threading.Lock()  # Serialize GPU access
 
 
@@ -120,17 +121,43 @@ def _pack_image(image: Image.Image, response_format: str, prompt: str) -> ImageD
     return ImageData(url=f"/images/{fname}", revised_prompt=prompt)
 
 
-def load_pipeline(model: str, device: str):
-    """Load the FLUX.2 Klein pipeline, fully on GPU."""
+def load_pipeline(model: str, device: str, quantize: str = "none"):
+    """Load the FLUX.2 Klein pipeline, fully on GPU.
+
+    quantize="fp8" applies torchao float8 dynamic-activation/weight
+    quantization (Hopper-native e4m3, needs compute capability >= 8.9) to
+    the diffusion transformer AND the Qwen3-8B text encoder — roughly
+    halving the ~33GB BF16 footprint. BF16 stays the default and the
+    quality reference; the community reads FP8 as visually
+    indistinguishable, but validate with fixed-seed A/B before scaling.
+    """
     from diffusers import Flux2KleinPipeline
 
-    print(f"Loading {model} on {device}...")
+    print(f"Loading {model} on {device} (quantize={quantize})...")
     t0 = time.time()
 
     pipeline = Flux2KleinPipeline.from_pretrained(
         model,
         torch_dtype=torch.bfloat16,
     ).to(device)
+
+    if quantize == "fp8":
+        # Manual torchao quantization of both large components. Applied
+        # post-load (BF16 loads first, then converts in place) because
+        # diffusers' PipelineQuantizationConfig shorthand refuses mixed
+        # diffusers/transformers components on this version pairing, and
+        # transformers 5.5.4's TorchAoConfig demands a newer torchao than
+        # torch 2.6 permits. quantize_() needs neither.
+        from torchao.quantization import (
+            Float8DynamicActivationFloat8WeightConfig,
+            quantize_,
+        )
+
+        t_q = time.time()
+        quantize_(pipeline.transformer, Float8DynamicActivationFloat8WeightConfig())
+        quantize_(pipeline.text_encoder, Float8DynamicActivationFloat8WeightConfig())
+        torch.cuda.empty_cache()
+        print(f"FP8 quantization applied in {time.time() - t_q:.1f}s")
 
     elapsed = time.time() - t0
     vram = torch.cuda.memory_allocated() / 1e9
@@ -142,7 +169,7 @@ def load_pipeline(model: str, device: str):
 async def lifespan(app: FastAPI):
     """Load model on startup."""
     global pipe, model_id, device_str
-    pipe = load_pipeline(model_id, device_str)
+    pipe = load_pipeline(model_id, device_str, quantize_mode)
     yield
     del pipe
     torch.cuda.empty_cache()
@@ -302,7 +329,7 @@ from fastapi.staticfiles import StaticFiles
 
 
 def main():
-    global model_id, device_str
+    global model_id, device_str, quantize_mode
 
     parser = argparse.ArgumentParser(description="FLUX.2 Klein OpenAI-compatible API server")
     parser.add_argument("--model", default="/data/flux2/models/FLUX.2-klein-9B",
@@ -312,10 +339,13 @@ def main():
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=18100)
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--quantize", choices=["none", "fp8"], default="none",
+                        help="fp8: torchao float8dq on transformer + text encoder")
     args = parser.parse_args()
 
     model_id = args.model
     device_str = args.device
+    quantize_mode = args.quantize
     app.state.served_model_name = args.served_model_name or args.model
 
     os.makedirs("/data/flux2/output", exist_ok=True)
