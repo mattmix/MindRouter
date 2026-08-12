@@ -84,18 +84,24 @@ nscp() { local n="$1"; local dst="$1"; shift; local last="${@: -1}"; set -- "${@
 
 # Per-node sidecar keys.
 #
-# SECURITY: the table below is checked into the repository, so every key in it
-# should be considered compromised to anyone with repo access — and a sidecar
-# key is not read-only, it also gates the node's model pull/delete endpoints.
-# Prefer supplying keys OUT of band; the table is a fallback for the nodes that
-# predate this and should be emptied as they are rotated. Resolution order:
+# SECURITY: this script no longer carries any keys. The twelve per-node keys
+# that USED to live in an in-repo `case` table here (marten, aspen1-5, lynx,
+# webbyg1/2, calvin, eunice, neuromancer) were committed to git history and
+# MUST BE TREATED AS COMPROMISED — a sidecar key is not read-only, it also
+# gates the node's model pull/delete endpoints. ROTATE ALL TWELVE as an
+# operational step: mint a fresh key per node, update the MindRouter backend
+# registration, and supply it to this script out of band via one of the two
+# paths below. (git history still contains the old values; rotation is what
+# neutralises them, not deleting the table.)
+#
+# Key resolution order (no in-repo fallback remains):
 #
 #   1. $SIDECAR_KEY_<NODE>            e.g. SIDECAR_KEY_WINTERMUTE=...
 #   2. $SIDECAR_KEY_FILE              lines of "<node> <key>", default
 #                                     /etc/mindrouter/sidecar-keys (mode 0600)
-#   3. the in-repo table below
 #
-# New nodes (wintermute onward) are deliberately NOT added to the table.
+# If neither yields a key, node_key fails hard rather than deploying with a
+# known-bad or absent secret.
 SIDECAR_KEY_FILE="${SIDECAR_KEY_FILE:-/etc/mindrouter/sidecar-keys}"
 
 node_key() {
@@ -109,21 +115,8 @@ node_key() {
         if [ -n "$k" ]; then echo "$k"; return 0; fi
     fi
 
-    case "$1" in
-        marten)      echo "b0447d8d7efefac27a761783447e37dce366395b802f69c5e578014966507953" ;;
-        aspen1)      echo "dd4bb8de54cb3ee1f732b1d21ac428180b0a76c6e5b740dcde5daf8e33d5fcbc" ;;
-        aspen2)      echo "udiydhdy7d7d7hdjhxhxhxhxh67sdgo" ;;
-        lynx)        echo "ce6187b6c36098a4a23f34c62b5112d2304000b4a9dd616fefec502e3a588428" ;;
-        webbyg2)     echo "a2663b63a2b036a88f9bb56a332dfd019f34c6398b9825ea0ec5aa940adf4830" ;;
-        webbyg1)     echo "67be9f8d222c05656af048d6dd81368237890ce43aab039a66736bd9429ca4b6" ;;
-        aspen3)      echo "Y8wzaoMh1aqYfOrSqJtTpyzvCauu9gyEEFDuoMh_tcc" ;;
-        aspen4)      echo "Y8wza1oMh1aqYfOrSqJtTpyzvCauu9gyEEFDuoMh_xxxt" ;;
-        calvin)      echo "491023f96203f67cf3d86bf81aacb98604b657f78b53b955407d35f51f3006ef" ;;
-        eunice)      echo "71f3997b67b423a52e243b081413f64591f1bf64272bf0e58f4cd03bc7506ee3" ;;
-        aspen5)      echo "f0426bf2f23aa5d6810ebc233b4944bee462a83bd4eb7ebfffe6581cacbbd431" ;;
-        neuromancer) echo "5871a710564c92d079a42ecdbbb3b0183f5a7accbf2ffc368f90421bf082896d" ;;
-        *) echo "UNKNOWN_NODE"; return 1 ;;
-    esac
+    echo "ERROR: no key for '$1'; set SIDECAR_KEY_$(printf '%s' "$1" | tr '[:lower:]-' '[:upper:]_') or add it to \$SIDECAR_KEY_FILE ($SIDECAR_KEY_FILE)" >&2
+    return 1
 }
 
 # Old sidecar paths to clean up
@@ -140,7 +133,10 @@ old_paths() {
 verify_node() {
     local node="$1"
     local key
-    key="$(node_key "$node")"
+    if ! key="$(node_key "$node")"; then
+        printf "  %-14s NO KEY (set SIDECAR_KEY_<NODE> or add to \$SIDECAR_KEY_FILE)\n" "$node"
+        return 1
+    fi
 
     # Internal (container direct)
     local iport
@@ -176,7 +172,9 @@ verify_node() {
 deploy_node() {
     local node="$1"
     local key
-    key="$(node_key "$node")"
+    if ! key="$(node_key "$node")"; then
+        return 1
+    fi
 
     echo ""
     echo "=========================================="

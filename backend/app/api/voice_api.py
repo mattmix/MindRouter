@@ -14,6 +14,7 @@
 
 """Public voice API endpoints (TTS and STT) with API key authentication."""
 
+import re
 import time
 from typing import Optional, Tuple
 
@@ -36,6 +37,20 @@ router = APIRouter(prefix="/v1/audio", tags=["voice"])
 # Upstream TTS call budget.  Covers connect through the last audio chunk;
 # httpx applies it per-operation, so it is a gap timeout while streaming.
 TTS_TIMEOUT_SECONDS = 30.0
+
+
+# Permitted characters in a voice/STT model name. Broad enough for any real
+# TTS/STT model name while rejecting the HTML/script metacharacters that would
+# otherwise let a hostile model name become stored XSS in admin request views.
+# This is a FORMAT check only — it does NOT validate against a model registry,
+# so every legitimately-installed voice model name still passes.
+_MODEL_NAME_RE = re.compile(r"^[A-Za-z0-9._:/\-]{1,128}$")
+
+
+def _validate_model_format(model: str) -> None:
+    """Raise HTTP 400 if ``model`` contains disallowed characters."""
+    if not isinstance(model, str) or not _MODEL_NAME_RE.match(model):
+        raise HTTPException(status_code=400, detail="Invalid model name")
 
 
 class TTSRequest(BaseModel):
@@ -153,6 +168,8 @@ async def tts_speech(
     user, api_key = auth
 
     await _check_quota(db, user, api_key)
+
+    _validate_model_format(body.model)
 
     if not body.input.strip():
         raise HTTPException(status_code=400, detail="No text provided")
@@ -327,6 +344,9 @@ async def stt_transcriptions(
     user, api_key = auth
 
     await _check_quota(db, user, api_key)
+
+    if model is not None and model.strip():
+        _validate_model_format(model.strip())
 
     fmt = response_format.lower() if isinstance(response_format, str) else "json"
     if fmt not in _STT_RESPONSE_FORMATS:

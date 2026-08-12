@@ -1300,6 +1300,11 @@ curl -X POST https://mindrouter.uidaho.edu/v1/ocr \
     requestAnimationFrame(animate);
 
     // Auto-refresh cluster stats and model list every 30 seconds
+    function escapeHtml(str) {
+        const div = document.createElement('div');
+        div.textContent = (str === null || str === undefined) ? '' : String(str);
+        return div.innerHTML.replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+    }
     async function refreshDashboard() {
         try {
             const statusRes = await fetch('/status');
@@ -1326,7 +1331,7 @@ curl -X POST https://mindrouter.uidaho.edu/v1/ocr \
                 if (gridEl && status.models && status.models.length) {
                     var html = '<div class="row">';
                     status.models.forEach(function(name) {
-                        html += '<div class="col-md-4 mb-2"><span class="badge bg-secondary"><i class="bi bi-box"></i> ' + name + '</span></div>';
+                        html += '<div class="col-md-4 mb-2"><span class="badge bg-secondary"><i class="bi bi-box"></i> ' + escapeHtml(name) + '</span></div>';
                     });
                     html += '</div>';
                     gridEl.innerHTML = html;

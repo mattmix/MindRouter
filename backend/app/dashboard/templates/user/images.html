@@ -828,7 +828,9 @@ async function loadHistory(append, limitOverride) {
             col.innerHTML = `
                 <div class="card gallery-card position-relative">
                     <img src="/images/serve/${img.id}" alt="${escapeHtml(img.prompt)}"
-                         loading="lazy" onclick="previewImage('/images/serve/${img.id}', '${escapeHtml(img.prompt)}')">
+                         loading="lazy" data-preview-src="/images/serve/${img.id}"
+                         data-preview-title="${escapeHtml(img.prompt)}"
+                         onclick="previewImage(this.dataset.previewSrc, this.dataset.previewTitle)">
                     <div class="gallery-overlay d-flex justify-content-between align-items-end">
                         <a href="/images/serve/${img.id}" download="mindrouter-${img.id}.png"
                            class="btn btn-sm btn-light" onclick="event.stopPropagation()">

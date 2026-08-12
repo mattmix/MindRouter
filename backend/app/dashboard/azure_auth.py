@@ -14,7 +14,6 @@
 
 """Azure AD OAuth2 SSO authentication for MindRouter."""
 
-import json
 import logging
 import secrets
 from datetime import datetime, timezone
@@ -109,6 +108,7 @@ async def azure_login(request: Request):
         value=signed_state,
         httponly=True,
         samesite="lax",
+        secure=settings.session_cookie_secure,
         max_age=600,  # 10 minutes
     )
     return response
@@ -186,8 +186,15 @@ async def azure_callback(
 
         profile = graph_response.json()
 
-    # Log full Azure AD profile for debugging field availability
-    logger.info("Azure AD profile for %s: %s", profile.get("mail") or profile.get("userPrincipalName"), json.dumps(profile, indent=2, default=str))
+    # Log only the minimal claims the login flow uses — never the full Graph
+    # /me object, which carries phone, job title, office location and other
+    # PII. INFO-level SSO logs are long-lived, so keep them to identifier +
+    # email only.
+    logger.info(
+        "Azure AD login oid=%s email=%s",
+        profile.get("id"),
+        profile.get("mail") or profile.get("userPrincipalName"),
+    )
 
     # JIT provision or update user
     user = await find_or_create_azure_user(db, profile)

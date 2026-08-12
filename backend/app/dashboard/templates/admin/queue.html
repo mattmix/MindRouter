@@ -152,6 +152,12 @@
         return s < 1 ? s.toFixed(2) + 's' : s.toFixed(1) + 's';
     }
 
+    function escapeHtml(str) {
+        const div = document.createElement('div');
+        div.textContent = (str === null || str === undefined) ? '' : String(str);
+        return div.innerHTML.replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+    }
+
     function statusBadge(status) {
         const cls = {
             'completed': 'bg-success',
@@ -241,7 +247,7 @@
             const failed = modelStats[model]?.failed;
 
             capHtml += `<tr>
-                <td><span class="badge bg-secondary model-badge">${model}</span></td>
+                <td><span class="badge bg-secondary model-badge">${escapeHtml(model)}</span></td>
                 <td class="text-center">${queued > 0 ? '<strong class="text-warning">' + queued + '</strong>' : '<span class="text-muted">0</span>'}</td>
                 <td class="text-center capacity-cell">${healthyCount} healthy</td>
                 <td class="text-center">${totalCap}</td>
@@ -267,8 +273,8 @@
         });
         for (const row of userRows) {
             userHtml += `<tr>
-                <td><span class="badge bg-secondary model-badge">${row.model}</span></td>
-                <td>${row.username}</td>
+                <td><span class="badge bg-secondary model-badge">${escapeHtml(row.model)}</span></td>
+                <td>${escapeHtml(row.username)}</td>
                 <td>${statusBadge(row.status)}</td>
                 <td class="text-center">${row.count}</td>
                 <td class="text-end">${formatTime(row.min_s)}</td>

@@ -48,15 +48,80 @@ _ALLOWED_IMAGE_TYPES = {
 _MAX_IMAGE_SIZE = 10 * 1024 * 1024  # 10 MB
 
 
+# ---------------------------------------------------------------------------
+# HTML sanitization for rendered markdown.
+#
+# Blog posts are admin-authored, but the rendered HTML is emitted with |safe on
+# the PUBLIC blog page, so we strip active content as defense-in-depth. When a
+# real HTML sanitizer (nh3) is present we use it; otherwise we fall back to a
+# conservative regex scrub. Code fences are unaffected because markdown already
+# entity-encodes their content (a `<script>` sample renders as `&lt;script&gt;`).
+# ---------------------------------------------------------------------------
+try:  # pragma: no cover - optional dependency
+    import nh3 as _nh3
+except Exception:  # pragma: no cover
+    _nh3 = None
+
+_ACTIVE_TAG_PAIR_RE = re.compile(
+    r"<\s*(script|iframe|object|embed|form|style|link|meta|base)\b[^>]*>.*?<\s*/\s*\1\s*>",
+    re.IGNORECASE | re.DOTALL,
+)
+_ACTIVE_TAG_RE = re.compile(
+    r"<\s*/?\s*(script|iframe|object|embed|form|style|link|meta|base)\b[^>]*>",
+    re.IGNORECASE,
+)
+_ON_ATTR_RE = re.compile(
+    r"""\son\w+\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)""", re.IGNORECASE
+)
+_JS_URI_RE = re.compile(r"""(=\s*["']?)\s*javascript:""", re.IGNORECASE)
+
+
+# Explicit nh3 allowlist covering exactly what the markdown pipeline emits
+# (fenced_code + codehilite + tables + toc). nh3's DEFAULT allowlist drops
+# `span`/`div` and strips the `class` attribute, which would silently break
+# code-syntax highlighting (codehilite emits `<span class=...>` / `<div
+# class="codehilite">`) and tables. Anything not listed here — script,
+# iframe, on* handlers, javascript: — is still removed.
+_NH3_TAGS = {
+    "a", "abbr", "b", "blockquote", "br", "code", "div", "em",
+    "h1", "h2", "h3", "h4", "h5", "h6", "hr", "i", "img", "li",
+    "ol", "p", "pre", "span", "strong", "sub", "sup",
+    "table", "tbody", "td", "th", "thead", "tr", "ul",
+}
+_NH3_ATTRS = {
+    "a": {"href", "title"},
+    "img": {"src", "alt", "title"},
+    "span": {"class"},
+    "code": {"class"},
+    "pre": {"class"},
+    "div": {"class"},
+    "table": {"class"},
+    "th": {"align"},
+    "td": {"align"},
+}
+
+
+def _sanitize_html(html: str) -> str:
+    """Neutralize active content in rendered markdown HTML (defense-in-depth)."""
+    if _nh3 is not None:
+        return _nh3.clean(html, tags=_NH3_TAGS, attributes=_NH3_ATTRS)
+    html = _ACTIVE_TAG_PAIR_RE.sub("", html)
+    html = _ACTIVE_TAG_RE.sub("", html)
+    html = _ON_ATTR_RE.sub("", html)
+    html = _JS_URI_RE.sub(r"\1unsafe:", html)
+    return html
+
+
 def _render_markdown(text: str) -> str:
-    """Render markdown to HTML with syntax highlighting."""
-    return markdown.markdown(
+    """Render markdown to HTML with syntax highlighting (sanitized for the public page)."""
+    rendered = markdown.markdown(
         text,
         extensions=["fenced_code", "codehilite", "tables", "toc"],
         extension_configs={
             "codehilite": {"css_class": "codehilite", "guess_lang": False},
         },
     )
+    return _sanitize_html(rendered)
 
 
 def _slugify(title: str) -> str:
@@ -647,8 +712,17 @@ async def serve_blog_image(path: str):
     content_types = {v: k for k, v in _ALLOWED_IMAGE_TYPES.items()}
     content_type = content_types.get(ext, "application/octet-stream")
 
+    headers = {"Cache-Control": "public, max-age=86400"}
+    # SVG (and unknown/unmapped types) can carry active content and would execute
+    # if opened as a top-level document. Force download + disable MIME sniffing.
+    # Inline <img src> embeds in blog posts still display: browsers ignore
+    # Content-Disposition for image subresources.
+    if content_type in ("image/svg+xml", "application/octet-stream"):
+        headers["Content-Disposition"] = "attachment"
+        headers["X-Content-Type-Options"] = "nosniff"
+
     return Response(
         content=data,
         media_type=content_type,
-        headers={"Cache-Control": "public, max-age=86400"},
+        headers=headers,
     )

@@ -123,6 +123,7 @@ manuscripts/
 # Security review (keep local)
 SECURITY_REVIEW.md
 MindRouter2_Security_Review.docx
+MindRouter-Security-Audit-*.pdf
 
 # Blog drafts (keep local)
 blog_drafts/
@@ -140,3 +141,6 @@ UI_Main_stacked_4c.png
 docs/gemma4-31b-chat-capacity-report-*.pdf
 docs/campus-chat-capacity-executive-briefing.pdf
 bench_results/
+
+# Security remediation plan (keep local)
+REMEDIATION_PLAN_2.9.18.md

@@ -19,6 +19,7 @@ import time
 from typing import Any, AsyncIterator, Dict, List, Optional
 
 import orjson
+import structlog
 
 from backend.app.core.canonical_schemas import (
     CanonicalChatRequest,
@@ -43,6 +44,9 @@ from backend.app.core.canonical_schemas import (
     TextContent,
     UsageInfo,
 )
+from backend.app.core.url_guard import image_url_reason
+
+logger = structlog.get_logger(__name__)
 
 
 _THINK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL)
@@ -749,12 +753,25 @@ class VLLMOutTranslator:
                 if isinstance(block, TextContent):
                     content_blocks.append({"type": "text", "text": block.text})
                 elif isinstance(block, ImageUrlContent):
-                    content_blocks.append(
-                        {
-                            "type": "image_url",
-                            "image_url": block.image_url,
-                        }
-                    )
+                    # SSRF guard: only relay http(s) URLs that resolve to
+                    # public addresses. data: URIs pass through unchanged.
+                    # Unsafe URLs are dropped, not fatal to the request.
+                    relay_url = ""
+                    if isinstance(block.image_url, dict):
+                        relay_url = block.image_url.get("url", "")
+                    ok, reason = image_url_reason(relay_url)
+                    if not ok:
+                        logger.warning(
+                            "dropping unsafe image_url before backend relay",
+                            reason=reason,
+                        )
+                    else:
+                        content_blocks.append(
+                            {
+                                "type": "image_url",
+                                "image_url": block.image_url,
+                            }
+                        )
                 elif isinstance(block, ImageBase64Content):
                     # Convert to data URL format
                     data_url = f"data:{block.media_type};base64,{block.data}"

@@ -203,8 +203,8 @@ def _vllm_backend():
     return SimpleNamespace(engine=_VLLM_SENTINEL, url="http://backend", id=1)
 
 
-def _conservative_bound(request) -> int:
-    est = inf._tiktoken_estimate(request)
+async def _conservative_bound(request) -> int:
+    est = await inf._tiktoken_estimate(request)
     return int(est * 1.3) + 16 * len(request.messages) + inf._TOKEN_BUFFER
 
 
@@ -227,7 +227,7 @@ class TestTokenizeGate:
         # cap at 65536, so the shortcut is provably equivalent to main.
         svc, client = _make_service()
         request = _make_request()
-        assert 131072 - _conservative_bound(_make_request()) >= inf._MAX_OUTPUT_TOKENS
+        assert 131072 - await _conservative_bound(_make_request()) >= inf._MAX_OUTPUT_TOKENS
         await svc.cap_max_tokens(request, _vllm_backend(), 131072)
         assert client.calls == 0
         assert request.max_tokens == inf._MAX_OUTPUT_TOKENS

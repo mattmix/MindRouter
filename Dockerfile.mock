@@ -9,4 +9,16 @@ COPY backend/app/tests/mocks/ ./mocks/
 
 RUN pip install fastapi uvicorn httpx
 
+# Create app user with explicit UID (mirrors the main Dockerfile) and hand it
+# ownership of the workdir so the mock runs unprivileged. The mock listens on
+# MOCK_PORT (11434/8001, both >1024) so no privileged bind is needed.
+RUN useradd --create-home --shell /bin/bash --uid 1000 appuser && \
+    chown -R appuser:appuser /app
+USER appuser
+
+# Route-agnostic liveness probe: a TCP connect to MOCK_PORT works for both the
+# ollama and vllm mock engines without assuming an HTTP health route.
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+    CMD python -c "import os,socket; s=socket.create_connection(('127.0.0.1', int(os.environ.get('MOCK_PORT','8001'))), 5); s.close()" || exit 1
+
 CMD ["python", "-m", "mocks.server"]

@@ -1079,7 +1079,10 @@ document.addEventListener('mr-theme-changed', function(e) {
                 renderMathInElement(el, {
                     delimiters: KATEX_DELIMITERS,
                     throwOnError: false,
-                    trust: true,
+                    // trust:false (KaTeX default) — LLM output must not be able to
+                    // emit javascript:/data: URLs via \href or inject raw HTML/CSS
+                    // via \htmlClass/\includegraphics. Normal math is unaffected.
+                    trust: false,
                 });
             } catch (e) { /* ignore KaTeX errors */ }
         }

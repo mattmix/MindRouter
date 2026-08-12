@@ -14,11 +14,13 @@
 
 """Dashboard routes for MindRouter."""
 
+import asyncio
 import csv
 import io
 import json
 import os
 import re
+import time
 import zoneinfo
 from urllib.parse import quote_plus
 from datetime import datetime, timedelta, timezone
@@ -171,13 +173,15 @@ def get_session_user_id(request: Request) -> Optional[int]:
 
 def set_session_cookie(response: Response, user_id: int) -> None:
     """Set signed session cookie."""
+    settings = get_settings()
     serializer = _get_session_serializer()
     signed_value = serializer.dumps(user_id)
     response.set_cookie(
         key="mindrouter_session",
         value=signed_value,
-        httponly=True,
-        samesite="lax",
+        httponly=settings.session_cookie_httponly,
+        samesite=settings.session_cookie_samesite,
+        secure=settings.session_cookie_secure,
         max_age=86400 * 7,  # 7 days
     )
 
@@ -543,6 +547,97 @@ async def models_catalog(
     )
 
 
+# ---------------------------------------------------------------------------
+# Login brute-force throttle + timing-uniform credential check
+# ---------------------------------------------------------------------------
+
+# Per (username, client-IP) sliding-window attempt tracker. In-memory and
+# per-worker: a lightweight guard against password guessing that never locks
+# an account out permanently (the window self-expires). Bounded by pruning
+# stale windows on each check so the dict cannot grow without limit.
+_login_attempts: dict = {}
+_LOGIN_ATTEMPTS_MAX_ENTRIES = 10000
+
+# Lazily-built dummy Argon2 hash. Verifying an attacker-supplied password
+# against this (via the same to_thread path) when the account is absent or
+# SSO-only keeps failed-login timing uniform, closing the enumeration oracle.
+_dummy_password_hash: Optional[str] = None
+
+
+def _get_dummy_password_hash() -> str:
+    """Return a cached valid Argon2 hash for timing-equalized dummy verifies."""
+    global _dummy_password_hash
+    if _dummy_password_hash is None:
+        _dummy_password_hash = hash_password("mindrouter-timing-equalizer")
+    return _dummy_password_hash
+
+
+def _login_throttle_check_and_record(key: str) -> bool:
+    """Record an attempt for ``key`` and return True if the caller is over limit.
+
+    Uses a sliding window of ``login_attempt_window_seconds`` allowing up to
+    ``login_max_attempts_per_window`` attempts. Prunes expired windows so the
+    tracker stays bounded.
+    """
+    settings = get_settings()
+    max_attempts = getattr(settings, "login_max_attempts_per_window", 15)
+    window = getattr(settings, "login_attempt_window_seconds", 300)
+    now = time.monotonic()
+    cutoff = now - window
+
+    # Prune this key, and opportunistically bound total size.
+    stamps = [t for t in _login_attempts.get(key, ()) if t > cutoff]
+    if len(_login_attempts) > _LOGIN_ATTEMPTS_MAX_ENTRIES:
+        for k in list(_login_attempts.keys()):
+            kept = [t for t in _login_attempts[k] if t > cutoff]
+            if kept:
+                _login_attempts[k] = kept
+            else:
+                _login_attempts.pop(k, None)
+
+    if len(stamps) >= max_attempts:
+        _login_attempts[key] = stamps  # already at/over limit; don't grow further
+        return True
+
+    stamps.append(now)
+    _login_attempts[key] = stamps
+    return False
+
+
+async def _verify_password_offloaded(password: str, password_hash: str) -> bool:
+    """Run the CPU/memory-heavy Argon2 verify off the event loop."""
+    return await asyncio.to_thread(verify_password, password, password_hash)
+
+
+async def _log_auth_event(
+    user_id: Optional[int],
+    action: str,
+    request: Request,
+    detail: Optional[str] = None,
+    entity_id: Optional[str] = None,
+) -> None:
+    """Record an authentication event to the admin audit log.
+
+    Isolated on its own session so it commits independently of the request
+    flow, and guarded so an audit failure can never block authentication.
+    Never pass secret material (passwords, key values) in ``detail``.
+    """
+    try:
+        async with get_async_db_context() as audit_db:
+            await crud.log_admin_action(
+                audit_db,
+                user_id=user_id,
+                action=action,
+                entity_type="auth",
+                entity_id=entity_id,
+                ip_address=get_client_ip(request),
+                detail=detail,
+            )
+            await audit_db.commit()
+    except Exception:
+        logger.warning("auth_audit_log_failed", action=action, exc_info=True)
+
+
 # Authentication
 def _login_page(request: Request, error: Optional[str] = None):
     """Render the login page with the enabled SSO providers."""
@@ -572,25 +667,60 @@ async def login(
     db: AsyncSession = Depends(get_async_db),
 ):
     """Handle login."""
+    # Generic message reused for every credential-rejection path so absent /
+    # SSO-only / bad-password accounts are indistinguishable (F32). The
+    # single sign-on (SSO) hint is shown ALWAYS (org-agnostic, not tied to any
+    # one account type), so it aids SSO-only users without leaking which
+    # accounts exist or are SSO-only.
+    generic_error = (
+        "Invalid username or password. If your account uses single sign-on "
+        "(SSO), use the SSO button above."
+    )
+
+    # Brute-force throttle keyed on (username, client IP). Self-expiring
+    # window; never a permanent lockout.
+    throttle_key = f"{(username or '').strip().lower()}|{get_client_ip(request)}"
+    if _login_throttle_check_and_record(throttle_key):
+        await _log_auth_event(None, "auth.login_failure", request, detail="throttled")
+        resp = _login_page(
+            request,
+            "Too many login attempts. Please wait a few minutes and try again.",
+        )
+        resp.status_code = status.HTTP_429_TOO_MANY_REQUESTS
+        return resp
+
     user = await crud.get_user_by_username(db, username)
 
-    if not user:
-        return _login_page(request, "Invalid username or password")
+    # Always run one Argon2 verify off the event loop — against the real hash
+    # when a usable local password exists, otherwise against a dummy hash — so
+    # absent and SSO-only accounts cost the same as a present one (no timing
+    # oracle, no event-loop stall from the 64MB hash).
+    if user is not None and user.password_hash is not None:
+        password_ok = await _verify_password_offloaded(password, user.password_hash)
+    else:
+        await _verify_password_offloaded(password, _get_dummy_password_hash())
+        password_ok = False
 
-    if user.password_hash is None:
-        org_name = branding_service.get_branding().get("org_name")
-        sso_label = f"{org_name} sign-in" if org_name else "single sign-on (SSO)"
-        return _login_page(request, f"This account has no local password — please use {sso_label}")
-
-    if not verify_password(password, user.password_hash):
-        return _login_page(request, "Invalid username or password")
+    if not password_ok:
+        await _log_auth_event(
+            user.id if user is not None else None,
+            "auth.login_failure",
+            request,
+            detail=f"username={username}",
+        )
+        return _login_page(request, generic_error)
 
     if not user.is_active:
+        # Only reachable after a correct password, so this is not an
+        # enumeration oracle.
+        await _log_auth_event(user.id, "auth.login_failure", request, detail="inactive")
         return _login_page(request, "Account is inactive")
 
     # Update last login
     user.last_login_at = datetime.now(timezone.utc)
     await db.commit()
+
+    await _log_auth_event(user.id, "auth.login_success", request, detail=f"username={username}")
 
     # Redirect to agreement page if user hasn't accepted current version
     target = "/dashboard/agreement" if await _needs_agreement(db, user) else "/dashboard"
@@ -600,8 +730,11 @@ async def login(
 
 
 @dashboard_router.get("/logout")
-async def logout():
+async def logout(request: Request):
     """Handle logout."""
+    user_id = get_session_user_id(request)
+    if user_id:
+        await _log_auth_event(user_id, "auth.logout", request)
     response = RedirectResponse(url="/", status_code=302)
     clear_session_cookie(response)
     return response
@@ -965,8 +1098,8 @@ async def change_password(
     if not user or not user.password_hash:
         return RedirectResponse(url="/dashboard", status_code=302)
 
-    # Validate current password
-    if not verify_password(current_password, user.password_hash):
+    # Validate current password (Argon2 verify offloaded off the event loop)
+    if not await _verify_password_offloaded(current_password, user.password_hash):
         return RedirectResponse(url="/dashboard?pw_error=Current+password+is+incorrect", status_code=302)
 
     # Validate new password
@@ -976,9 +1109,11 @@ async def change_password(
     if new_password != confirm_password:
         return RedirectResponse(url="/dashboard?pw_error=Passwords+do+not+match", status_code=302)
 
-    # Update password
-    user.password_hash = hash_password(new_password)
+    # Update password (Argon2 hashing offloaded off the event loop)
+    user.password_hash = await asyncio.to_thread(hash_password, new_password)
     await db.commit()
+
+    await _log_auth_event(user.id, "auth.password_change", request, detail=f"username={user.username}")
 
     return RedirectResponse(url="/dashboard?pw_success=Password+changed+successfully", status_code=302)
 
@@ -1012,7 +1147,7 @@ async def create_api_key(
     full_key, key_hash, key_prefix, key_sha256 = generate_api_key()
 
     # Store in database
-    await crud.create_api_key(
+    new_key = await crud.create_api_key(
         db=db,
         user_id=user_id,
         key_hash=key_hash,
@@ -1020,6 +1155,13 @@ async def create_api_key(
         name=key_name,
         expires_at=expires_at,
         key_sha256=key_sha256,
+    )
+    # Audit the credential creation (prefix only — never the key material).
+    await crud.log_admin_action(
+        db, user_id=user_id, action="apikey.create",
+        entity_type="api_key", entity_id=str(new_key.id),
+        ip_address=get_client_ip(request),
+        detail=f"name={key_name} prefix={key_prefix}",
     )
     await db.commit()
 
@@ -1059,6 +1201,12 @@ async def revoke_key(
         return RedirectResponse(
             url="/dashboard?key_error=not_found", status_code=302
         )
+    await crud.log_admin_action(
+        db, user_id=user_id, action="apikey.revoke",
+        entity_type="api_key", entity_id=str(key_id),
+        ip_address=get_client_ip(request),
+        detail=f"self-service prefix={revoked.key_prefix}",
+    )
     await db.commit()
 
     return RedirectResponse(url="/dashboard", status_code=302)
@@ -3670,11 +3818,13 @@ async def admin_masquerade_start(
     ser = _get_masquerade_serializer()
     signed = ser.dumps(target_user_id)
     response = RedirectResponse(url="/dashboard", status_code=302)
+    _settings = get_settings()
     response.set_cookie(
         key=_MASQUERADE_COOKIE,
         value=signed,
-        httponly=True,
-        samesite="lax",
+        httponly=_settings.session_cookie_httponly,
+        samesite=_settings.session_cookie_samesite,
+        secure=_settings.session_cookie_secure,
         max_age=86400,  # 24h
     )
     return response

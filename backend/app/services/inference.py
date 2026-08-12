@@ -64,34 +64,91 @@ logger = get_logger(__name__)
 _tiktoken_encoder = None
 
 
-def _tiktoken_estimate(request: "CanonicalChatRequest") -> int:
-    """Estimate input tokens using tiktoken (fallback for Ollama / vLLM errors)."""
+def _ensure_encoder():
+    """Lazily initialize (and return) the module-level tiktoken encoder."""
     global _tiktoken_encoder
     if _tiktoken_encoder is None:
         try:
             _tiktoken_encoder = tiktoken.get_encoding(get_settings().default_tokenizer)
         except Exception:
             _tiktoken_encoder = tiktoken.get_encoding("cl100k_base")
+    return _tiktoken_encoder
 
+
+def count_request_text_chars(request: "CanonicalChatRequest") -> int:
+    """Sum the input text characters in a chat request.
+
+    Used as a cheap admission-control size gate before the (potentially
+    expensive) tokenizer round-trip on the /tokenize endpoints.
+    """
     total = 0
     for msg in request.messages or []:
         content = msg.content
         if isinstance(content, str):
-            total += len(_tiktoken_encoder.encode(content))
+            total += len(content)
         elif isinstance(content, list):
             for block in content:
                 text = getattr(block, "text", None)
                 if text:
-                    total += len(_tiktoken_encoder.encode(text))
+                    total += len(text)
+    if request.tools:
+        total += len(json.dumps([t.model_dump() for t in request.tools]))
+    return total
+
+
+def _tiktoken_estimate_sync(request: "CanonicalChatRequest", encoder, max_chars: int) -> int:
+    """CPU-bound tiktoken estimate (runs off the event loop via to_thread).
+
+    Caps the total number of characters fed to the encoder at ``max_chars``
+    so a pathologically large prompt cannot pin a worker in a synchronous
+    encode. The cap only bounds the *counting* cost — the actual prompt sent
+    to the model is untouched. Per-message overhead is always accounted for.
+    """
+    total = 0
+    budget = max_chars
+
+    def _encode_capped(text) -> int:
+        nonlocal budget
+        if not text or budget <= 0:
+            return 0
+        chunk = text[:budget]
+        budget -= len(chunk)
+        return len(encoder.encode(chunk))
+
+    for msg in request.messages or []:
+        content = msg.content
+        if isinstance(content, str):
+            total += _encode_capped(content)
+        elif isinstance(content, list):
+            for block in content:
+                total += _encode_capped(getattr(block, "text", None))
         # Per-message overhead (role, separators)
         total += 4
 
     # Tool definitions contribute tokens too
     if request.tools:
         tool_text = json.dumps([t.model_dump() for t in request.tools])
-        total += len(_tiktoken_encoder.encode(tool_text))
+        total += _encode_capped(tool_text)
 
     return total
+
+
+async def _tiktoken_estimate(request: "CanonicalChatRequest") -> int:
+    """Estimate input tokens using tiktoken (fallback for Ollama / vLLM errors).
+
+    The synchronous encode is offloaded to a thread so it never blocks the
+    event loop, and the text fed to it is capped at
+    ``settings.tokenize_max_input_chars``.
+    """
+    encoder = _ensure_encoder()
+    # getattr fallback keeps this robust if the shared setting has not yet been
+    # added (concurrent settings work); default matches the contract. Coerce to
+    # a positive int so a missing/misconfigured (non-numeric) value falls back
+    # to the safe default instead of crashing this hot path.
+    max_chars = getattr(get_settings(), "tokenize_max_input_chars", 2_000_000)
+    if not isinstance(max_chars, int) or isinstance(max_chars, bool) or max_chars <= 0:
+        max_chars = 2_000_000
+    return await asyncio.to_thread(_tiktoken_estimate_sync, request, encoder, max_chars)
 
 
 # Hard cap on max_tokens to prevent any single response from being excessively large
@@ -101,11 +158,11 @@ _MAX_OUTPUT_TOKENS = 65536
 _TOKEN_BUFFER = 1024
 
 
-def _estimate_input_tokens(request: "CanonicalChatRequest") -> int:
+async def _estimate_input_tokens(request: "CanonicalChatRequest") -> int:
     """Tiktoken estimate, memoized on the request so retries don't re-encode."""
     est = getattr(request, "_est_input_tokens", None)
     if est is None:
-        est = _tiktoken_estimate(request)
+        est = await _tiktoken_estimate(request)
         request._est_input_tokens = est
     return est
 
@@ -267,7 +324,7 @@ class InferenceService:
                 )
                 # Fall through to tiktoken estimation
 
-        return _estimate_input_tokens(request), True
+        return await _estimate_input_tokens(request), True
 
     async def cap_max_tokens(
         self,
@@ -294,7 +351,7 @@ class InferenceService:
             # A context-length 400 slipped past the gate — recount from scratch.
             _invalidate_token_memos(request)
         elif not request.auto_truncate:
-            est = _estimate_input_tokens(request)
+            est = await _estimate_input_tokens(request)
             bound = int(est * 1.3) + 16 * len(request.messages or []) + _TOKEN_BUFFER
             room = context_length - bound
             if request.max_tokens is not None:
@@ -322,8 +379,7 @@ class InferenceService:
             # the input fits, reserving room for a useful response.
             from backend.app.core.context_trim import trim_messages_to_fit
 
-            if _tiktoken_encoder is None:
-                _tiktoken_estimate(request)  # initializes the encoder
+            _ensure_encoder()  # ensure the module-level encoder is ready
             reserve = min(request.max_tokens or 1024, 4096)
             budget = context_length - _TOKEN_BUFFER - reserve
             request.messages, dropped = trim_messages_to_fit(

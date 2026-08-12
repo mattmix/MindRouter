@@ -156,6 +156,7 @@ async def begin_login(request: Request, cfg: OIDCConfig):
         value=signed_state,
         httponly=True,
         samesite="lax",
+        secure=get_settings().session_cookie_secure,
         max_age=600,
     )
     return response

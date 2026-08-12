@@ -59,7 +59,7 @@ from backend.app.services import (
     responses_store,
     responses_websearch,
 )
-from backend.app.services.inference import InferenceService
+from backend.app.services.inference import InferenceService, count_request_text_chars
 from backend.app.settings import get_settings
 
 logger = get_logger(__name__)
@@ -481,6 +481,24 @@ async def count_input_tokens(
     except Exception as e:
         return error_json(400, f"Invalid request: {str(e)}")
 
+    # Admission control: this endpoint runs the (possibly backend-round-trip)
+    # tokenizer, so it must respect the same RPM limit as the metered inference
+    # endpoints, and reject inputs too large to count cheaply. No token-cost
+    # quota is debited here — counting tokens is not billed generation.
+    service = InferenceService(db)
+    try:
+        await service._check_quota(user, api_key)
+    except HTTPException as e:
+        return _reshape_http_exception(e)
+
+    max_chars = getattr(settings, "tokenize_max_input_chars", 2_000_000)
+    if not isinstance(max_chars, int) or isinstance(max_chars, bool) or max_chars <= 0:
+        max_chars = 2_000_000
+    if count_request_text_chars(canonical) > max_chars:
+        return error_json(
+            413, "Input too large to tokenize", code="input_too_large",
+        )
+
     registry = get_registry()
     canonical.model, _ = registry.resolve_alias(canonical.model)
     backends = await registry.get_backends_with_model(canonical.model)
@@ -496,7 +514,6 @@ async def count_input_tokens(
         (b for b in backends if getattr(b.engine, "value", b.engine) == "vllm"),
         backends[0],
     )
-    service = InferenceService(db)
     count, _is_estimate = await service._count_input_tokens(canonical, backend)
 
     return {"object": "response.input_tokens", "input_tokens": count}

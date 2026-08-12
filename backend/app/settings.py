@@ -88,6 +88,18 @@ class Settings(BaseSettings):
     session_cookie_samesite: str = "lax"
     api_key_hash_algorithm: str = "argon2"
 
+    # Login throttling — cap failed login attempts per source within a rolling
+    # window (brute-force / credential-stuffing guard). Enforcement lives in
+    # the login path; these are the tunables it reads.
+    login_max_attempts_per_window: int = 15
+    login_attempt_window_seconds: int = 300
+
+    # CSRF: for state-changing browser requests (POST/PUT/PATCH/DELETE) the
+    # Origin/Referer host must be this deployment's own host or one of these
+    # explicitly trusted origins (scheme+host, e.g. "https://app.example.com").
+    # API-key/server-to-server clients send no Origin and are unaffected.
+    csrf_trusted_origins: List[str] = []
+
     # Azure AD SSO
     azure_ad_client_id: Optional[str] = None
     azure_ad_client_secret: Optional[str] = None
@@ -219,6 +231,12 @@ class Settings(BaseSettings):
     backend_request_timeout_per_attempt: int = 180
     backend_retry_max_attempts: int = 3
     structured_output_retry_on_invalid: bool = True
+    # Upper bound on the OpenAI `n` parameter (completions per request) —
+    # a large n multiplies backend load and cost.
+    max_completions_n: int = 8
+    # Rate limiting: when Redis is unavailable, fall back to a per-worker
+    # in-process limiter instead of skipping the limit entirely. Default True.
+    rate_limit_local_fallback: bool = True
     # Streaming write coalescing: buffer up to N framed SSE/NDJSON events per
     # socket write.  The T-ms bound applies while events keep arriving —
     # during a backend stall, buffered events flush on the next arrival or
@@ -293,12 +311,29 @@ class Settings(BaseSettings):
     otel_exporter_otlp_endpoint: Optional[str] = None
     otel_service_name: str = "mindrouter"
 
+    # API docs — /docs (Swagger), /redoc and /openapi.json. Disable to hide
+    # the interactive schema on internet-facing deployments. Default True
+    # preserves the current behavior.
+    enable_api_docs: bool = True
+
+    # Image URL fetching (image_url inputs / vision + OCR). When
+    # image_url_block_private is True, targets resolving to private/loopback/
+    # link-local addresses are refused (SSRF guard); allowed URL schemes are
+    # restricted to image_url_allowed_schemes. ocr_max_frames caps how many
+    # pages/frames a single OCR job will rasterize.
+    image_url_block_private: bool = True
+    image_url_allowed_schemes: List[str] = ["http", "https", "data"]
+    ocr_max_frames: int = 500
+
     # CORS
     cors_origins: List[str] = ["http://localhost:3000", "http://localhost:8000"]
 
     # Chat UI
     chat_files_path: str = "/data/chat_files"
     chat_upload_max_size_mb: int = 10
+    # Cap for the DECOMPRESSED size of an uploaded file (guards against
+    # decompression-bomb archives whose on-disk size passes the size cap).
+    chat_upload_max_uncompressed_mb: int = 100
     chat_upload_allowed_extensions: List[str] = [
         ".txt", ".md", ".csv", ".json", ".html", ".htm", ".log",
         ".docx", ".xlsx", ".pptx", ".pdf",
@@ -314,6 +349,9 @@ class Settings(BaseSettings):
 
     # Tokenizer
     default_tokenizer: str = "cl100k_base"
+    # Upper bound on characters accepted by the /v1/tokenize helper — caps the
+    # work a single unauthenticated-cost tokenization request can trigger.
+    tokenize_max_input_chars: int = 2000000
 
     @field_validator("cors_origins", mode="before")
     @classmethod
