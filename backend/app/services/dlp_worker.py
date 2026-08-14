@@ -283,6 +283,10 @@ async def _load_dlp_config(db) -> dict:
     config["gliner.enabled"] = await crud.get_config_json(db, "dlp.gliner.enabled", False)
     config["gliner.threshold"] = await crud.get_config_json(db, "dlp.gliner.threshold", 0.5)
     config["gliner.categories"] = await crud.get_config_json(db, "dlp.gliner.categories", None)
+    from backend.app.services.dlp_scanner import GLINER_DEFAULT_MAX_CHARS
+    config["gliner.max_scan_chars"] = await crud.get_config_json(
+        db, "dlp.gliner.max_scan_chars", GLINER_DEFAULT_MAX_CHARS
+    )
     config["llm.enabled"] = await crud.get_config_json(db, "dlp.llm.enabled", False)
     config["llm.model"] = await crud.get_config_json(db, "dlp.llm.model", "")
     config["llm.system_prompt"] = await crud.get_config_json(db, "dlp.llm.system_prompt", "")

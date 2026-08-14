@@ -36,6 +36,12 @@ CompleteFn = Callable[[str, List[Dict[str, str]]], Awaitable[str]]
 # cost and GLiNER/LLM token use on a pathological request.
 MAX_SCAN_CHARS = 200_000
 
+# GLiNER is CPU-bound torch inference whose cost scales with text length, so it
+# gets its OWN, much smaller cap than the cheap regex scanner: a long chat
+# history could otherwise pin a CPU thread for tens of seconds.  Admin-tunable
+# via dlp.gliner.max_scan_chars; this bounds a scan to ~1-2s at the default.
+GLINER_DEFAULT_MAX_CHARS = 10_000
+
 
 class DlpScannerError(Exception):
     """A DLP scanner failed to RUN (model load / dispatch / unparseable output).
@@ -197,6 +203,7 @@ async def scan_gliner(
     text: str,
     categories: Optional[List[str]] = None,
     threshold: float = 0.5,
+    max_chars: Optional[int] = None,
 ) -> List[ScanFinding]:
     """Scan text using GLiNER NER model for PII entities.
 
@@ -204,10 +211,17 @@ async def scan_gliner(
         text: Text to scan.
         categories: Entity categories to detect.
         threshold: Minimum confidence threshold.
+        max_chars: Cap the text fed to the model (CPU cost scales with length).
+            Defaults to GLINER_DEFAULT_MAX_CHARS; None keeps the default.
 
     Returns:
         List of ScanFinding objects.
     """
+    cap = GLINER_DEFAULT_MAX_CHARS if max_chars is None else max_chars
+    if cap and cap > 0 and len(text) > cap:
+        logger.info("dlp_gliner_text_capped", original_chars=len(text), kept=cap)
+        text = text[:cap]
+
     if not categories:
         categories = [
             "person", "phone number", "email", "credit card number",
@@ -484,6 +498,7 @@ async def run_dlp_scan(
                 text,
                 categories=config.get("gliner.categories"),
                 threshold=config.get("gliner.threshold", 0.5),
+                max_chars=config.get("gliner.max_scan_chars"),
             )
             all_findings.extend(gliner_findings)
             if gliner_findings:

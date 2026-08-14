@@ -999,3 +999,21 @@ class TestDigest:
         assert 'name="email_{{ row.key }}_mode"' in html
         assert 'name="digest_frequency"' in html
         assert 'name="digest_recipients"' in html
+
+
+class TestGlinerScanCapWiring:
+    """The GLiNER scan-length cap is admin-configurable end to end."""
+
+    def test_worker_loads_and_passes_the_cap(self):
+        assert 'get_config_json(\n        db, "dlp.gliner.max_scan_chars"' in WORKER_SRC \
+            or 'dlp.gliner.max_scan_chars' in WORKER_SRC
+        assert 'GLINER_DEFAULT_MAX_CHARS' in WORKER_SRC
+        assert 'max_chars=config.get("gliner.max_scan_chars")' in SCANNER_SRC
+
+    def test_route_validates_and_persists_the_cap(self):
+        assert '"dlp.gliner.max_scan_chars", gliner_max_chars' in ROUTES_SRC
+        assert "500 <= gliner_max_chars <= 200000" in ROUTES_SRC
+
+    def test_template_exposes_the_field(self):
+        html = (_DASHBOARD_DIR / "templates" / "admin" / "dlp.html").read_text()
+        assert 'name="gliner_max_scan_chars"' in html

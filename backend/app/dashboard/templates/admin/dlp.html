@@ -219,12 +219,19 @@
                                 </button>
                             </div>
                             <div class="card-body">
-                                <p class="text-muted small">Neural entity recognition using GLiNER. Runs on CPU (~10ms/scan). First scan takes ~2-3s to load the model.</p>
+                                <p class="text-muted small">Neural entity recognition using GLiNER. Runs on CPU; scan time scales with text length (roughly 1&ndash;3s for a typical message, longer for long chats). First scan takes ~2&ndash;3s to load the model. Scans run in the background and never add latency to a user's request.</p>
                                 <div class="mb-3">
                                     <label class="form-label fw-bold" for="gliner_threshold">Confidence Threshold</label>
                                     <input type="range" class="form-range" id="gliner_threshold" name="gliner_threshold"
                                            min="0.1" max="0.95" step="0.05" value="{{ config.gliner_threshold }}">
                                     <div class="text-center"><span id="threshold_val">{{ config.gliner_threshold }}</span></div>
+                                </div>
+                                <div class="mb-3">
+                                    <label class="form-label fw-bold" for="gliner_max_scan_chars">Max scan characters</label>
+                                    <input type="number" class="form-control form-control-sm" style="max-width: 12rem;"
+                                           id="gliner_max_scan_chars" name="gliner_max_scan_chars"
+                                           value="{{ config.gliner_max_scan_chars }}" min="500" max="200000" step="500">
+                                    <div class="form-text">Caps the text GLiNER scans, bounding CPU cost. Lower = faster scans; higher = scans deeper into long messages. Default 10000 (~1&ndash;2s). Regex is unaffected.</div>
                                 </div>
                                 <div class="mb-3">
                                     <label class="form-label fw-bold">Entity Categories</label>

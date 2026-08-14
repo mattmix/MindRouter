@@ -511,7 +511,7 @@ class TestRunDlpScanFailOpen:
 
     @pytest.mark.asyncio
     async def test_gliner_error_is_surfaced_not_swallowed(self, monkeypatch):
-        async def _boom(text, categories=None, threshold=0.5):
+        async def _boom(text, categories=None, threshold=0.5, max_chars=None):
             raise _scanner_mod.DlpScannerError("gliner model unavailable: OSError")
 
         monkeypatch.setattr(_scanner_mod, "scan_gliner", _boom)
@@ -535,7 +535,7 @@ class TestRunDlpScanFailOpen:
 
     @pytest.mark.asyncio
     async def test_one_broken_scanner_does_not_blind_the_others(self, monkeypatch):
-        async def _boom(text, categories=None, threshold=0.5):
+        async def _boom(text, categories=None, threshold=0.5, max_chars=None):
             raise _scanner_mod.DlpScannerError("gliner predict failed: RuntimeError")
 
         monkeypatch.setattr(_scanner_mod, "scan_gliner", _boom)
@@ -547,3 +547,56 @@ class TestRunDlpScanFailOpen:
         assert result is not None
         assert any(f.category == "social security number" for f in result.findings)
         assert result.scanner_errors  # the gliner failure is still reported
+
+
+class TestGlinerScanCap:
+    """GLiNER (CPU-bound) gets its own text cap so a long chat can't pin a
+    thread for tens of seconds. Regex is unaffected."""
+
+    @pytest.mark.asyncio
+    async def test_explicit_cap_truncates_text(self, monkeypatch):
+        seen = {}
+
+        class _FakeModel:
+            def predict_entities(self, text, categories, threshold=0.5):
+                seen["len"] = len(text)
+                return []
+
+        async def _fake_load():
+            return _FakeModel()
+
+        monkeypatch.setattr(_scanner_mod, "_load_gliner", _fake_load)
+        await _scanner_mod.scan_gliner("x" * 50000, max_chars=1000)
+        assert seen["len"] == 1000
+
+    @pytest.mark.asyncio
+    async def test_default_cap_applied_when_unset(self, monkeypatch):
+        seen = {}
+
+        class _FakeModel:
+            def predict_entities(self, text, categories, threshold=0.5):
+                seen["len"] = len(text)
+                return []
+
+        async def _fake_load():
+            return _FakeModel()
+
+        monkeypatch.setattr(_scanner_mod, "_load_gliner", _fake_load)
+        await _scanner_mod.scan_gliner("x" * 50000)  # no max_chars -> default
+        assert seen["len"] == _scanner_mod.GLINER_DEFAULT_MAX_CHARS
+
+    @pytest.mark.asyncio
+    async def test_short_text_not_truncated(self, monkeypatch):
+        seen = {}
+
+        class _FakeModel:
+            def predict_entities(self, text, categories, threshold=0.5):
+                seen["len"] = len(text)
+                return []
+
+        async def _fake_load():
+            return _FakeModel()
+
+        monkeypatch.setattr(_scanner_mod, "_load_gliner", _fake_load)
+        await _scanner_mod.scan_gliner("just a short message", max_chars=10000)
+        assert seen["len"] == len("just a short message")

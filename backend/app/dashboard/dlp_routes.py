@@ -117,6 +117,7 @@ async def admin_dlp_page(
         "gliner_enabled": await crud.get_config_json(db, "dlp.gliner.enabled", False),
         "gliner_threshold": await crud.get_config_json(db, "dlp.gliner.threshold", 0.5),
         "gliner_categories": await crud.get_config_json(db, "dlp.gliner.categories", []),
+        "gliner_max_scan_chars": await crud.get_config_json(db, "dlp.gliner.max_scan_chars", 10000),
         "llm_enabled": await crud.get_config_json(db, "dlp.llm.enabled", False),
         "llm_model": await crud.get_config_json(db, "dlp.llm.model", ""),
         "llm_system_prompt": await crud.get_config_json(db, "dlp.llm.system_prompt", ""),
@@ -230,6 +231,14 @@ async def save_dlp_config(
     if not (0.1 <= threshold <= 0.95):  # also rejects nan (all comparisons False)
         return _err("GLiNER threshold must be between 0.1 and 0.95")
 
+    # GLiNER max scan chars — bounds CPU cost (scan time scales with length).
+    try:
+        gliner_max_chars = int(float(form.get("gliner_max_scan_chars", "10000")))
+    except (TypeError, ValueError):
+        return _err("GLiNER max scan characters must be a whole number")
+    if not (500 <= gliner_max_chars <= 200000):
+        return _err("GLiNER max scan characters must be between 500 and 200000")
+
     # GLiNER categories — normalized, deduped, and saved even when empty so an
     # admin can clear the list (the old `if categories:` guard made that
     # impossible, silently keeping the previous list).
@@ -341,6 +350,7 @@ async def save_dlp_config(
         await crud.set_config(db, "dlp.gliner.enabled", form.get("gliner_enabled") == "on")
         await crud.set_config(db, "dlp.llm.enabled", llm_enabled)
         await crud.set_config(db, "dlp.gliner.threshold", threshold)
+        await crud.set_config(db, "dlp.gliner.max_scan_chars", gliner_max_chars)
         await crud.set_config(db, "dlp.gliner.categories", categories)
         await crud.set_config(db, "dlp.llm.model", llm_model)
         await crud.set_config(db, "dlp.llm.system_prompt", llm_prompt)
