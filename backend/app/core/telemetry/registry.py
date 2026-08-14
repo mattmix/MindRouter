@@ -58,6 +58,12 @@ class BackendRegistry:
         self._capabilities: Dict[int, BackendCapabilities] = {}
         self._telemetry: Dict[int, TelemetrySnapshot] = {}
         self._lock = asyncio.Lock()
+        # Bound concurrent capability discovery: a fresh worker otherwise fires
+        # one model-enumeration + FOR-UPDATE upsert per backend at once, which
+        # deadlocks on model rows and exhausts the DB pool at startup.
+        self._discover_sem = asyncio.Semaphore(
+            max(1, getattr(self._settings, "backend_poll_concurrency", 8))
+        )
         self._poll_task: Optional[asyncio.Task] = None
         self._persist_task: Optional[asyncio.Task] = None
         self._cleanup_task: Optional[asyncio.Task] = None
@@ -990,7 +996,7 @@ class BackendRegistry:
                         self._check_backend_health(bid)
                         for bid in self._fast_poll_backends
                     ]
-                    await asyncio.gather(*fast_tasks, return_exceptions=True)
+                    await self._gather_bounded(fast_tasks)
 
                 # Determine sleep interval
                 if self._fast_poll_backends:
@@ -1012,6 +1018,24 @@ class BackendRegistry:
             except Exception as e:
                 logger.error("poll_loop_error", error=str(e))
 
+    async def _gather_bounded(self, coros) -> None:
+        """Run poll coroutines with bounded concurrency.
+
+        Each backend health check opens a DB session; an unbounded gather over
+        every backend opens a connection per backend at once, which — across N
+        uvicorn workers each polling — can exhaust MariaDB's max_connections.
+        Bounding it keeps peak connections proportional to the concurrency
+        limit, not the backend count, while still checking every backend.
+        """
+        limit = max(1, getattr(self._settings, "backend_poll_concurrency", 8))
+        sem = asyncio.Semaphore(limit)
+
+        async def _run(coro):
+            async with sem:
+                return await coro
+
+        await asyncio.gather(*(_run(c) for c in coros), return_exceptions=True)
+
     async def _poll_all_backends(self) -> None:
         """Poll all nodes' sidecars and all backends concurrently."""
         async with self._lock:
@@ -1032,7 +1056,7 @@ class BackendRegistry:
         for bid in backend_ids:
             all_tasks.append(self._check_backend_health(bid))
 
-        await asyncio.gather(*all_tasks, return_exceptions=True)
+        await self._gather_bounded(all_tasks)
 
     async def _check_backend_health(self, backend_id: int) -> None:
         """Check health of a single backend."""
@@ -1106,6 +1130,17 @@ class BackendRegistry:
             )
 
     async def _discover_backend(self, backend_id: int) -> None:
+        """Discover a backend's capabilities, concurrency-bounded.
+
+        Thin wrapper so the (many, fire-and-forget) discovery tasks a fresh
+        worker spawns can't all hit the DB at once — see _discover_sem.
+        """
+        if backend_id not in self._adapters:
+            return
+        async with self._discover_sem:
+            await self._discover_backend_impl(backend_id)
+
+    async def _discover_backend_impl(self, backend_id: int) -> None:
         """Discover capabilities for a backend."""
         adapter = self._adapters.get(backend_id)
         if not adapter:

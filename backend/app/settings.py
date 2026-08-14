@@ -212,6 +212,13 @@ class Settings(BaseSettings):
     backend_circuit_breaker_recovery_seconds: int = 30
     backend_adaptive_poll_fast_interval: int = 10
     backend_adaptive_poll_fast_duration: int = 120
+    # Max backend health checks run concurrently per poll sweep. Each check
+    # opens a DB session, so an unbounded gather over every backend opens a
+    # connection per backend at once — and with N uvicorn workers each polling,
+    # that multiplies into the DB pool and can exhaust MariaDB max_connections.
+    # Bounding it keeps peak poll connections ~= concurrency x workers instead
+    # of backends x workers.
+    backend_poll_concurrency: int = 8
 
     # Request Handling
     max_request_size: int = 52428800  # 50MB
