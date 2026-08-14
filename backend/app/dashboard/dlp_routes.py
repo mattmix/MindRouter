@@ -126,6 +126,11 @@ async def admin_dlp_page(
         "email_major": await crud.get_config_json(db, "dlp.email.major_recipients", ""),
         "dedup_enabled": await crud.get_config_json(db, "dlp.dedup.enabled", True),
         "dedup_window_seconds": await crud.get_config_json(db, "dlp.dedup.window_seconds", 300),
+        "email_minor_mode": await crud.get_config_json(db, "dlp.email.minor.mode", "immediate"),
+        "email_moderate_mode": await crud.get_config_json(db, "dlp.email.moderate.mode", "immediate"),
+        "email_major_mode": await crud.get_config_json(db, "dlp.email.major.mode", "immediate"),
+        "digest_frequency": await crud.get_config_json(db, "dlp.digest.frequency", "daily"),
+        "digest_recipients": await crud.get_config_json(db, "dlp.digest.recipients", ""),
     }
 
     # Load alerts with pagination
@@ -191,6 +196,31 @@ async def save_dlp_config(
         return _err("De-duplication window must be a whole number of seconds")
     if not (0 <= dedup_window <= 86400):
         return _err("De-duplication window must be between 0 and 86400 seconds")
+
+    # Per-severity email delivery mode (immediate / digest / off) and the
+    # central digest schedule.
+    email_modes = {}
+    for sev in ("minor", "moderate", "major"):
+        m = (form.get(f"email_{sev}_mode") or "immediate").strip()
+        if m not in ("immediate", "digest", "off"):
+            return _err(f"Invalid delivery mode for {sev} alerts")
+        email_modes[sev] = m
+
+    digest_frequency = (form.get("digest_frequency") or "daily").strip()
+    if digest_frequency not in ("hourly", "6h", "12h", "daily"):
+        return _err("Digest frequency must be hourly, 6h, 12h, or daily")
+
+    raw_digest = (form.get("digest_recipients") or "").replace("\r", " ").replace("\n", " ")
+    digest_addrs = [a.strip() for a in raw_digest.split(",") if a.strip()]
+    if len(digest_addrs) > MAX_RECIPIENTS:
+        return _err(f"Too many digest recipients (max {MAX_RECIPIENTS})")
+    for a in digest_addrs:
+        if not _EMAIL_RE.match(a):
+            return _err(f"'{a[:40]}' is not a valid email address")
+    digest_recipients = ", ".join(digest_addrs)
+    # If any severity routes to the digest, the digest needs somewhere to go.
+    if "digest" in email_modes.values() and not digest_recipients:
+        return _err("Add digest recipients — a severity is set to Digest but no digest address is configured")
 
     # GLiNER confidence threshold
     try:
@@ -327,6 +357,11 @@ async def save_dlp_config(
         await crud.set_config(db, "dlp.email.minor_recipients", recipients["minor"])
         await crud.set_config(db, "dlp.email.moderate_recipients", recipients["moderate"])
         await crud.set_config(db, "dlp.email.major_recipients", recipients["major"])
+        await crud.set_config(db, "dlp.email.minor.mode", email_modes["minor"])
+        await crud.set_config(db, "dlp.email.moderate.mode", email_modes["moderate"])
+        await crud.set_config(db, "dlp.email.major.mode", email_modes["major"])
+        await crud.set_config(db, "dlp.digest.frequency", digest_frequency)
+        await crud.set_config(db, "dlp.digest.recipients", digest_recipients)
 
         await crud.log_admin_action(
             db, user.id, "update", "dlp_config",

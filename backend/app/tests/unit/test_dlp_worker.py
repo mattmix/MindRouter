@@ -930,3 +930,72 @@ class TestScannerFailOpenSurfaced:
         assert "raise DlpScannerError" in SCANNER_SRC
         # run_dlp_scan no longer treats an errored scan as clean (None).
         assert "if not all_findings and not scanner_errors:" in SCANNER_SRC
+
+
+# ===================================================================
+# Digest report: per-severity delivery mode + scheduled roll-up
+# ===================================================================
+
+class TestDigest:
+    """Each severity routes to immediate / digest / off; digest-mode alerts are
+    rolled into a scheduled report (hourly..daily), central recipients."""
+
+    def test_frequencies_cover_hourly_to_daily(self, worker):
+        f = worker.DIGEST_FREQUENCIES
+        assert f["hourly"] == 3600
+        assert f["6h"] == 21600
+        assert f["12h"] == 43200
+        assert f["daily"] == 86400
+
+    def test_parse_iso_roundtrip_and_tolerance(self, worker):
+        from datetime import datetime, timezone
+        # tz-aware ISO round-trips
+        dt = datetime(2026, 8, 14, 12, 0, tzinfo=timezone.utc)
+        assert worker._parse_iso(dt.isoformat()) == dt
+        # naive input is coerced to UTC (not left tz-naive)
+        parsed = worker._parse_iso("2026-08-14T12:00:00")
+        assert parsed.tzinfo is not None
+        # None / garbage never raise
+        assert worker._parse_iso(None) is None
+        assert worker._parse_iso("not-a-date") is None
+
+    def test_immediate_delivery_gated_on_mode(self):
+        # _maybe_send_email only sends when the severity is set to "immediate".
+        assert 'get_config_json(db, f"dlp.email.{severity}.mode", "immediate")' in WORKER_SRC
+        assert 'if mode != "immediate":' in WORKER_SRC
+
+    def test_digest_loop_is_wired_and_scheduled(self):
+        assert "async def dlp_digest_loop" in WORKER_SRC
+        assert "async def _maybe_send_digest" in WORKER_SRC
+        # First run establishes the watermark without emailing a backfill.
+        assert "First run establishes the watermark" in WORKER_SRC
+        # Only digest-mode severities are rolled up.
+        assert '"immediate") == "digest"' in WORKER_SRC
+
+    def test_digest_watermark_not_advanced_on_failure(self):
+        # A send failure must not drop alerts: keep the window for the retry.
+        assert "Do NOT advance the watermark on send failure" in WORKER_SRC
+
+    def test_digest_email_never_includes_matched_values(self):
+        assert "Matched values are masked" in WORKER_SRC
+
+    def test_main_starts_the_digest_loop(self):
+        main_src = (_APP_DIR / "main.py").read_text()
+        assert "dlp_digest_loop" in main_src
+        assert "_dlp_digest_task = asyncio.create_task(dlp_digest_loop())" in main_src
+        assert "_dlp_digest_task.cancel()" in main_src  # cancelled on shutdown
+
+    def test_route_persists_modes_and_digest(self):
+        assert '"dlp.email.minor.mode", email_modes["minor"]' in ROUTES_SRC
+        assert '"dlp.email.major.mode", email_modes["major"]' in ROUTES_SRC
+        assert '"dlp.digest.frequency", digest_frequency' in ROUTES_SRC
+        assert '"dlp.digest.recipients", digest_recipients' in ROUTES_SRC
+        assert 'if digest_frequency not in ("hourly", "6h", "12h", "daily")' in ROUTES_SRC
+        # A digest-routed severity without recipients is rejected up front.
+        assert '"digest" in email_modes.values() and not digest_recipients' in ROUTES_SRC
+
+    def test_template_has_mode_selectors_and_digest_card(self):
+        html = (_DASHBOARD_DIR / "templates" / "admin" / "dlp.html").read_text()
+        assert 'name="email_{{ row.key }}_mode"' in html
+        assert 'name="digest_frequency"' in html
+        assert 'name="digest_recipients"' in html

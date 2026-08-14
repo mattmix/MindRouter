@@ -19,6 +19,7 @@
 
 import asyncio
 import time
+from datetime import datetime, timedelta, timezone
 
 from backend.app.logging_config import get_logger
 
@@ -52,6 +53,27 @@ _dedup_seen: dict = {}  # key -> first-seen monotonic time
 # flood while an operator is still told DLP is degraded.
 SCANNER_ERROR_ALERT_WINDOW = 3600.0
 _scanner_error_seen: dict = {}
+
+# Per-severity email delivery modes (admin -> DLP panel).  Each severity picks
+# how its alerts are emailed:
+#   "immediate" — email now, to that severity's recipients (flood-guarded)
+#   "digest"    — roll up into the periodic digest report (dlp_digest_loop)
+#   "off"       — no email; the alert is still created and logged
+_DELIVERY_MODES = ("immediate", "digest", "off")
+_SEVERITIES = ("minor", "moderate", "major")
+
+# Digest schedule: how often the rolled-up report is sent.
+DIGEST_FREQUENCIES = {
+    "hourly": 3600,
+    "6h": 21600,
+    "12h": 43200,
+    "daily": 86400,
+}
+# How often the digest loop wakes to check whether a report is due.
+DIGEST_CHECK_INTERVAL = 300.0
+# Cap alerts enumerated in one digest email so a busy window can't produce a
+# multi-megabyte message; the count line still reports the true total.
+DIGEST_MAX_ROWS = 500
 
 
 def _dedup_is_duplicate(key, window: float) -> bool:
@@ -411,10 +433,22 @@ def _email_allowed(severity: str) -> tuple:
 
 
 async def _maybe_send_email(db, alert, scan_result) -> None:
-    """Send email notification if configured for this severity level."""
+    """Send an IMMEDIATE email for this alert, if its severity is set to
+    immediate delivery.
+
+    Delivery mode is per-severity (Admin -> DLP): "immediate" mails now to the
+    severity's recipients; "digest" defers to the periodic report
+    (dlp_digest_loop); "off" logs the alert without emailing.  Default is
+    "immediate" so existing configs keep working.
+    """
     from backend.app.db import crud
 
     severity = scan_result.severity
+    mode = await crud.get_config_json(db, f"dlp.email.{severity}.mode", "immediate")
+    if mode != "immediate":
+        # "digest" is picked up by dlp_digest_loop; "off" is log-only.
+        return
+
     key = f"dlp.email.{severity}_recipients"
     recipients_str = await crud.get_config_json(db, key, "")
     if not recipients_str:
@@ -470,6 +504,165 @@ async def _maybe_send_email(db, alert, scan_result) -> None:
         logger.info("dlp_email_sent", severity=severity, recipients=len(recipients), sent=sent)
     except Exception:
         logger.exception("dlp_email_failed")
+
+
+# ===================================================================
+# Digest report — a rolled-up email of digest-mode alerts on a schedule
+# ===================================================================
+
+async def dlp_digest_loop() -> None:
+    """Background task: periodically send the DLP digest report.
+
+    Wakes every DIGEST_CHECK_INTERVAL and sends a report when one is due per the
+    configured frequency.  Runs alongside dlp_worker_loop for the app lifespan.
+    """
+    logger.info("dlp_digest_loop_started")
+    while True:
+        try:
+            await asyncio.sleep(DIGEST_CHECK_INTERVAL)
+            await _maybe_send_digest()
+        except asyncio.CancelledError:
+            logger.info("dlp_digest_loop_cancelled")
+            break
+        except Exception:
+            logger.exception("dlp_digest_loop_error")
+            await asyncio.sleep(DIGEST_CHECK_INTERVAL)
+
+
+async def _maybe_send_digest() -> None:
+    """Send the digest report if one is due, then advance the watermark."""
+    from backend.app.db import crud
+    from backend.app.db.session import get_async_db_context
+
+    async with get_async_db_context() as db:
+        recipients_str = await crud.get_config_json(db, "dlp.digest.recipients", "")
+        recipients = [r.strip() for r in str(recipients_str).split(",") if r.strip()]
+        if not recipients:
+            return  # digest not configured
+
+        digest_sevs = [
+            s for s in _SEVERITIES
+            if await crud.get_config_json(db, f"dlp.email.{s}.mode", "immediate") == "digest"
+        ]
+        if not digest_sevs:
+            return  # no severity routes to the digest
+
+        freq = await crud.get_config_json(db, "dlp.digest.frequency", "daily")
+        interval = DIGEST_FREQUENCIES.get(freq, DIGEST_FREQUENCIES["daily"])
+
+        now = datetime.now(timezone.utc)
+        last_sent_raw = await crud.get_config_json(db, "dlp.digest.last_sent_at", None)
+        last_sent = _parse_iso(last_sent_raw)
+        # First run establishes the watermark without emailing a backfill.
+        if last_sent is None:
+            await crud.set_config(db, "dlp.digest.last_sent_at", now.isoformat())
+            await db.commit()
+            return
+        if (now - last_sent).total_seconds() < interval:
+            return  # not due yet
+
+        # Gather digest-mode alerts scanned since the last report.
+        alerts = await _digest_alerts_since(db, last_sent, digest_sevs)
+        if alerts:
+            try:
+                await _send_digest_email(db, recipients, alerts, since=last_sent, until=now)
+            except Exception:
+                # Do NOT advance the watermark on send failure, so the next
+                # cycle retries the same window instead of dropping alerts.
+                logger.exception("dlp_digest_send_failed")
+                return
+
+        await crud.set_config(db, "dlp.digest.last_sent_at", now.isoformat())
+        await db.commit()
+        logger.info("dlp_digest_sent", alerts=len(alerts), recipients=len(recipients), frequency=freq)
+
+
+def _parse_iso(value):
+    """Parse an ISO timestamp from config, tolerant of None/garbage."""
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value))
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except (ValueError, TypeError):
+        return None
+
+
+async def _digest_alerts_since(db, since, severities):
+    """Fetch digest-mode alerts scanned after `since`, oldest first, capped."""
+    from sqlalchemy import select
+    from backend.app.db.models import DlpAlert
+
+    result = await db.execute(
+        select(DlpAlert)
+        .where(DlpAlert.scanned_at > since, DlpAlert.severity.in_(severities))
+        .order_by(DlpAlert.scanned_at.asc())
+        .limit(DIGEST_MAX_ROWS + 1)
+    )
+    return list(result.scalars().all())
+
+
+async def _send_digest_email(db, recipients, alerts, since, until) -> None:
+    """Build and send the digest report. Matched values stay masked/absent."""
+    from backend.app.services import email_service
+
+    smtp_config = await email_service.get_smtp_config(db)
+    if not email_service.is_smtp_configured(smtp_config):
+        logger.warning("dlp_digest_smtp_not_configured")
+        raise RuntimeError("SMTP not configured")
+
+    base_url = await email_service.get_base_url(db)
+    truncated = len(alerts) > DIGEST_MAX_ROWS
+    shown = alerts[:DIGEST_MAX_ROWS]
+
+    # Severity + category tallies for the summary.
+    sev_counts: dict = {}
+    cat_counts: dict = {}
+    for a in shown:
+        sev_counts[a.severity] = sev_counts.get(a.severity, 0) + 1
+        for c in (a.categories or []):
+            cat_counts[c] = cat_counts.get(c, 0) + 1
+
+    def _esc(s):
+        return (str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+
+    summary = ", ".join(f"{n} {_esc(s)}" for s, n in sorted(sev_counts.items())) or "0"
+    cats = ", ".join(f"{_esc(c)} ({n})" for c, n in sorted(cat_counts.items(), key=lambda kv: -kv[1])) or "none"
+
+    rows = []
+    for a in shown:
+        when = a.scanned_at.strftime("%Y-%m-%d %H:%M") if a.scanned_at else ""
+        cat = _esc(", ".join(a.categories or []) or "unknown")
+        rows.append(
+            f"<tr><td>{when}</td><td>{_esc(a.severity)}</td><td>{_esc(a.scanner)}</td>"
+            f"<td>{cat}</td><td>{a.request_id if a.request_id else 'n/a'}</td></tr>"
+        )
+    trunc_note = (
+        f"<p><em>Showing the first {DIGEST_MAX_ROWS}; more alerts exist in this "
+        f"window — review them in the admin console.</em></p>" if truncated else ""
+    )
+
+    body_html = (
+        f"<p><strong>MindRouter DLP digest</strong></p>"
+        f"<p>Window: {since.strftime('%Y-%m-%d %H:%M')} &rarr; {until.strftime('%Y-%m-%d %H:%M')} UTC<br>"
+        f"Alerts: {len(shown)}{'+' if truncated else ''}<br>"
+        f"By severity: {summary}<br>"
+        f"Top categories: {cats}</p>"
+        f'<table border="1" cellpadding="4" cellspacing="0">'
+        f"<tr><th>Time (UTC)</th><th>Severity</th><th>Scanner</th><th>Categories</th><th>Request</th></tr>"
+        f"{''.join(rows)}</table>"
+        f"{trunc_note}"
+        f'<p><a href="{base_url}/admin/dlp">Review in Admin &rarr; DLP</a></p>'
+        f"<p><small>Matched values are masked in the console and never included here.</small></p>"
+    )
+
+    await email_service.send_notification_email(
+        config=smtp_config,
+        recipients=recipients,
+        subject=f"[MindRouter DLP] Digest — {len(shown)}{'+' if truncated else ''} alert(s)",
+        body_html=body_html,
+        base_url=base_url,
+    )
 
 
 # NOTE: ensure_internal_api_key() was removed in 2.9.9.  It minted a

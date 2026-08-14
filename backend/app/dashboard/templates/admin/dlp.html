@@ -334,21 +334,46 @@
                         <div class="card mb-4">
                             <div class="card-header"><h5 class="mb-0">Email Notifications</h5></div>
                             <div class="card-body">
-                                <p class="text-muted small">Configure email recipients for each severity level. Separate multiple addresses with commas. Requires SMTP to be configured in Settings.</p>
-                                <div class="mb-2">
-                                    <label class="form-label" for="email_minor"><span class="badge bg-info">Minor</span> Recipients</label>
-                                    <input type="text" class="form-control form-control-sm" id="email_minor" name="email_minor"
-                                           value="{{ config.email_minor }}" placeholder="user@example.com, admin@example.com">
+                                <p class="text-muted small">For each severity, choose how alerts are delivered: <strong>Immediate</strong> (email now to that severity's recipients), <strong>Digest</strong> (roll into the scheduled report below), or <strong>Off</strong> (logged only, no email). Separate multiple addresses with commas. Requires SMTP configured in Settings.</p>
+
+                                {% for row in [
+                                    {"key": "minor", "label": "Minor", "badge": "bg-info", "ph": "user@example.com"},
+                                    {"key": "moderate", "label": "Moderate", "badge": "bg-warning text-dark", "ph": "security@example.com"},
+                                    {"key": "major", "label": "Major", "badge": "bg-danger", "ph": "ciso@example.com, compliance@example.com"}
+                                ] %}
+                                {% set mode = config['email_' ~ row.key ~ '_mode'] %}
+                                <div class="mb-3">
+                                    <label class="form-label" for="email_{{ row.key }}"><span class="badge {{ row.badge }}">{{ row.label }}</span></label>
+                                    <div class="d-flex gap-2">
+                                        <select class="form-select form-select-sm" style="max-width: 10rem;" name="email_{{ row.key }}_mode" id="email_{{ row.key }}_mode">
+                                            <option value="immediate" {% if mode == 'immediate' %}selected{% endif %}>Immediate</option>
+                                            <option value="digest" {% if mode == 'digest' %}selected{% endif %}>Digest</option>
+                                            <option value="off" {% if mode == 'off' %}selected{% endif %}>Off (log only)</option>
+                                        </select>
+                                        <input type="text" class="form-control form-control-sm" id="email_{{ row.key }}" name="email_{{ row.key }}"
+                                               value="{{ config['email_' ~ row.key] }}" placeholder="{{ row.ph }}">
+                                    </div>
                                 </div>
-                                <div class="mb-2">
-                                    <label class="form-label" for="email_moderate"><span class="badge bg-warning text-dark">Moderate</span> Recipients</label>
-                                    <input type="text" class="form-control form-control-sm" id="email_moderate" name="email_moderate"
-                                           value="{{ config.email_moderate }}" placeholder="security@example.com">
-                                </div>
-                                <div class="mb-2">
-                                    <label class="form-label" for="email_major"><span class="badge bg-danger">Major</span> Recipients</label>
-                                    <input type="text" class="form-control form-control-sm" id="email_major" name="email_major"
-                                           value="{{ config.email_major }}" placeholder="ciso@example.com, compliance@example.com">
+                                {% endfor %}
+
+                                <hr>
+                                <h6 class="mb-1">Digest report</h6>
+                                <p class="text-muted small mb-2">A single rolled-up report of every severity set to <strong>Digest</strong>, emailed on this schedule. Matched values are never included — only counts, categories, and links.</p>
+                                <div class="row g-2">
+                                    <div class="col-sm-5">
+                                        <label class="form-label" for="digest_frequency">Frequency</label>
+                                        <select class="form-select form-select-sm" name="digest_frequency" id="digest_frequency">
+                                            <option value="hourly" {% if config.digest_frequency == 'hourly' %}selected{% endif %}>Hourly</option>
+                                            <option value="6h" {% if config.digest_frequency == '6h' %}selected{% endif %}>Every 6 hours</option>
+                                            <option value="12h" {% if config.digest_frequency == '12h' %}selected{% endif %}>Every 12 hours</option>
+                                            <option value="daily" {% if config.digest_frequency == 'daily' %}selected{% endif %}>Daily</option>
+                                        </select>
+                                    </div>
+                                    <div class="col-sm-7">
+                                        <label class="form-label" for="digest_recipients">Digest recipients</label>
+                                        <input type="text" class="form-control form-control-sm" id="digest_recipients" name="digest_recipients"
+                                               value="{{ config.digest_recipients }}" placeholder="soc@example.com, compliance@example.com">
+                                    </div>
                                 </div>
                             </div>
                         </div>

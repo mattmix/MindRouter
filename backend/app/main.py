@@ -347,6 +347,7 @@ _redis_sync_task: Optional[asyncio.Task] = None
 _cache_warm_task: Optional[asyncio.Task] = None
 _trend_warm_task: Optional[asyncio.Task] = None
 _dlp_task: Optional[asyncio.Task] = None
+_dlp_digest_task: Optional[asyncio.Task] = None
 
 
 async def _run_migrations() -> None:
@@ -413,7 +414,7 @@ async def _run_migrations() -> None:
 
 async def lifespan(app: FastAPI) -> AsyncGenerator:
     """Application lifespan manager."""
-    global _cleanup_task, _redis_sync_task, _dlp_task, _cache_warm_task, _trend_warm_task
+    global _cleanup_task, _redis_sync_task, _dlp_task, _dlp_digest_task, _cache_warm_task, _trend_warm_task
     logger.info("Starting MindRouter...")
 
     # Opt-in: bring the schema to head before anything reads it (init_registry
@@ -474,9 +475,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
     # Pre-warm in-memory trend caches in background (takes several minutes)
     _trend_warm_task = asyncio.create_task(_warm_trend_caches())
 
-    # Start DLP background worker
-    from backend.app.services.dlp_worker import dlp_worker_loop
+    # Start DLP background worker + the periodic digest-report scheduler
+    from backend.app.services.dlp_worker import dlp_digest_loop, dlp_worker_loop
     _dlp_task = asyncio.create_task(dlp_worker_loop())
+    _dlp_digest_task = asyncio.create_task(dlp_digest_loop())
 
     # DLP scans STORED audit content — with capture disabled it has
     # nothing to scan, which an operator should hear about once.
@@ -536,6 +538,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
         _dlp_task.cancel()
         try:
             await _dlp_task
+        except asyncio.CancelledError:
+            pass
+    if _dlp_digest_task:
+        _dlp_digest_task.cancel()
+        try:
+            await _dlp_digest_task
         except asyncio.CancelledError:
             pass
     if _video_task:
