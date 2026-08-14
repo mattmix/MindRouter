@@ -343,14 +343,17 @@ class TestLLMResponseParsing:
         assert len(findings) == 1
 
     @pytest.mark.asyncio
-    async def test_dispatch_failure_returns_no_findings(self):
+    async def test_dispatch_failure_raises_scanner_error(self):
+        """A dispatch failure is a DEGRADED scan, not a clean one: scan_llm
+        raises DlpScannerError (fail-closed) so run_dlp_scan can surface the
+        failure rather than silently passing the request as clean."""
         async def _boom(model, messages):
             raise RuntimeError("no healthy backend")
 
-        findings = await _scanner_mod.scan_llm(
-            "x", system_prompt="p", model="m", complete=_boom,
-        )
-        assert findings == []
+        with pytest.raises(_scanner_mod.DlpScannerError):
+            await _scanner_mod.scan_llm(
+                "x", system_prompt="p", model="m", complete=_boom,
+            )
 
     @pytest.mark.asyncio
     async def test_non_dict_items_are_skipped(self):
@@ -381,10 +384,13 @@ class TestLLMResponseParsing:
         orig = _scanner_mod.logger
         _scanner_mod.logger = _Capture()
         try:
-            await _scanner_mod.scan_llm(
-                "x", system_prompt="p", model="m",
-                complete=_fake_complete(f"I found {secret} in the text"),
-            )
+            # Unparseable non-empty output is now fail-closed (raises), but the
+            # privacy contract is unchanged: the log must never quote the reply.
+            with pytest.raises(_scanner_mod.DlpScannerError):
+                await _scanner_mod.scan_llm(
+                    "x", system_prompt="p", model="m",
+                    complete=_fake_complete(f"I found {secret} in the text"),
+                )
         finally:
             _scanner_mod.logger = orig
 
@@ -493,3 +499,51 @@ class TestScanFinding:
         f = ScanFinding("regex", "ssn", "123-45-6789", 1.0, start=10, end=21)
         assert f.start == 10
         assert f.end == 21
+
+
+class TestRunDlpScanFailOpen:
+    """F53: a scanner that ERRORS must not look like clean traffic.
+
+    run_dlp_scan records the failure in ``scanner_errors`` and returns a
+    ScanResult (not None) even with zero findings, so the worker can surface a
+    degraded scanner instead of silently passing the request as clean.
+    """
+
+    @pytest.mark.asyncio
+    async def test_gliner_error_is_surfaced_not_swallowed(self, monkeypatch):
+        async def _boom(text, categories=None, threshold=0.5):
+            raise _scanner_mod.DlpScannerError("gliner model unavailable: OSError")
+
+        monkeypatch.setattr(_scanner_mod, "scan_gliner", _boom)
+        result = await _scanner_mod.run_dlp_scan(
+            "nothing sensitive here",
+            {"regex.enabled": False, "gliner.enabled": True},
+        )
+        assert result is not None, "an errored scan must not return None (clean)"
+        assert result.scanner_errors, "the gliner failure must be recorded"
+        assert "gliner" in result.scanner_errors[0]
+        assert result.findings == []
+
+    @pytest.mark.asyncio
+    async def test_clean_scan_still_returns_none(self, monkeypatch):
+        # No findings AND no errors is the only genuinely-clean outcome.
+        result = await _scanner_mod.run_dlp_scan(
+            "nothing sensitive here",
+            {"regex.enabled": True, "regex.patterns": [], "regex.keywords": []},
+        )
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_one_broken_scanner_does_not_blind_the_others(self, monkeypatch):
+        async def _boom(text, categories=None, threshold=0.5):
+            raise _scanner_mod.DlpScannerError("gliner predict failed: RuntimeError")
+
+        monkeypatch.setattr(_scanner_mod, "scan_gliner", _boom)
+        # Regex still finds the SSN even though GLiNER is down.
+        result = await _scanner_mod.run_dlp_scan(
+            "my ssn is 123-45-6789",
+            {"regex.enabled": True, "gliner.enabled": True},
+        )
+        assert result is not None
+        assert any(f.category == "social security number" for f in result.findings)
+        assert result.scanner_errors  # the gliner failure is still reported

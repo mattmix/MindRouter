@@ -124,6 +124,8 @@ async def admin_dlp_page(
         "email_minor": await crud.get_config_json(db, "dlp.email.minor_recipients", ""),
         "email_moderate": await crud.get_config_json(db, "dlp.email.moderate_recipients", ""),
         "email_major": await crud.get_config_json(db, "dlp.email.major_recipients", ""),
+        "dedup_enabled": await crud.get_config_json(db, "dlp.dedup.enabled", True),
+        "dedup_window_seconds": await crud.get_config_json(db, "dlp.dedup.window_seconds", 300),
     }
 
     # Load alerts with pagination
@@ -179,6 +181,16 @@ async def save_dlp_config(
     # admin could believe a pattern set was saved when it had been discarded.
 
     llm_enabled = form.get("llm_enabled") == "on"
+
+    # Alert de-duplication window (seconds). Bounded so a typo can't set an
+    # absurd retention-length suppression window; 0 disables via the toggle.
+    dedup_enabled = form.get("dedup_enabled") == "on"
+    try:
+        dedup_window = int(float(form.get("dedup_window_seconds", "300")))
+    except (TypeError, ValueError):
+        return _err("De-duplication window must be a whole number of seconds")
+    if not (0 <= dedup_window <= 86400):
+        return _err("De-duplication window must be between 0 and 86400 seconds")
 
     # GLiNER confidence threshold
     try:
@@ -293,6 +305,8 @@ async def save_dlp_config(
     # ---- Everything validated; apply ---------------------------------
     try:
         await crud.set_config(db, "dlp.enabled", form.get("enabled") == "on")
+        await crud.set_config(db, "dlp.dedup.enabled", dedup_enabled)
+        await crud.set_config(db, "dlp.dedup.window_seconds", dedup_window)
         await crud.set_config(db, "dlp.regex.enabled", form.get("regex_enabled") == "on")
         await crud.set_config(db, "dlp.gliner.enabled", form.get("gliner_enabled") == "on")
         await crud.set_config(db, "dlp.llm.enabled", llm_enabled)

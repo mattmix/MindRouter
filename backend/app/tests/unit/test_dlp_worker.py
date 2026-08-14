@@ -865,3 +865,68 @@ class TestDlpAlertRetention:
     def test_retention_post_allowlist_includes_the_key(self):
         routes_src = (_DASHBOARD_DIR / "routes.py").read_text()
         assert '"retention.dlp_alerts_days",' in routes_src
+
+
+# ===================================================================
+# Alert de-duplication (admin-toggleable) + scanner fail-open surfacing
+# ===================================================================
+
+class TestAlertDedup:
+    """The same masked value from the same user collapses to one alert within
+    the window, so a client's classifier/title calls and conversation-history
+    re-scans don't mint an alert+email each."""
+
+    def test_first_then_repeat_then_expiry(self, worker):
+        worker._dedup_seen.clear()
+        key = (7, ("12*******89",))
+        # First sighting is not a duplicate; an immediate repeat is.
+        assert worker._dedup_is_duplicate(key, 300.0) is False
+        assert worker._dedup_is_duplicate(key, 300.0) is True
+        # A different value for the same user is independent.
+        assert worker._dedup_is_duplicate((7, ("ab****ef",)), 300.0) is False
+        # Once the window elapses, the value alerts again (age the entry).
+        worker._dedup_seen[key] = worker.time.monotonic() - 301.0
+        assert worker._dedup_is_duplicate(key, 300.0) is False
+
+    def test_dedup_keys_bounded(self, worker):
+        worker._dedup_seen.clear()
+        # Never grows without bound even under a flood of unique values.
+        for i in range(worker._DEDUP_MAX_KEYS + 500):
+            worker._dedup_is_duplicate((1, (f"v{i}",)), 300.0)
+        assert len(worker._dedup_seen) <= worker._DEDUP_MAX_KEYS + 1
+
+    def test_worker_gates_dedup_on_config(self):
+        # _process_one honors the admin toggle + window and suppresses by return.
+        assert 'config.get("dedup.enabled"' in WORKER_SRC
+        assert "_dedup_is_duplicate((req.user_id, masked)" in WORKER_SRC
+        assert 'get_config_json(db, "dlp.dedup.enabled"' in WORKER_SRC
+        assert 'get_config_json(\n        db, "dlp.dedup.window_seconds"' in WORKER_SRC \
+            or 'dlp.dedup.window_seconds' in WORKER_SRC
+
+    def test_route_persists_dedup_toggle(self):
+        # Admin -> DLP panel writes both keys and validates the window.
+        assert '"dlp.dedup.enabled", dedup_enabled' in ROUTES_SRC
+        assert '"dlp.dedup.window_seconds", dedup_window' in ROUTES_SRC
+        assert 'form.get("dedup_enabled") == "on"' in ROUTES_SRC
+        assert "0 <= dedup_window <= 86400" in ROUTES_SRC
+
+
+class TestScannerFailOpenSurfaced:
+    """A scanner that errors must be VISIBLE, never silently treated as clean."""
+
+    def test_worker_surfaces_scanner_errors(self):
+        assert "scan_result.scanner_errors" in WORKER_SRC
+        assert "_surface_scanner_errors" in WORKER_SRC
+        # An error with no findings still surfaces, then returns.
+        assert "if not scan_result.findings:" in WORKER_SRC
+
+    def test_error_alert_is_rate_limited(self):
+        assert "SCANNER_ERROR_ALERT_WINDOW" in WORKER_SRC
+        assert '"dlp_scanner_error"' in WORKER_SRC
+
+    def test_scanner_raises_instead_of_returning_empty(self):
+        # dlp_scanner surfaces failures as DlpScannerError (fail-closed).
+        assert "class DlpScannerError" in SCANNER_SRC
+        assert "raise DlpScannerError" in SCANNER_SRC
+        # run_dlp_scan no longer treats an errored scan as clean (None).
+        assert "if not all_findings and not scanner_errors:" in SCANNER_SRC

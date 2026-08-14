@@ -37,6 +37,16 @@ CompleteFn = Callable[[str, List[Dict[str, str]]], Awaitable[str]]
 MAX_SCAN_CHARS = 200_000
 
 
+class DlpScannerError(Exception):
+    """A DLP scanner failed to RUN (model load / dispatch / unparseable output).
+
+    Distinct from a scan that ran cleanly and found nothing: a scanner that
+    errors must never be treated as "clean" (that is the silent fail-open the
+    audit flagged).  run_dlp_scan collects these so the worker can surface a
+    degraded scanner instead of letting it pass sensitive data unnoticed.
+    """
+
+
 # ---------------------------------------------------------------------------
 # Data classes
 # ---------------------------------------------------------------------------
@@ -60,6 +70,10 @@ class ScanResult:
     scan_latency_ms: int = 0
     scanner: str = "regex"       # primary scanner that produced the result
     detail: Optional[str] = None
+    # Scanners that failed to run this pass (e.g. "gliner: model load failed").
+    # Non-empty means the scan was DEGRADED — sensitive data may have been
+    # missed — so a result is returned (not None) even with zero findings.
+    scanner_errors: List[str] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -203,8 +217,10 @@ async def scan_gliner(
 
     try:
         model = await _load_gliner()
-    except Exception:
-        return []
+    except Exception as e:
+        # Model unavailable (not installed / download failed). Surface it —
+        # a scan that cannot run is not a clean scan.
+        raise DlpScannerError(f"gliner model unavailable: {type(e).__name__}") from e
 
     loop = asyncio.get_event_loop()
 
@@ -213,9 +229,9 @@ async def scan_gliner(
 
     try:
         entities = await loop.run_in_executor(None, _predict)
-    except Exception:
-        logger.exception("dlp_gliner_predict_failed")
-        return []
+    except Exception as e:
+        logger.error("dlp_gliner_predict_failed", error=type(e).__name__)
+        raise DlpScannerError(f"gliner predict failed: {type(e).__name__}") from e
 
     findings = []
     for ent in entities:
@@ -265,36 +281,46 @@ async def scan_llm(
 
     try:
         content = await complete(model, messages)
-    except Exception:
-        logger.exception("dlp_llm_scan_failed", model=model)
+    except Exception as e:
+        # Dispatch failed (no backend, timeout, HTTP error). Surface it — the
+        # scan did not run, so the request is unscanned, not clean.
+        logger.error("dlp_llm_scan_failed", model=model, error=type(e).__name__)
+        raise DlpScannerError(f"llm dispatch failed: {type(e).__name__}") from e
+
+    # Extract JSON from the response (may have reasoning or fences)
+    json_str = _THINK_RE.sub("", content or "").strip()
+    if json_str.startswith("```"):
+        # Strip markdown code fences
+        lines = json_str.split("\n")
+        lines = [l for l in lines if not l.strip().startswith("```")]
+        json_str = "\n".join(lines)
+
+    # An empty answer or an explicit empty array is a legitimate CLEAN result.
+    if json_str in ("", "[]"):
         return []
 
-    findings = []
     try:
-        # Try to extract JSON from the response (may have reasoning or fences)
-        json_str = _THINK_RE.sub("", content or "").strip()
-        if json_str.startswith("```"):
-            # Strip markdown code fences
-            lines = json_str.split("\n")
-            lines = [l for l in lines if not l.strip().startswith("```")]
-            json_str = "\n".join(lines)
-
         parsed = json.loads(json_str)
-        if isinstance(parsed, list):
-            for item in parsed:
-                if not isinstance(item, dict):
-                    continue
-                findings.append(ScanFinding(
-                    scanner="llm",
-                    category=str(item.get("category", "unknown")),
-                    text=str(item.get("text", "")),
-                    confidence=float(item.get("confidence", 0.7)),
-                ))
-    except (json.JSONDecodeError, ValueError, TypeError):
-        # The model didn't return the requested JSON array.  Never log the
-        # response body — it quotes the very content we are scanning.
-        if (content or "").strip() not in ("", "[]"):
-            logger.warning("dlp_llm_parse_failed", model=model, content_chars=len(content or ""))
+    except (json.JSONDecodeError, ValueError, TypeError) as e:
+        # The model returned non-empty, non-JSON output: a DEGRADED scan, not a
+        # clean one.  Never log the response body — it quotes the very content
+        # we are scanning.
+        logger.warning("dlp_llm_parse_failed", model=model, content_chars=len(content or ""))
+        raise DlpScannerError("llm returned unparseable output") from e
+
+    if not isinstance(parsed, list):
+        raise DlpScannerError("llm did not return a JSON array")
+
+    findings = []
+    for item in parsed:
+        if not isinstance(item, dict):
+            continue
+        findings.append(ScanFinding(
+            scanner="llm",
+            category=str(item.get("category", "unknown")),
+            text=str(item.get("text", "")),
+            confidence=float(item.get("confidence", 0.7)),
+        ))
 
     return findings
 
@@ -424,6 +450,7 @@ async def run_dlp_scan(
     t0 = time.monotonic()
     all_findings: List[ScanFinding] = []
     scanners_used: List[str] = []
+    scanner_errors: List[str] = []
 
     if len(text) > MAX_SCAN_CHARS:
         logger.info("dlp_scan_text_truncated", original_chars=len(text), kept=MAX_SCAN_CHARS)
@@ -448,33 +475,45 @@ async def run_dlp_scan(
             scanners_used.append("regex")
 
     # --- GLiNER NER scanner ---
+    # A scanner that raises DlpScannerError is recorded and the OTHER scanners
+    # still run: one broken scanner must not blind the others, and it must not
+    # be silently swallowed (the fail-open the audit flagged).
     if config.get("gliner.enabled", False):
-        gliner_findings = await scan_gliner(
-            text,
-            categories=config.get("gliner.categories"),
-            threshold=config.get("gliner.threshold", 0.5),
-        )
-        all_findings.extend(gliner_findings)
-        if gliner_findings:
-            scanners_used.append("gliner")
+        try:
+            gliner_findings = await scan_gliner(
+                text,
+                categories=config.get("gliner.categories"),
+                threshold=config.get("gliner.threshold", 0.5),
+            )
+            all_findings.extend(gliner_findings)
+            if gliner_findings:
+                scanners_used.append("gliner")
+        except DlpScannerError as e:
+            scanner_errors.append(f"gliner: {e}")
+            logger.error("dlp_scanner_failed", scanner="gliner", error=str(e))
 
     # --- LLM contextual scanner ---
     if config.get("llm.enabled", False):
         complete = config.get("llm.complete")
         if complete is not None:
-            llm_findings = await scan_llm(
-                text,
-                system_prompt=config.get("llm.system_prompt", ""),
-                model=config.get("llm.model", ""),
-                complete=complete,
-            )
-            all_findings.extend(llm_findings)
-            if llm_findings:
-                scanners_used.append("llm")
+            try:
+                llm_findings = await scan_llm(
+                    text,
+                    system_prompt=config.get("llm.system_prompt", ""),
+                    model=config.get("llm.model", ""),
+                    complete=complete,
+                )
+                all_findings.extend(llm_findings)
+                if llm_findings:
+                    scanners_used.append("llm")
+            except DlpScannerError as e:
+                scanner_errors.append(f"llm: {e}")
+                logger.error("dlp_scanner_failed", scanner="llm", error=str(e))
 
     elapsed_ms = int((time.monotonic() - t0) * 1000)
 
-    if not all_findings:
+    # Genuinely clean only when a scan ran AND found nothing AND nothing errored.
+    if not all_findings and not scanner_errors:
         return None
 
     severity = classify_severity(
@@ -484,8 +523,13 @@ async def run_dlp_scan(
 
     # Build detail summary
     categories = list(set(f.category for f in all_findings))
-    detail_parts = [f"{len(all_findings)} finding(s) across {', '.join(scanners_used)}"]
-    detail_parts.append(f"Categories: {', '.join(categories)}")
+    if all_findings:
+        detail_parts = [f"{len(all_findings)} finding(s) across {', '.join(scanners_used)}"]
+        detail_parts.append(f"Categories: {', '.join(categories)}")
+    else:
+        detail_parts = ["no findings"]
+    if scanner_errors:
+        detail_parts.append(f"scanner errors: {'; '.join(scanner_errors)}")
     detail = "; ".join(detail_parts)
 
     primary_scanner = scanners_used[-1] if scanners_used else "regex"
@@ -496,4 +540,5 @@ async def run_dlp_scan(
         scan_latency_ms=elapsed_ms,
         scanner=primary_scanner,
         detail=detail,
+        scanner_errors=scanner_errors,
     )
