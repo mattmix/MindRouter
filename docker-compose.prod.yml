@@ -99,12 +99,18 @@ services:
     volumes:
       - redis_data:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      # Authenticated ping: with requirepass set, an unauthenticated PING is
+      # rejected (NOAUTH), so the healthcheck must present the password.
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:?REDIS_PASSWORD required}", "ping"]
       interval: 10s
       timeout: 5s
       retries: 3
     restart: unless-stopped
-    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:-changeme}
+    # REDIS_PASSWORD is mandatory in production: the `:?` form makes every
+    # `docker compose` command fail fast if it is unset, rather than silently
+    # falling back to a well-known default. Set it in the deployment .env and
+    # keep it in sync with REDIS_URL in .env.prod.
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:?REDIS_PASSWORD required}
     networks:
       - mindrouter_network
     # No external port exposure in production

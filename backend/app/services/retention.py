@@ -184,59 +184,78 @@ async def _bulk_insert_ignore(
     table = model_class.__table__
     now = datetime.now(timezone.utc)
 
+    # The dump carries plaintext prompts/completions/IPs, so it must never be
+    # world-readable: restrict the directory to 0o700 and each file to 0o600.
+    # os.makedirs honours the process umask, so chmod the directory explicitly
+    # in case it (or an ancestor left by an earlier looser run) is too open.
     os.makedirs(_RETENTION_DUMP_DIR, exist_ok=True)
+    try:
+        os.chmod(_RETENTION_DUMP_DIR, 0o700)
+    except OSError:
+        pass
     dump_path = os.path.join(
         _RETENTION_DUMP_DIR,
         f"{table.name}_{now.strftime('%Y%m%dT%H%M%SZ')}_{uuid.uuid4().hex[:8]}.jsonl",
     )
 
-    with open(dump_path, "w", encoding="utf-8") as fh:
-        for row in rows:
-            row["archived_at"] = now
-            fh.write(_json.dumps(row, default=_jsonl_default) + "\n")
+    # Open with O_EXCL and mode 0o600 so the file is created private from the
+    # start (never a world-readable window between open and a later chmod).
+    fd = os.open(dump_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
 
-    logger.info(
-        "retention_dump_written",
-        table=table.name,
-        path=dump_path,
-        rows=len(rows),
-    )
+    # Deliberately retained on partial failure for forensics; removed in the
+    # finally on full success OR on an unexpected error, so plaintext PII is
+    # never left on disk except in the controlled skip-for-triage case.
+    retain = False
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            for row in rows:
+                row["archived_at"] = now
+                fh.write(_json.dumps(row, default=_jsonl_default) + "\n")
 
-    total = 0
-    skipped: list[dict] = []
-    with open(dump_path, "r", encoding="utf-8") as fh:
-        for line in fh:
-            row = _json.loads(line, object_hook=_jsonl_object_hook)
-            sp = await archive_db.begin_nested()
-            try:
-                stmt = table.insert().prefix_with("IGNORE").values(**row)
-                result = await archive_db.execute(stmt)
-                total += result.rowcount
-                await sp.commit()
-            except Exception as exc:
-                await sp.rollback()
-                logger.warning(
-                    "retention_row_insert_failed",
-                    table=table.name,
-                    row_id=row.get("id"),
-                    error=str(exc),
-                )
-                skipped.append(row)
-
-    if not skipped:
-        try:
-            os.remove(dump_path)
-        except OSError:
-            pass
-    else:
-        logger.warning(
-            "retention_dump_retained",
+        logger.info(
+            "retention_dump_written",
+            table=table.name,
             path=dump_path,
-            inserted=total,
-            skipped=len(skipped),
+            rows=len(rows),
         )
 
-    return total, skipped
+        total = 0
+        skipped: list[dict] = []
+        with open(dump_path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                row = _json.loads(line, object_hook=_jsonl_object_hook)
+                sp = await archive_db.begin_nested()
+                try:
+                    stmt = table.insert().prefix_with("IGNORE").values(**row)
+                    result = await archive_db.execute(stmt)
+                    total += result.rowcount
+                    await sp.commit()
+                except Exception as exc:
+                    await sp.rollback()
+                    logger.warning(
+                        "retention_row_insert_failed",
+                        table=table.name,
+                        row_id=row.get("id"),
+                        error=str(exc),
+                    )
+                    skipped.append(row)
+
+        if skipped:
+            retain = True
+            logger.warning(
+                "retention_dump_retained",
+                path=dump_path,
+                inserted=total,
+                skipped=len(skipped),
+            )
+
+        return total, skipped
+    finally:
+        if not retain:
+            try:
+                os.remove(dump_path)
+            except OSError:
+                pass
 
 
 # ------------------------------------------------------------------

@@ -20,10 +20,32 @@
 """Async video worker HTTP client (submit / poll / fetch / cancel)."""
 
 import hashlib
+import os
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Protocol
 
 import httpx
+
+from backend.app.settings import get_settings
+
+
+def _tls_verify() -> bool:
+    """TLS verification for outbound calls to the internal video worker (F20/F56).
+
+    Defaults to verifying certs. A worker behind a private CA / self-signed cert
+    can opt out via ``internal_tls_verify`` until it is fronted by nginx TLS with
+    a trusted chain. For plain-``http://`` workers this is a no-op."""
+    return bool(getattr(get_settings(), "internal_tls_verify", True))
+
+
+def _fetch_max_bytes() -> int:
+    """Cumulative cap for a single streamed artifact download (F52).
+
+    Overridable via ``video_worker_fetch_max_mb``; the default is deliberately
+    generous (2 GiB) so no legitimate clip is truncated. A value <= 0 disables
+    the cap."""
+    mb = int(getattr(get_settings(), "video_worker_fetch_max_mb", 2048))
+    return mb * 1024 * 1024 if mb > 0 else 0
 
 
 class WorkerSubmitError(Exception):
@@ -35,6 +57,11 @@ class WorkerSubmitError(Exception):
     def __init__(self, message: str, *, retryable: bool = True):
         super().__init__(message)
         self.retryable = retryable
+
+
+class WorkerFetchError(Exception):
+    """Raised when an artifact fetch cannot complete safely (e.g. the streamed
+    download exceeds the size cap). Surfaced to the runner, which fails the job."""
 
 
 @dataclass
@@ -58,7 +85,11 @@ class VideoWorkerClient(Protocol):
 
 class HttpVideoWorkerClient:
     """httpx-backed worker client. A fresh client is used per call (per the
-    per-request-client pattern that fixed orphaned generations in v2.4.0)."""
+    per-request-client pattern that fixed orphaned generations in v2.4.0).
+
+    Outbound calls carry the ``X-Worker-Key`` shared secret when ``api_key`` is
+    set (empty = no header, legacy/open), verify TLS per ``_tls_verify()``, and
+    the artifact fetch is bounded by ``_fetch_max_bytes()``."""
 
     def __init__(
         self,
@@ -66,15 +97,10 @@ class HttpVideoWorkerClient:
         control_timeout: float = 60.0,
         fetch_timeout: float = 900.0,
         api_key: str = "",
-        verify_tls: bool = False,
     ):
         self._control_timeout = control_timeout
         self._fetch_timeout = fetch_timeout
-        # Shared secret sent as X-Worker-Key when set; empty = no header (legacy).
         self._api_key = api_key or ""
-        # verify_tls: False keeps the historical no-verify behavior; set True (or
-        # a CA-bundle path) once the worker is fronted by nginx TLS on loopback.
-        self._verify = verify_tls
 
     def _headers(self) -> Dict[str, str]:
         return {"X-Worker-Key": self._api_key} if self._api_key else {}
@@ -82,7 +108,7 @@ class HttpVideoWorkerClient:
     async def submit(self, base_url: str, payload: Dict[str, Any]) -> str:
         url = f"{base_url.rstrip('/')}/v1/videos"
         try:
-            async with httpx.AsyncClient(timeout=self._control_timeout, verify=self._verify) as client:
+            async with httpx.AsyncClient(timeout=self._control_timeout, verify=_tls_verify()) as client:
                 resp = await client.post(url, json=payload, headers=self._headers())
         except httpx.HTTPError as exc:
             raise WorkerSubmitError(f"submit connect error: {exc}", retryable=True) from exc
@@ -98,7 +124,7 @@ class HttpVideoWorkerClient:
 
     async def poll(self, base_url: str, worker_job_id: str) -> Dict[str, Any]:
         url = f"{base_url.rstrip('/')}/v1/videos/{worker_job_id}"
-        async with httpx.AsyncClient(timeout=self._control_timeout, verify=self._verify) as client:
+        async with httpx.AsyncClient(timeout=self._control_timeout, verify=_tls_verify()) as client:
             resp = await client.get(url, headers=self._headers())
         resp.raise_for_status()
         return resp.json()
@@ -107,20 +133,31 @@ class HttpVideoWorkerClient:
         url = f"{base_url.rstrip('/')}/v1/videos/{worker_job_id}/content"
         hasher = hashlib.sha256()
         size = 0
-        async with httpx.AsyncClient(timeout=self._fetch_timeout, verify=self._verify) as client:
+        max_bytes = _fetch_max_bytes()
+        async with httpx.AsyncClient(timeout=self._fetch_timeout, verify=_tls_verify()) as client:
             async with client.stream("GET", url, headers=self._headers()) as resp:
                 resp.raise_for_status()
                 with open(dest_path, "wb") as fh:
                     async for chunk in resp.aiter_bytes():
+                        size += len(chunk)
+                        if max_bytes and size > max_bytes:
+                            # Runaway/oversized artifact — abort before it fills
+                            # the disk; drop the partial file and fail the job.
+                            try:
+                                os.unlink(dest_path)
+                            except OSError:
+                                pass
+                            raise WorkerFetchError(
+                                f"video artifact exceeds {max_bytes}-byte cap"
+                            )
                         fh.write(chunk)
                         hasher.update(chunk)
-                        size += len(chunk)
         return FetchResult(sha256=hasher.hexdigest(), size_bytes=size)
 
     async def cancel(self, base_url: str, worker_job_id: str) -> None:
         url = f"{base_url.rstrip('/')}/v1/videos/{worker_job_id}"
         try:
-            async with httpx.AsyncClient(timeout=self._control_timeout, verify=self._verify) as client:
+            async with httpx.AsyncClient(timeout=self._control_timeout, verify=_tls_verify()) as client:
                 await client.delete(url, headers=self._headers())
         except httpx.HTTPError:
             # Best effort — the worker frees the GPU on its own deadline anyway.

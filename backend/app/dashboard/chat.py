@@ -21,6 +21,7 @@ import json
 import os
 import re
 import time
+import zipfile
 from typing import List, Optional, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile, File
@@ -162,6 +163,22 @@ def _generate_pdf_thumbnail(file_bytes: bytes) -> Optional[bytes]:
         buf = io.BytesIO()
         pil_img.save(buf, format="PNG")
         return buf.getvalue()
+
+
+def _ooxml_uncompressed_bytes(file_bytes: bytes) -> int:
+    """Total declared uncompressed size of an OOXML (docx/xlsx/pptx) package.
+
+    OOXML files are zip archives; a small upload can declare members that
+    expand to gigabytes (a "zip bomb"). Summing the central-directory
+    ``file_size`` fields is cheap (no decompression) and bounds naive bombs
+    before any parser inflates them. Returns -1 if the bytes are not a valid
+    zip, letting the caller defer to the normal parser's error handling.
+    """
+    try:
+        with zipfile.ZipFile(io.BytesIO(file_bytes)) as zf:
+            return sum(info.file_size for info in zf.infolist())
+    except zipfile.BadZipFile:
+        return -1
 
 
 def _extract_text_from_docx(file_bytes: bytes) -> str:
@@ -663,6 +680,22 @@ async def chat_upload(
             "is_image": True,
             "thumbnail": thumb_url,
         })
+
+    # OOXML packages (docx/xlsx/pptx) are zip archives whose members can
+    # expand far beyond the compressed upload. The size check above only
+    # bounds the compressed bytes, so guard the total uncompressed size
+    # before handing the file to a parser that inflates it.
+    if ext in (".docx", ".xlsx", ".pptx"):
+        max_uncompressed = settings.chat_upload_max_uncompressed_mb * 1024 * 1024
+        uncompressed = await asyncio.to_thread(_ooxml_uncompressed_bytes, file_bytes)
+        if uncompressed > max_uncompressed:
+            return JSONResponse(
+                {"error": (
+                    f"File expands to too much data. Maximum uncompressed size "
+                    f"is {settings.chat_upload_max_uncompressed_mb}MB."
+                )},
+                status_code=413,
+            )
 
     # Text extraction for non-image files
     try:

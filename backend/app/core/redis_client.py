@@ -484,11 +484,32 @@ _RPM_KEY_PREFIX = "rpm:"
 _RPM_WINDOW_SECONDS = 60
 
 
+def _rpm_fallback(key: str, rpm_limit: int) -> tuple[bool, int]:
+    """Consult the bounded in-process limiter when Redis is unavailable.
+
+    Gated by ``settings.rate_limit_local_fallback`` (default True). When
+    disabled, preserves the historical fully-open behaviour. The local
+    limiter enforces the same fixed-window contract as :func:`check_rpm`,
+    so callers are unaffected.
+    """
+    if not getattr(get_settings(), "rate_limit_local_fallback", True):
+        return True, 0
+    try:
+        from backend.app.security.rate_limits import check_rpm_local
+
+        return check_rpm_local(key, rpm_limit)
+    except Exception:
+        logger.exception("rpm_local_fallback_failed", key=key)
+        return True, 0  # never let the limiter itself break the request path
+
+
 async def check_rpm(key: str, rpm_limit: int) -> tuple[bool, int]:
     """Check whether a request is allowed under the RPM limit.
 
     Uses INCR + EXPIRE for a fixed 60-second sliding window.
-    Fail-open: if Redis is unavailable the request is allowed.
+    When Redis is unavailable, falls back to a bounded in-process limiter
+    (``settings.rate_limit_local_fallback``, default True) instead of
+    admitting everything.
 
     Args:
         key: Rate limit key (e.g., ``"user:123"``).
@@ -498,8 +519,10 @@ async def check_rpm(key: str, rpm_limit: int) -> tuple[bool, int]:
         ``(allowed, current_count)``  — *current_count* includes this
         request if allowed.
     """
-    if not _available or not _redis or rpm_limit <= 0:
+    if rpm_limit <= 0:
         return True, 0
+    if not _available or not _redis:
+        return _rpm_fallback(key, rpm_limit)
     try:
         redis_key = f"{_RPM_KEY_PREFIX}{key}"
         pipe = _redis.pipeline(transaction=True)
@@ -521,4 +544,4 @@ async def check_rpm(key: str, rpm_limit: int) -> tuple[bool, int]:
         return True, current
     except Exception:
         logger.exception("redis_check_rpm_failed", key=key)
-        return True, 0  # fail-open
+        return _rpm_fallback(key, rpm_limit)

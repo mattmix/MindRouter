@@ -18,11 +18,18 @@ These schemas serve as the internal representation that all incoming requests
 are converted to, and from which backend-specific requests are generated.
 """
 
+import re
 from datetime import datetime
 from enum import Enum
 from typing import Any, Dict, List, Literal, Optional, Union
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+# Permitted characters in a model name. Deliberately broad enough for
+# HuggingFace-style ids ("black-forest-labs/FLUX.2-dev") and served-model
+# aliases, while rejecting the HTML/script metacharacters (< > " ' & space …)
+# that would let a hostile model name become stored XSS in admin views.
+_MODEL_NAME_RE = re.compile(r"^[A-Za-z0-9._:/\-]{1,128}$")
 
 
 class ContentType(str, Enum):
@@ -193,6 +200,24 @@ class CanonicalChatRequest(BaseModel):
     request_id: Optional[str] = None
     user_id: Optional[int] = None
     api_key_id: Optional[int] = None
+
+    @field_validator("n")
+    @classmethod
+    def _clamp_n(cls, v: int) -> int:
+        """Clamp the completion count to a sane bound.
+
+        Guards against a single request asking for an unbounded number of
+        parallel completions (a resource-amplification DoS). Non-breaking for
+        any request with n in [1, settings.max_completions_n].
+        """
+        from backend.app.settings import get_settings
+
+        if v is None or v < 1:
+            return 1
+        # getattr fallback keeps this robust if the shared setting has not yet
+        # been added (concurrent settings work); default matches the contract.
+        max_n = getattr(get_settings(), "max_completions_n", 8)
+        return min(v, max_n)
 
     def requires_multimodal(self) -> bool:
         """Check if request requires multimodal capabilities."""
@@ -447,6 +472,20 @@ class CanonicalImageRequest(BaseModel):
     api_key_id: Optional[int] = None
     user: Optional[str] = None
     policy_verdict: Optional[dict] = None  # Populated by LLM-as-judge
+
+    @field_validator("model")
+    @classmethod
+    def _validate_model_format(cls, v: str) -> str:
+        """Reject model names carrying HTML/script metacharacters.
+
+        The model name is echoed into admin request views; a name like
+        ``<script>…`` would otherwise be stored and rendered there. This is a
+        pure format check — it does NOT validate against the model registry,
+        so any legitimately-installed diffusion model name still passes.
+        """
+        if not isinstance(v, str) or not _MODEL_NAME_RE.match(v):
+            raise ValueError("invalid model name")
+        return v
 
 
 class CanonicalImageData(BaseModel):

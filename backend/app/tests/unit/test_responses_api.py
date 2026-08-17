@@ -582,6 +582,7 @@ class TestCountInputTokens:
              patch.object(_mod, "get_registry", return_value=registry), \
              patch.object(_mod, "InferenceService", return_value=service), \
              patch.object(_mod, "responses_store", _make_mock_store()), \
+             patch.object(_mod, "count_request_text_chars", return_value=0), \
              patch.object(_mod, "crud", _make_mock_crud()):
             return await count_input_tokens_endpoint(
                 _make_mock_request(body),

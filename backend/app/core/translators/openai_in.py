@@ -16,6 +16,8 @@
 
 from typing import Any, Dict, List, Optional, Union
 
+import structlog
+
 from backend.app.core.canonical_schemas import (
     CanonicalChatRequest,
     CanonicalCompletionRequest,
@@ -34,6 +36,9 @@ from backend.app.core.canonical_schemas import (
     ResponseFormatType,
     TextContent,
 )
+from backend.app.core.url_guard import image_url_reason
+
+logger = structlog.get_logger(__name__)
 
 
 class OpenAIInTranslator:
@@ -250,6 +255,18 @@ class OpenAIInTranslator:
                     return ImageBase64Content(data=data, media_type=media_type)
                 except (ValueError, IndexError):
                     pass
+
+            # SSRF guard: user-supplied http(s) image URLs are forwarded to
+            # backends inside the GPU/HPC network. Drop (skip) any URL that
+            # resolves to a private/internal/metadata address instead of
+            # failing the whole request. data: URIs are handled above.
+            ok, reason = image_url_reason(url)
+            if not ok:
+                logger.warning(
+                    "dropping unsafe image_url from vision request",
+                    reason=reason,
+                )
+                return None
 
             return ImageUrlContent(
                 image_url={

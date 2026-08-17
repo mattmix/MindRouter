@@ -34,6 +34,18 @@ _tracer_provider: Optional[TracerProvider] = None
 _meter_provider: Optional[MeterProvider] = None
 
 
+def _exporter_insecure(endpoint: str) -> bool:
+    """Decide whether the OTLP gRPC channel should be insecure (plaintext).
+
+    An ``https://`` endpoint gets a secure channel; anything else — a bare
+    ``host:port`` or an explicit ``http://``, which is the historical default —
+    stays insecure so existing plaintext-collector deployments keep working
+    unchanged.  A dedicated ``otel_exporter_insecure`` setting would express
+    intent more directly (noted in needs_coordination; WS2 owns settings.py).
+    """
+    return not (endpoint or "").strip().lower().startswith("https://")
+
+
 def setup_telemetry() -> None:
     """Initialize OpenTelemetry tracing and metrics.
 
@@ -63,10 +75,13 @@ def setup_telemetry() -> None:
         "service.version": settings.app_version,
     })
 
+    # TLS for the OTLP gRPC channel is derived from the endpoint scheme.
+    insecure = _exporter_insecure(endpoint)
+
     # --- Tracing ---
     from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
 
-    span_exporter = OTLPSpanExporter(endpoint=endpoint, insecure=True)
+    span_exporter = OTLPSpanExporter(endpoint=endpoint, insecure=insecure)
     _tracer_provider = TracerProvider(resource=resource)
     _tracer_provider.add_span_processor(BatchSpanProcessor(span_exporter))
     trace.set_tracer_provider(_tracer_provider)
@@ -74,7 +89,7 @@ def setup_telemetry() -> None:
     # --- Metrics ---
     from opentelemetry.exporter.otlp.proto.grpc.metric_exporter import OTLPMetricExporter
 
-    metric_exporter = OTLPMetricExporter(endpoint=endpoint, insecure=True)
+    metric_exporter = OTLPMetricExporter(endpoint=endpoint, insecure=insecure)
     metric_reader = PeriodicExportingMetricReader(metric_exporter, export_interval_millis=30000)
     _meter_provider = MeterProvider(resource=resource, metric_readers=[metric_reader])
     metrics.set_meter_provider(_meter_provider)

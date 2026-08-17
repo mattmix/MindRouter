@@ -30,6 +30,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -46,6 +47,13 @@ from backend.app.logging_config import get_logger
 from backend.app.settings import get_settings
 
 logger = get_logger(__name__)
+
+# Guard against decompression-bomb images (a small file that declares an
+# enormous pixel grid). PIL raises DecompressionBombError when an image's
+# pixel count exceeds this bound, before allocating the full buffer. The
+# limit is generous relative to real documents (a US-Letter page at 300 DPI
+# is ~8 MP) so no legitimate upload is rejected.
+Image.MAX_IMAGE_PIXELS = 256_000_000
 
 
 _DEFAULT_PROMPT_OCRMD = (
@@ -104,6 +112,34 @@ def _image_to_png_bytes(img: Image.Image, max_dim: int = 2048) -> bytes:
     return buf.getvalue()
 
 
+def _image_bytes_to_pages(file_bytes: bytes, max_frames: int) -> List[bytes]:
+    """Decode an image (possibly multi-frame) to a list of PNG byte buffers.
+
+    Synchronous — call via ``asyncio.to_thread``. The frame walk stops after
+    ``max_frames`` so a crafted animated GIF / multi-page TIFF cannot force
+    unbounded decoding.
+    """
+    img = Image.open(io.BytesIO(file_bytes))
+    pages: List[bytes] = []
+    try:
+        frame = 0
+        while True:
+            if frame >= max_frames:
+                logger.warning(
+                    "ocr_image_frame_cap",
+                    max_frames=max_frames,
+                )
+                break
+            img.seek(frame)
+            pages.append(_image_to_png_bytes(img.copy()))
+            frame += 1
+    except EOFError:
+        pass
+    if not pages:
+        pages.append(_image_to_png_bytes(img))
+    return pages
+
+
 async def document_to_images(
     file_bytes: bytes,
     content_type: str,
@@ -116,22 +152,12 @@ async def document_to_images(
     Supports: images, PDFs, DOCX, PPTX, XLSX.
     Office formats are converted via LibreOffice headless → PDF → images.
     """
-    # Images: single page
+    # Images: single page (or multi-frame GIF/TIFF). Decoding runs off the
+    # event loop like the PDF branch, and the frame count is bounded so a
+    # hostile many-frame image can't pin a CPU decoding unbounded frames.
     if content_type.startswith("image/"):
-        img = Image.open(io.BytesIO(file_bytes))
-        # Handle multi-frame images (GIF, TIFF)
-        pages = []
-        try:
-            frame = 0
-            while True:
-                img.seek(frame)
-                pages.append(_image_to_png_bytes(img.copy()))
-                frame += 1
-        except EOFError:
-            pass
-        if not pages:
-            pages.append(_image_to_png_bytes(img))
-        return pages
+        max_frames = get_settings().ocr_max_frames
+        return await asyncio.to_thread(_image_bytes_to_pages, file_bytes, max_frames)
 
     # PDF
     if content_type == "application/pdf":
@@ -208,16 +234,34 @@ async def _office_to_pdf(file_bytes: bytes, suffix: str) -> bytes:
         input_path = Path(tmpdir) / f"input{suffix}"
         input_path.write_bytes(file_bytes)
 
+        # Isolate the user profile per invocation so concurrent conversions
+        # don't share (and corrupt) a single LibreOffice profile, and so a
+        # hostile document can't poison a persistent profile. --norestore
+        # stops LibreOffice from trying to recover a "crashed" prior session.
+        user_install = f"file://{tmpdir}/lo_profile_{uuid.uuid4().hex}"
+
         proc = await asyncio.create_subprocess_exec(
             lo_path,
             "--headless",
+            "--norestore",
+            f"-env:UserInstallation={user_install}",
             "--convert-to", "pdf",
             "--outdir", tmpdir,
             str(input_path),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
-        stdout, stderr = await proc.communicate()
+        # Bound the conversion: a malformed/hostile document can otherwise
+        # hang LibreOffice indefinitely. Kill the process group on timeout.
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            await proc.wait()
+            raise RuntimeError("LibreOffice conversion timed out")
         if proc.returncode != 0:
             raise RuntimeError(
                 f"LibreOffice conversion failed (exit {proc.returncode}): "

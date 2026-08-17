@@ -15,6 +15,7 @@
 """Image generation gallery routes for MindRouter."""
 
 import base64
+import io
 import os
 from typing import Optional, Tuple
 
@@ -397,6 +398,27 @@ async def images_save(
         image_data = base64.b64decode(image_b64)
     except Exception:
         return JSONResponse(status_code=400, content={"error": "Invalid base64 data"})
+
+    # Cap single-item size (there is no per-user image storage quota helper;
+    # this bounds a single save). Reuse the img.max_image_upload_mb config used
+    # for reference-image uploads so the limits stay consistent.
+    max_bytes = int(await crud.get_config_json(db, "img.max_image_upload_mb", 10)) * 1024 * 1024
+    if len(image_data) > max_bytes:
+        return JSONResponse(
+            status_code=400,
+            content={"error": f"Image exceeds {max_bytes // 1024 // 1024}MB"},
+        )
+
+    # Validate that the bytes are actually a decodable image before persisting.
+    # Image.verify() checks structural integrity without decoding the full
+    # raster; PIL's MAX_IMAGE_PIXELS also guards decompression bombs. This
+    # rejects arbitrary non-image payloads with a 400.
+    try:
+        from PIL import Image
+        with Image.open(io.BytesIO(image_data)) as _probe:
+            _probe.verify()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "Not a valid image"})
 
     # Store via ArtifactStorage
     storage = get_artifact_storage()

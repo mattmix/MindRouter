@@ -39,7 +39,7 @@ from backend.app.db import crud
 from backend.app.db.models import ApiKey, BackendEngine, Modality, RequestStatus, User
 from backend.app.db.session import get_async_db
 from backend.app.logging_config import bind_request_context, get_logger
-from backend.app.services.inference import InferenceService
+from backend.app.services.inference import InferenceService, count_request_text_chars
 from backend.app.settings import get_settings
 
 logger = get_logger(__name__)
@@ -412,6 +412,21 @@ async def tokenize(
             detail=f"Invalid request format: {str(e)}",
         )
 
+    # Admission control: this endpoint runs the (possibly backend-round-trip)
+    # tokenizer, so it must respect the same RPM limit as the metered inference
+    # endpoints, and reject inputs too large to count cheaply. No token-cost
+    # quota is debited here — counting tokens is not billed generation.
+    service = InferenceService(db)
+    await service._check_quota(user, api_key)
+
+    settings = get_settings()
+    max_chars = getattr(settings, "tokenize_max_input_chars", 2_000_000)
+    if count_request_text_chars(canonical) > max_chars:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail="Input too large to tokenize",
+        )
+
     # Find a backend that has this model
     backends = await registry.get_backends_with_model(model)
     if not backends:
@@ -427,7 +442,6 @@ async def tokenize(
     target = next((m for m in models if m.name == model), None)
     max_model_len = target.context_length if target else None
 
-    service = InferenceService(db)
     count, is_estimate = await service._count_input_tokens(canonical, backend)
 
     return {

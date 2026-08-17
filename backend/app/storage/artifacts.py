@@ -101,6 +101,35 @@ class ArtifactStorage:
 
         return relative_path, sha256_hash, len(data)
 
+    def _resolve_within_base(self, storage_path: str) -> Optional[Path]:
+        """
+        Resolve a client-supplied storage path against the artifact root,
+        rejecting anything that escapes it (absolute paths, ``..`` traversal,
+        symlink escapes).
+
+        Every legitimate storage_path is a relative
+        "YYYY/MM/DD/<prefix>/<hash>_<uuid>.<ext>" and never contains ``..`` or a
+        leading ``/``, so this is unconditional hardening that no legitimate
+        request exercises.
+
+        Returns the resolved absolute Path if it is contained within the base
+        path, otherwise None.
+        """
+        if not storage_path:
+            return None
+
+        candidate = self._base_path / storage_path
+        try:
+            resolved = candidate.resolve()
+            base = self._base_path.resolve()
+            # Raises ValueError if resolved is not within base.
+            resolved.relative_to(base)
+        except (ValueError, OSError):
+            logger.warning("artifact_path_traversal_blocked", path=storage_path)
+            return None
+
+        return resolved
+
     async def retrieve(self, storage_path: str) -> Optional[bytes]:
         """
         Retrieve an artifact by storage path.
@@ -111,9 +140,9 @@ class ArtifactStorage:
         Returns:
             File content as bytes, or None if not found
         """
-        file_path = self._base_path / storage_path
+        file_path = self._resolve_within_base(storage_path)
 
-        if not file_path.exists():
+        if file_path is None or not file_path.exists():
             return None
 
         async with aiofiles.open(file_path, "rb") as f:
@@ -129,9 +158,9 @@ class ArtifactStorage:
         Returns:
             True if deleted, False if not found
         """
-        file_path = self._base_path / storage_path
+        file_path = self._resolve_within_base(storage_path)
 
-        if not file_path.exists():
+        if file_path is None or not file_path.exists():
             return False
 
         file_path.unlink()
@@ -140,14 +169,14 @@ class ArtifactStorage:
 
     async def exists(self, storage_path: str) -> bool:
         """Check if an artifact exists."""
-        file_path = self._base_path / storage_path
-        return file_path.exists()
+        file_path = self._resolve_within_base(storage_path)
+        return file_path is not None and file_path.exists()
 
     async def get_size(self, storage_path: str) -> Optional[int]:
         """Get artifact size in bytes."""
-        file_path = self._base_path / storage_path
+        file_path = self._resolve_within_base(storage_path)
 
-        if not file_path.exists():
+        if file_path is None or not file_path.exists():
             return None
 
         return file_path.stat().st_size

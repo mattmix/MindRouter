@@ -24,12 +24,30 @@ services:
     command: ["uvicorn", "backend.app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "${UVICORN_WORKERS:-2}", "--timeout-graceful-shutdown", "60"]
     environment:
       - DATABASE_URL=mysql+pymysql://mindrouter:${MYSQL_PASSWORD:-mindrouter_password}@127.0.0.1:3306/mindrouter
-      - REDIS_URL=redis://127.0.0.1:6379/0
+      # Redis now requires a password (see the redis service below). The default
+      # keeps a fresh `docker compose up` working locally; override REDIS_PASSWORD
+      # in .env to change it. Keep this URL's password in sync with that service.
+      - REDIS_URL=redis://:${REDIS_PASSWORD:-mindrouter_dev_redis}@127.0.0.1:6379/0
       - SECRET_KEY=${SECRET_KEY:-dev-secret-key-change-in-production}
       - ARTIFACT_STORAGE_PATH=/data/artifacts
       - CHAT_FILES_PATH=/data/chat_files
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - DEBUG=${DEBUG:-false}
+      # Security hardening (2.9.18 audit remediation — see backend/app/settings.py).
+      # Defaults preserve current behavior; set the prod-hardening values in .env:
+      #   SESSION_COOKIE_SECURE=true, ENABLE_API_DOCS=false.
+      - SESSION_COOKIE_SECURE=${SESSION_COOKIE_SECURE:-false}
+      - ENABLE_API_DOCS=${ENABLE_API_DOCS:-true}
+      - 'CSRF_TRUSTED_ORIGINS=${CSRF_TRUSTED_ORIGINS:-[]}'
+      - IMAGE_URL_BLOCK_PRIVATE=${IMAGE_URL_BLOCK_PRIVATE:-true}
+      - 'IMAGE_URL_ALLOWED_SCHEMES=${IMAGE_URL_ALLOWED_SCHEMES:-["http","https","data"]}'
+      - OCR_MAX_FRAMES=${OCR_MAX_FRAMES:-500}
+      - CHAT_UPLOAD_MAX_UNCOMPRESSED_MB=${CHAT_UPLOAD_MAX_UNCOMPRESSED_MB:-100}
+      - MAX_COMPLETIONS_N=${MAX_COMPLETIONS_N:-8}
+      - LOGIN_MAX_ATTEMPTS_PER_WINDOW=${LOGIN_MAX_ATTEMPTS_PER_WINDOW:-15}
+      - LOGIN_ATTEMPT_WINDOW_SECONDS=${LOGIN_ATTEMPT_WINDOW_SECONDS:-300}
+      - RATE_LIMIT_LOCAL_FALLBACK=${RATE_LIMIT_LOCAL_FALLBACK:-true}
+      - TOKENIZE_MAX_INPUT_CHARS=${TOKENIZE_MAX_INPUT_CHARS:-2000000}
       # Audit content capture (see backend/app/settings.py — keep in sync).
       # Disabling capture also disables DLP scanning of that content.
       # SAML SP key pair (inline PEM or a path to a mounted file) — needed
@@ -95,7 +113,8 @@ services:
       - VIDEO_WORKER_TIMEOUT_SECONDS=${VIDEO_WORKER_TIMEOUT_SECONDS:-60}
       - VIDEO_WORKER_FETCH_TIMEOUT_SECONDS=${VIDEO_WORKER_FETCH_TIMEOUT_SECONDS:-900}
       - VIDEO_WORKER_API_KEY=${VIDEO_WORKER_API_KEY:-}
-      - VIDEO_WORKER_TLS_VERIFY=${VIDEO_WORKER_TLS_VERIFY:-false}
+      - VIDEO_WORKER_FETCH_MAX_MB=${VIDEO_WORKER_FETCH_MAX_MB:-2048}
+      - INTERNAL_TLS_VERIFY=${INTERNAL_TLS_VERIFY:-true}
       - VIDEO_JOB_MAX_WALL_SECONDS=${VIDEO_JOB_MAX_WALL_SECONDS:-3600}
       - VIDEO_JOB_STALE_HEARTBEAT_SECONDS=${VIDEO_JOB_STALE_HEARTBEAT_SECONDS:-120}
       - VIDEO_RECONCILE_INTERVAL_SECONDS=${VIDEO_RECONCILE_INTERVAL_SECONDS:-20}
@@ -179,12 +198,17 @@ services:
     volumes:
       - redis_data:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      # Authenticated ping: with requirepass set, an unauthenticated PING is
+      # rejected (NOAUTH), so the healthcheck must pass the password.
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-mindrouter_dev_redis}", "ping"]
       interval: 10s
       timeout: 5s
       retries: 3
     restart: unless-stopped
-    command: redis-server --appendonly yes --port 6379
+    # Redis requires a password. The default matches REDIS_URL above so a local
+    # `docker compose up` works out of the box; set REDIS_PASSWORD in .env to
+    # override (keep it in sync with the app/mcp REDIS_URL).
+    command: redis-server --appendonly yes --port 6379 --requirepass ${REDIS_PASSWORD:-mindrouter_dev_redis}
 
   # Standalone MCP SSE server (single worker for session affinity)
   mcp:
@@ -194,7 +218,7 @@ services:
     network_mode: host
     environment:
       - DATABASE_URL=mysql+pymysql://mindrouter:${MYSQL_PASSWORD:-mindrouter_password}@127.0.0.1:3306/mindrouter
-      - REDIS_URL=redis://127.0.0.1:6379/0
+      - REDIS_URL=redis://:${REDIS_PASSWORD:-mindrouter_dev_redis}@127.0.0.1:6379/0
       - SECRET_KEY=${SECRET_KEY:-dev-secret-key-change-in-production}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - BRAVE_SEARCH_API_KEY=${BRAVE_SEARCH_API_KEY:-}

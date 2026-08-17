@@ -14,7 +14,9 @@
 
 """Health check and metrics endpoints."""
 
+import asyncio
 import json
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict
 
@@ -207,6 +209,45 @@ async def cluster_status() -> Dict[str, Any]:
     }
 
 
+class _SingleFlightTTL:
+    """Single-flight TTL cache guarding an expensive async producer (F40).
+
+    The public /api/cluster/* endpoints are unauthenticated and polled by the
+    landing page, so a burst of concurrent cache misses would otherwise
+    dogpile the database with identical expensive aggregate queries.
+    Concurrent misses collapse onto ONE producer call via a double-checked
+    ``asyncio.Lock`` — the rest wait, then read the freshly populated value.
+
+    The producer returns ``(value, cacheable)``. A result flagged
+    ``cacheable=False`` (a DB-error fallback) is returned to the caller but
+    NOT stored, so the next request retries instead of pinning a stale error
+    for the whole TTL.
+    """
+
+    def __init__(self, ttl_seconds: float) -> None:
+        self._ttl = ttl_seconds
+        self._value: Any = None
+        self._has_value = False
+        self._expires = 0.0
+        self._lock = asyncio.Lock()
+
+    async def get(self, producer) -> Any:
+        now = time.monotonic()
+        if self._has_value and now < self._expires:
+            return self._value
+        async with self._lock:
+            # Double-check: another waiter may have filled the cache.
+            now = time.monotonic()
+            if self._has_value and now < self._expires:
+                return self._value
+            value, cacheable = await producer()
+            if cacheable:
+                self._value = value
+                self._has_value = True
+                self._expires = now + self._ttl
+            return value
+
+
 _TOTAL_TOKENS_REDIS_KEY = "cluster:total_tokens"
 
 # Per-worker fallback cache (used only when Redis is unavailable)
@@ -214,15 +255,13 @@ _total_tokens_fallback: Dict[str, Any] = {
     "value": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
 }
 
+# Single-flight caches collapse concurrent misses to one query (F40).
+_total_tokens_cache = _SingleFlightTTL(5.0)
+_throughput_cache = _SingleFlightTTL(2.0)
 
-@router.get("/api/cluster/total-tokens")
-async def cluster_total_tokens() -> Dict[str, Any]:
-    """Public endpoint: total tokens ever served.
 
-    Reads from a live Redis counter that is atomically incremented on
-    every request completion.  Falls back to a DB scan only if the
-    counter hasn't been seeded yet (first startup).
-    """
+async def _produce_total_tokens() -> tuple[dict[str, Any], bool]:
+    """Compute total tokens ever served; returns (value, cacheable)."""
     # Try live Redis counter first
     totals = await redis_client.get_cluster_tokens()
     if totals is not None:
@@ -236,7 +275,7 @@ async def cluster_total_tokens() -> Dict[str, Any]:
         except Exception:
             pass
         _total_tokens_fallback["value"] = totals
-        return totals
+        return totals, True
 
     # Counter not seeded — seed from DB (one-time on first startup)
     try:
@@ -254,15 +293,33 @@ async def cluster_total_tokens() -> Dict[str, Any]:
         if offset:
             totals["total_tokens"] += int(offset)
     except Exception:
-        return _total_tokens_fallback["value"]
+        # Don't cache the fallback — retry on the next request.
+        return _total_tokens_fallback["value"], False
 
     _total_tokens_fallback["value"] = totals
-    return totals
+    return totals, True
+
+
+@router.get("/api/cluster/total-tokens")
+async def cluster_total_tokens() -> Dict[str, Any]:
+    """Public endpoint: total tokens ever served.
+
+    Reads from a live Redis counter that is atomically incremented on
+    every request completion.  Falls back to a DB scan only if the
+    counter hasn't been seeded yet (first startup).
+    """
+    return await _total_tokens_cache.get(_produce_total_tokens)
 
 
 _RANGE_SECONDS = {
     "hour": 3600, "day": 86400, "week": 604800,
     "month": 2592000, "year": 31536000,
+}
+
+# One single-flight cache per range (each keyed query is independently
+# expensive; week/month/year scan millions of rows).
+_trends_caches: Dict[str, _SingleFlightTTL] = {
+    _range: _SingleFlightTTL(15.0) for _range in _RANGE_SECONDS
 }
 
 
@@ -273,15 +330,21 @@ async def cluster_trends(range: str = "day") -> Dict[str, Any]:
         range = "day"
     since = (datetime.now(timezone.utc) - timedelta(seconds=_RANGE_SECONDS[range])).strftime("%Y-%m-%dT%H:%M:%SZ")
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    try:
-        from backend.app.db import crud
-        async with AsyncSessionLocal() as db:
-            tokens = await crud.get_token_trend(db, range)
-            users = await crud.get_active_users_trend(db, range)
-    except Exception:
-        tokens = []
-        users = []
-    return {"tokens": tokens, "users": users, "range": range, "since": since, "now": now_str}
+
+    async def _produce() -> tuple[dict[str, Any], bool]:
+        try:
+            from backend.app.db import crud
+            async with AsyncSessionLocal() as db:
+                tokens = await crud.get_token_trend(db, range)
+                users = await crud.get_active_users_trend(db, range)
+            return {"tokens": tokens, "users": users}, True
+        except Exception:
+            return {"tokens": [], "users": []}, False
+
+    # Only the (expensive) query result is cached; the window timestamps are
+    # recomputed each call so the response stays fresh.
+    data = await _trends_caches[range].get(_produce)
+    return {"tokens": data["tokens"], "users": data["users"], "range": range, "since": since, "now": now_str}
 
 
 @router.get("/api/cluster/throughput")
@@ -292,27 +355,32 @@ async def cluster_throughput() -> Dict[str, Any]:
     Returns tokens/second computed from completed requests in the last 10 seconds.
     """
     window_seconds = 10
-    cutoff = datetime.now(timezone.utc) - timedelta(seconds=window_seconds)
 
-    try:
-        async with AsyncSessionLocal() as db:
-            result = await db.execute(
-                select(
-                    func.coalesce(func.sum(DBRequest.total_tokens), 0),
-                    func.count(DBRequest.id),
-                ).where(
-                    and_(
-                        DBRequest.status == RequestStatus.COMPLETED,
-                        DBRequest.completed_at >= cutoff,
+    async def _produce() -> tuple[dict[str, int], bool]:
+        cutoff = datetime.now(timezone.utc) - timedelta(seconds=window_seconds)
+        try:
+            async with AsyncSessionLocal() as db:
+                result = await db.execute(
+                    select(
+                        func.coalesce(func.sum(DBRequest.total_tokens), 0),
+                        func.count(DBRequest.id),
+                    ).where(
+                        and_(
+                            DBRequest.status == RequestStatus.COMPLETED,
+                            DBRequest.completed_at >= cutoff,
+                        )
                     )
                 )
-            )
-            row = result.one()
-            total_tokens = int(row[0])
-            request_count = int(row[1])
-    except Exception:
-        total_tokens = 0
-        request_count = 0
+                row = result.one()
+                return {"total_tokens": int(row[0]), "request_count": int(row[1])}, True
+        except Exception:
+            return {"total_tokens": 0, "request_count": 0}, False
+
+    # Single-flight the DB aggregate; inflight/active-request reads below stay
+    # live so the ticker keeps updating between cache fills.
+    agg = await _throughput_cache.get(_produce)
+    total_tokens = agg["total_tokens"]
+    request_count = agg["request_count"]
 
     # Add inflight streaming tokens to the total
     inflight_tokens = await redis_client.get_inflight_tokens()

@@ -596,7 +596,6 @@ def _build_runner(settings) -> "VideoRunner":
             control_timeout=settings.video_worker_timeout_seconds,
             fetch_timeout=settings.video_worker_fetch_timeout_seconds,
             api_key=settings.video_worker_api_key,
-            verify_tls=settings.video_worker_tls_verify,
         ),
         storage_root=settings.video_storage_path,
         poll_interval=settings.video_runner_poll_interval_seconds,

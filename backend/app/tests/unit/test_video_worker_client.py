@@ -3,8 +3,10 @@
 Loads the module directly via importlib to avoid the backend package import
 chain (db/session -> settings -> pymysql), per the repo's test hygiene rules.
 A fake httpx.AsyncClient records the verify kwarg and the headers/params each
-request receives, so we assert the client sends X-Worker-Key and threads
-verify_tls through without a live worker.
+request receives, so we assert the client sends X-Worker-Key (and that TLS
+verification comes from the module-level _tls_verify() default) without a live
+worker. The fetch-cap and _tls_verify behavior is covered in
+test_video_worker_client_hardening.py.
 """
 
 import importlib.util
@@ -89,19 +91,19 @@ def patched(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_submit_sends_key_and_verify_true(patched):
-    client = vwc.HttpVideoWorkerClient(api_key="secret-xyz", verify_tls=True)
+async def test_submit_sends_key(patched):
+    client = vwc.HttpVideoWorkerClient(api_key="secret-xyz")
     job_id = await client.submit("https://node:18300", {"prompt": "x"})
     assert job_id == "wjob-abc123"
-    assert patched["init"]["verify"] is True
     assert patched["post"]["headers"] == {"X-Worker-Key": "secret-xyz"}
+    # TLS verification comes from _tls_verify() (secure default), not a ctor arg.
+    assert patched["init"]["verify"] is True
 
 
 @pytest.mark.asyncio
-async def test_no_key_sends_no_header_and_verify_false(patched):
-    client = vwc.HttpVideoWorkerClient()  # defaults: no key, verify False
+async def test_no_key_sends_no_header(patched):
+    client = vwc.HttpVideoWorkerClient()  # no key -> no auth header
     await client.poll("https://node:18300", "wjob-1")
-    assert patched["init"]["verify"] is False
     assert patched["get"]["headers"] == {}
 
 

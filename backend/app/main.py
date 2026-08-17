@@ -645,13 +645,36 @@ def create_app() -> FastAPI:
     """Create and configure the FastAPI application."""
     settings = get_settings()
 
+    # Secret-key startup guard (F07): refuse to boot with the built-in dev
+    # placeholder or a too-short key. The session cookies, CSRF tokens and
+    # JWTs are all only as strong as this value, so an insecure one must never
+    # reach production. Prod already sets a real 64-char key and is unaffected;
+    # this only stops an accidental insecure deploy.
+    if (
+        settings.secret_key == "dev-secret-key-change-in-production"
+        or len(settings.secret_key) < 32
+    ):
+        raise RuntimeError(
+            "Refusing to start: SECRET_KEY is unset/insecure. Set a strong "
+            "SECRET_KEY (>= 32 chars, not the built-in dev placeholder) in the "
+            "environment before starting MindRouter."
+        )
+
+    # Interactive API docs are gated so an internet-facing deployment can hide
+    # the full schema (F57/L2). Default enable_api_docs=True keeps /docs,
+    # /redoc and /openapi.json exactly as before.
+    _docs_kwargs = (
+        {"docs_url": "/docs", "redoc_url": "/redoc"}
+        if settings.enable_api_docs
+        else {"docs_url": None, "redoc_url": None, "openapi_url": None}
+    )
+
     app = FastAPI(
         title=settings.app_name,
         version=settings.app_version,
         description="LLM Inference Load Balancer for Ollama and vLLM backends",
         lifespan=lifespan,
-        docs_url="/docs",
-        redoc_url="/redoc",
+        **_docs_kwargs,
     )
 
     # CORS middleware
@@ -662,6 +685,13 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    # CSRF origin guard (F12) — registered after CORS. Rejects cross-origin
+    # browser state-changing requests; requests without an Origin/Referer
+    # (API-key / server-to-server clients) pass through untouched, so the
+    # /v1, /api and vendor-compatible surfaces are unaffected.
+    from backend.app.core.csrf import CSRFOriginMiddleware
+    app.add_middleware(CSRFOriginMiddleware)
 
     # Session deactivation guard — raw ASGI; refuses session-cookie
     # requests from deactivated/deleted users (cookies live 7 days and
