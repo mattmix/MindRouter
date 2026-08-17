@@ -11,6 +11,7 @@ test_video_worker_client_hardening.py.
 
 import importlib.util
 import os
+import secrets
 
 import pytest
 
@@ -30,6 +31,9 @@ def _load_module():
 
 
 vwc = _load_module()
+
+# Generated per run — never a hardcoded secret literal in the tree.
+_KEY = secrets.token_hex(16)
 
 
 class _FakeResponse:
@@ -92,10 +96,10 @@ def patched(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_submit_sends_key(patched):
-    client = vwc.HttpVideoWorkerClient(api_key="secret-xyz")
+    client = vwc.HttpVideoWorkerClient(api_key=_KEY)
     job_id = await client.submit("https://node:18300", {"prompt": "x"})
     assert job_id == "wjob-abc123"
-    assert patched["post"]["headers"] == {"X-Worker-Key": "secret-xyz"}
+    assert patched["post"]["headers"] == {"X-Worker-Key": _KEY}
     # TLS verification comes from _tls_verify() (secure default), not a ctor arg.
     assert patched["init"]["verify"] is True
 
@@ -109,11 +113,11 @@ async def test_no_key_sends_no_header(patched):
 
 @pytest.mark.asyncio
 async def test_cancel_sends_key(patched):
-    client = vwc.HttpVideoWorkerClient(api_key="k")
+    client = vwc.HttpVideoWorkerClient(api_key=_KEY)
     await client.cancel("https://node:18300", "wjob-1")
-    assert patched["delete"]["headers"] == {"X-Worker-Key": "k"}
+    assert patched["delete"]["headers"] == {"X-Worker-Key": _KEY}
 
 
 def test_headers_helper():
-    assert vwc.HttpVideoWorkerClient(api_key="k")._headers() == {"X-Worker-Key": "k"}
+    assert vwc.HttpVideoWorkerClient(api_key=_KEY)._headers() == {"X-Worker-Key": _KEY}
     assert vwc.HttpVideoWorkerClient()._headers() == {}

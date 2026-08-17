@@ -7,6 +7,7 @@ that GET /health stays responsive while a render occupies the executor.
 """
 
 import os
+import secrets
 import sys
 import time
 
@@ -144,7 +145,8 @@ def test_cancel_queued_job(tmp_path):
 # X-Worker-Key header; /health and /version stay open for monitoring. Mirrors
 # the sidecar's SIDECAR_SECRET_KEY gate (sidecar/tests/test_gpu_agent_stress.py).
 
-_KEY = "worker-test-secret-abc123"
+# Generated per run — never a hardcoded secret literal in the tree.
+_KEY = secrets.token_hex(16)
 
 
 def _authed_client(tmp_path):

@@ -2554,17 +2554,16 @@ async def get_latest_gpu_device_telemetry(
     if not device_ids:
         return []
 
-    # Get max timestamp per device. Use an expanding bind parameter for the
-    # IN() list rather than string-joining ids into the SQL text.
-    from sqlalchemy import bindparam, text
-    subq = text("""
-        SELECT gpu_device_id, MAX(timestamp) as max_ts
-        FROM gpu_device_telemetry
-        WHERE gpu_device_id IN :device_ids
-        GROUP BY gpu_device_id
-    """).bindparams(bindparam("device_ids", expanding=True))
-
-    result = await db.execute(subq, {"device_ids": device_ids})
+    # Max timestamp per device via a pure-ORM grouped aggregate — no raw
+    # string SQL; .in_() emits a fully bound IN() list.
+    result = await db.execute(
+        select(
+            GPUDeviceTelemetry.gpu_device_id,
+            func.max(GPUDeviceTelemetry.timestamp).label("max_ts"),
+        )
+        .where(GPUDeviceTelemetry.gpu_device_id.in_(device_ids))
+        .group_by(GPUDeviceTelemetry.gpu_device_id)
+    )
     latest_map = {row[0]: row[1] for row in result.all()}
 
     if not latest_map:
