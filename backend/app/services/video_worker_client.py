@@ -60,15 +60,30 @@ class HttpVideoWorkerClient:
     """httpx-backed worker client. A fresh client is used per call (per the
     per-request-client pattern that fixed orphaned generations in v2.4.0)."""
 
-    def __init__(self, *, control_timeout: float = 60.0, fetch_timeout: float = 900.0):
+    def __init__(
+        self,
+        *,
+        control_timeout: float = 60.0,
+        fetch_timeout: float = 900.0,
+        api_key: str = "",
+        verify_tls: bool = False,
+    ):
         self._control_timeout = control_timeout
         self._fetch_timeout = fetch_timeout
+        # Shared secret sent as X-Worker-Key when set; empty = no header (legacy).
+        self._api_key = api_key or ""
+        # verify_tls: False keeps the historical no-verify behavior; set True (or
+        # a CA-bundle path) once the worker is fronted by nginx TLS on loopback.
+        self._verify = verify_tls
+
+    def _headers(self) -> Dict[str, str]:
+        return {"X-Worker-Key": self._api_key} if self._api_key else {}
 
     async def submit(self, base_url: str, payload: Dict[str, Any]) -> str:
         url = f"{base_url.rstrip('/')}/v1/videos"
         try:
-            async with httpx.AsyncClient(timeout=self._control_timeout, verify=False) as client:
-                resp = await client.post(url, json=payload)
+            async with httpx.AsyncClient(timeout=self._control_timeout, verify=self._verify) as client:
+                resp = await client.post(url, json=payload, headers=self._headers())
         except httpx.HTTPError as exc:
             raise WorkerSubmitError(f"submit connect error: {exc}", retryable=True) from exc
         if resp.status_code >= 500:
@@ -83,8 +98,8 @@ class HttpVideoWorkerClient:
 
     async def poll(self, base_url: str, worker_job_id: str) -> Dict[str, Any]:
         url = f"{base_url.rstrip('/')}/v1/videos/{worker_job_id}"
-        async with httpx.AsyncClient(timeout=self._control_timeout, verify=False) as client:
-            resp = await client.get(url)
+        async with httpx.AsyncClient(timeout=self._control_timeout, verify=self._verify) as client:
+            resp = await client.get(url, headers=self._headers())
         resp.raise_for_status()
         return resp.json()
 
@@ -92,8 +107,8 @@ class HttpVideoWorkerClient:
         url = f"{base_url.rstrip('/')}/v1/videos/{worker_job_id}/content"
         hasher = hashlib.sha256()
         size = 0
-        async with httpx.AsyncClient(timeout=self._fetch_timeout, verify=False) as client:
-            async with client.stream("GET", url) as resp:
+        async with httpx.AsyncClient(timeout=self._fetch_timeout, verify=self._verify) as client:
+            async with client.stream("GET", url, headers=self._headers()) as resp:
                 resp.raise_for_status()
                 with open(dest_path, "wb") as fh:
                     async for chunk in resp.aiter_bytes():
@@ -105,8 +120,8 @@ class HttpVideoWorkerClient:
     async def cancel(self, base_url: str, worker_job_id: str) -> None:
         url = f"{base_url.rstrip('/')}/v1/videos/{worker_job_id}"
         try:
-            async with httpx.AsyncClient(timeout=self._control_timeout, verify=False) as client:
-                await client.delete(url)
+            async with httpx.AsyncClient(timeout=self._control_timeout, verify=self._verify) as client:
+                await client.delete(url, headers=self._headers())
         except httpx.HTTPError:
             # Best effort — the worker frees the GPU on its own deadline anyway.
             pass

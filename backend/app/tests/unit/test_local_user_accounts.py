@@ -226,7 +226,9 @@ BADGE_TEMPLATES = [
 def _template_env():
     from jinja2 import Environment, FileSystemLoader
 
-    env = Environment(loader=FileSystemLoader(str(_TEMPLATES_DIR)))
+    env = Environment(
+        loader=FileSystemLoader(str(_TEMPLATES_DIR)), autoescape=True
+    )
     env.filters["localtime"] = lambda v, fmt=None: v
     env.filters["fromjson"] = lambda s: []
     return env

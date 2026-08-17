@@ -39,7 +39,7 @@ def test_capabilities_and_models(tmp_path):
     with _client(tmp_path) as client:
         cap = client.get("/v1/capabilities").json()
         assert "1280x704" in cap["supported_sizes"]
-        assert cap["pipelines"] == ["t2v"]
+        assert cap["pipelines"] == ["t2v", "i2v", "keyframes"]
         models = client.get("/v1/models").json()
         assert models["data"][0]["id"] == "lightricks/ltx-2.3-distilled"
         assert client.get("/version").json()["mode"] == "mock"
@@ -137,3 +137,63 @@ def test_cancel_queued_job(tmp_path):
         body = _poll_until(client, second)
         assert body["status"] == "cancelled"
         _poll_until(client, first)  # drain
+
+
+# ── Auth (X-Worker-Key) ────────────────────────────────────────────────────
+# When WorkerConfig.api_key is set, the /v1/* routes require a matching
+# X-Worker-Key header; /health and /version stay open for monitoring. Mirrors
+# the sidecar's SIDECAR_SECRET_KEY gate (sidecar/tests/test_gpu_agent_stress.py).
+
+_KEY = "worker-test-secret-abc123"
+
+
+def _authed_client(tmp_path):
+    cfg = WorkerConfig(mode="mock", output_dir=str(tmp_path), api_key=_KEY)
+    return TestClient(create_app(cfg))
+
+
+def test_v1_routes_require_key_when_configured(tmp_path):
+    with _authed_client(tmp_path) as client:
+        submit_body = {"prompt": "x", "size": "1280x704", "seconds": "5"}
+        # Missing header → 401 on every /v1 route.
+        assert client.get("/v1/models").status_code == 401
+        assert client.get("/v1/capabilities").status_code == 401
+        assert client.post("/v1/videos", json=submit_body).status_code == 401
+        assert client.get("/v1/videos/wjob-x").status_code == 401
+        assert client.get("/v1/videos/wjob-x/content").status_code == 401
+        assert client.delete("/v1/videos/wjob-x").status_code == 401
+        # Wrong header → 401.
+        assert client.get("/v1/models", headers={"X-Worker-Key": "nope"}).status_code == 401
+
+
+def test_v1_routes_accept_correct_key(tmp_path):
+    with _authed_client(tmp_path) as client:
+        h = {"X-Worker-Key": _KEY}
+        assert client.get("/v1/models", headers=h).status_code == 200
+        assert client.get("/v1/capabilities", headers=h).status_code == 200
+        r = client.post(
+            "/v1/videos", json={"prompt": "x", "size": "1280x704", "seconds": "5"}, headers=h
+        )
+        assert r.status_code == 202
+        job_id = r.json()["id"]
+        # Drain to completion so lifespan teardown is clean (poll needs the key).
+        for _ in range(200):
+            pr = client.get(f"/v1/videos/{job_id}", headers=h)
+            assert pr.status_code == 200
+            if pr.json()["status"] in ("completed", "failed", "cancelled"):
+                break
+            time.sleep(0.01)
+
+
+def test_health_and_version_open_without_key(tmp_path):
+    with _authed_client(tmp_path) as client:
+        # Monitoring endpoints must not require the key.
+        assert client.get("/health").status_code == 200
+        assert client.get("/version").status_code == 200
+
+
+def test_no_key_configured_leaves_routes_open(tmp_path):
+    # Empty api_key = legacy/open behavior (rollout window before the gateway
+    # sends the key). No header, still 200.
+    with _client(tmp_path) as client:
+        assert client.get("/v1/models").status_code == 200

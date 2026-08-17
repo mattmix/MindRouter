@@ -14,9 +14,11 @@
 
 """FastAPI application for the video worker."""
 
+import hmac
 from contextlib import asynccontextmanager
+from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 
 from config import SUPPORTED_SIZES, WorkerConfig, frames_for
@@ -56,6 +58,23 @@ def create_app(config: WorkerConfig | None = None) -> FastAPI:
     app = FastAPI(title="mindrouter video-worker", version=VERSION, lifespan=lifespan)
     app.state.config = config or WorkerConfig()
 
+    async def require_worker_key(
+        x_worker_key: Optional[str] = Header(default=None, alias="X-Worker-Key"),
+    ) -> None:
+        """Guard the /v1/* routes with a shared secret when one is configured.
+
+        Empty api_key = auth disabled (legacy/open), so a new worker can be
+        deployed before the gateway is sending the key. Compared in constant
+        time to avoid leaking the secret via response timing.
+        """
+        expected = app.state.config.api_key
+        if not expected:
+            return
+        if not x_worker_key or not hmac.compare_digest(x_worker_key, expected):
+            raise HTTPException(status_code=401, detail="invalid or missing worker key")
+
+    guarded = [Depends(require_worker_key)]
+
     def manager() -> JobManager:
         return app.state.manager
 
@@ -69,15 +88,15 @@ def create_app(config: WorkerConfig | None = None) -> FastAPI:
     async def version():
         return {"version": VERSION, "mode": app.state.config.mode, "model": app.state.config.model_id}
 
-    @app.get("/v1/models")
+    @app.get("/v1/models", dependencies=guarded)
     async def models():
         return {"object": "list", "data": [{"id": m} for m in manager().engine.model_ids()]}
 
-    @app.get("/v1/capabilities")
+    @app.get("/v1/capabilities", dependencies=guarded)
     async def capabilities():
         return manager().engine.capabilities()
 
-    @app.post("/v1/videos", status_code=202)
+    @app.post("/v1/videos", status_code=202, dependencies=guarded)
     async def submit(request: Request):
         try:
             body = await request.json()
@@ -115,14 +134,14 @@ def create_app(config: WorkerConfig | None = None) -> FastAPI:
         job = manager().submit(spec)
         return {"id": job.id, "status": job.status}
 
-    @app.get("/v1/videos/{job_id}")
+    @app.get("/v1/videos/{job_id}", dependencies=guarded)
     async def poll(job_id: str):
         job = manager().get(job_id)
         if not job:
             raise HTTPException(status_code=404, detail="job not found")
         return _external_status(job)
 
-    @app.get("/v1/videos/{job_id}/content")
+    @app.get("/v1/videos/{job_id}/content", dependencies=guarded)
     async def content(job_id: str):
         job = manager().get(job_id)
         if not job:
@@ -132,7 +151,7 @@ def create_app(config: WorkerConfig | None = None) -> FastAPI:
         # FileResponse (starlette) serves Accept-Ranges + 206 partial content.
         return FileResponse(job.output_path, media_type="video/mp4", filename=f"{job_id}.mp4")
 
-    @app.delete("/v1/videos/{job_id}")
+    @app.delete("/v1/videos/{job_id}", dependencies=guarded)
     async def cancel(job_id: str):
         if not manager().request_cancel(job_id):
             raise HTTPException(status_code=404, detail="job not found")

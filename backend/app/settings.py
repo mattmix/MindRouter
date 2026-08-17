@@ -152,6 +152,13 @@ class Settings(BaseSettings):
     video_runner_poll_interval_seconds: int = 5
     video_worker_timeout_seconds: int = 60          # control-plane calls (submit/poll/cancel)
     video_worker_fetch_timeout_seconds: int = 900   # artifact fetch (worker -> gateway, large)
+    # Shared secret sent to the worker as X-Worker-Key (host .env only, never in
+    # repo). Empty = no header (legacy). Set the SAME value as the worker's
+    # VIDEO_WORKER_API_KEY to enforce auth on the worker /v1/* routes.
+    video_worker_api_key: str = ""
+    # Verify the worker's TLS cert. False keeps the historical no-verify posture;
+    # set True (or a CA-bundle path) once the worker is fronted by nginx TLS.
+    video_worker_tls_verify: bool = False
     video_job_max_wall_seconds: int = 3600
     video_job_stale_heartbeat_seconds: int = 120
     video_reconcile_interval_seconds: int = 20  # ground-truth sweep for orphaned renders

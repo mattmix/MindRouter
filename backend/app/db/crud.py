@@ -2554,17 +2554,17 @@ async def get_latest_gpu_device_telemetry(
     if not device_ids:
         return []
 
-    # Get max timestamp per device
-    from sqlalchemy import text
-    placeholders = ",".join(str(d) for d in device_ids)
-    subq = text(f"""
+    # Get max timestamp per device. Use an expanding bind parameter for the
+    # IN() list rather than string-joining ids into the SQL text.
+    from sqlalchemy import bindparam, text
+    subq = text("""
         SELECT gpu_device_id, MAX(timestamp) as max_ts
         FROM gpu_device_telemetry
-        WHERE gpu_device_id IN ({placeholders})
+        WHERE gpu_device_id IN :device_ids
         GROUP BY gpu_device_id
-    """)
+    """).bindparams(bindparam("device_ids", expanding=True))
 
-    result = await db.execute(subq)
+    result = await db.execute(subq, {"device_ids": device_ids})
     latest_map = {row[0]: row[1] for row in result.all()}
 
     if not latest_map:
@@ -3501,21 +3501,23 @@ async def get_api_key_last_ips_batch(
     """Get the most recent client_ip for each API key. Returns {api_key_id: ip}."""
     if not api_key_ids:
         return {}
-    from sqlalchemy import text
+    from sqlalchemy import bindparam, text
 
-    placeholders = ",".join(str(int(kid)) for kid in api_key_ids)
-    query = text(f"""
+    # Coerce to int (defensive) and pass as an expanding bind parameter rather
+    # than string-joining ids into the SQL text.
+    key_ids = [int(kid) for kid in api_key_ids]
+    query = text("""
         SELECT r.api_key_id, r.client_ip
         FROM requests r
         INNER JOIN (
             SELECT api_key_id, MAX(created_at) as max_created
             FROM requests
-            WHERE api_key_id IN ({placeholders}) AND client_ip IS NOT NULL
+            WHERE api_key_id IN :api_key_ids AND client_ip IS NOT NULL
             GROUP BY api_key_id
         ) latest ON r.api_key_id = latest.api_key_id AND r.created_at = latest.max_created
         WHERE r.client_ip IS NOT NULL
-    """)
-    result = await db.execute(query)
+    """).bindparams(bindparam("api_key_ids", expanding=True))
+    result = await db.execute(query, {"api_key_ids": key_ids})
     return {row[0]: row[1] for row in result.all()}
 
 

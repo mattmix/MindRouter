@@ -34,6 +34,13 @@ from backend.app.logging_config import get_logger
 
 logger = get_logger(__name__)
 
+# Telemetry table names are interpolated into DELETE statements below. Table
+# identifiers cannot be passed as bind parameters, so they must come from this
+# closed allowlist — asserted at each interpolation site — never from input.
+_TELEMETRY_TABLES = frozenset(
+    {"backend_telemetry", "gpu_device_telemetry", "node_telemetry"}
+)
+
 # Default retention config values
 # Fallbacks used when an app_config row is missing.  The requests/chat/
 # telemetry/interval/batch keys MUST match migration 029's seeds so the
@@ -758,6 +765,7 @@ async def archive_expired_telemetry(
         ("gpu_device_telemetry", "gpu_device_telemetry"),
         ("node_telemetry", "node_telemetry"),
     ]:
+        assert table_name in _TELEMETRY_TABLES  # closed allowlist, not input
         while True:
             result = await app_db.execute(
                 text(
@@ -800,6 +808,7 @@ async def cleanup_expired_telemetry(
         ("gpu_device_telemetry", "gpu_device_telemetry"),
         ("node_telemetry", "node_telemetry"),
     ]:
+        assert table_name in _TELEMETRY_TABLES  # closed allowlist, not input
         while True:
             result = await app_db.execute(
                 text(

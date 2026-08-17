@@ -57,6 +57,11 @@ class WorkerConfig:
     )
     # Model checkpoint dir + fp8 flag (only used in mode=ltx).
     checkpoint_dir: str = field(default_factory=lambda: os.environ.get("VIDEO_WORKER_CKPT_DIR", ""))
+    # Shared secret required on the X-Worker-Key header for the /v1/* control +
+    # content routes. Empty = auth DISABLED (open, legacy behavior) so a new
+    # worker can be rolled out ahead of the gateway sending the key. Set the SAME
+    # value here (VIDEO_WORKER_API_KEY) and on the gateway to enforce.
+    api_key: str = field(default_factory=lambda: os.environ.get("VIDEO_WORKER_API_KEY", ""))
     default_fps: int = 24
     # Mock-only: seconds of simulated work per step (keeps /health-under-load
     # tests meaningful; 0 in CI for speed).

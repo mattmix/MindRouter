@@ -19,8 +19,13 @@ Environment=VIDEO_WORKER_OUTPUT_DIR=/data/video-worker
 Environment=VIDEO_WORKER_CKPT_DIR=/data/ltx-2.3
 # Pin to the reclaimed GPU (e.g. aspen1 GPU2). Update per node.
 Environment=CUDA_VISIBLE_DEVICES=2
+# Shared secret enforced on /v1/* (X-Worker-Key). MUST match the gateway's
+# VIDEO_WORKER_API_KEY. Leave empty ONLY during the initial rollout window.
+Environment=VIDEO_WORKER_API_KEY=
 # EngineCore/port hygiene and Hopper build flags are set during Phase 0.
-ExecStart=/opt/mindrouter-video-worker/.venv/bin/uvicorn app:app --host 0.0.0.0 --port 18300 --log-level info
+# Bind to loopback:18301; the nginx vhost (nginx-video-worker.conf) terminates
+# TLS on :18300 and proxies here. Do NOT bind 0.0.0.0 — that bypasses nginx TLS.
+ExecStart=/opt/mindrouter-video-worker/.venv/bin/uvicorn app:app --host 127.0.0.1 --port 18301 --log-level info
 Restart=on-failure
 RestartSec=5
 # A cold model load + torch.compile warm can take minutes.
