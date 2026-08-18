@@ -5337,11 +5337,15 @@ async def branding_asset(filename: str):
     Public (no auth) so logos render on the login page. Long-lived cache: the
     filename carries a random token that changes whenever the asset is replaced.
     """
-    full = branding_service.asset_path(filename)
-    if not full:
+    # Validate the name (rejects separators / leading dot / missing file) via
+    # asset_path, then serve a path rebuilt INLINE from clean components — the
+    # config storage dir + os.path.basename(filename) — so the tainted param
+    # never reaches FileResponse.
+    if not branding_service.asset_path(filename):
         raise HTTPException(status_code=404, detail="Not found")
+    safe_path = os.path.join(branding_service.storage_dir(), os.path.basename(filename))
     return FileResponse(
-        full,
+        safe_path,
         media_type=branding_service.content_type_for(filename),
         headers={"Cache-Control": "public, max-age=31536000, immutable"},
     )
