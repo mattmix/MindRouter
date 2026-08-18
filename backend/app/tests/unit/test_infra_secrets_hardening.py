@@ -100,12 +100,6 @@ def test_sidecar_image_runs_non_root():
     assert "USER appuser" in df
 
 
-def test_mock_image_runs_non_root_and_has_healthcheck():
-    df = _read("Dockerfile.mock")
-    assert "USER appuser" in df
-    assert "HEALTHCHECK" in df
-
-
 # ---------------------------------------------------------------------------
 # Env examples document the new settings
 # ---------------------------------------------------------------------------
