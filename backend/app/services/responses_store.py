@@ -342,7 +342,7 @@ async def persist_response(
     try:
         input_items = stamp_item_ids(input_items)
         output_items = stamp_item_ids(output_items or [])
-        input_items, offload_map = offload_images(input_items, ctx.response_id)
+        input_items, offload_map = offload_images(input_items, os.path.basename(ctx.response_id))
 
         parameters = ctx.to_stored_parameters()
 
@@ -357,7 +357,7 @@ async def persist_response(
             )
             input_items, output_items = None, None
             parameters["payload_too_large"] = True
-            remove_artifacts(ctx.response_id)
+            remove_artifacts(os.path.basename(ctx.response_id))
             offload_map = None
 
         async with get_async_db_context() as db:
@@ -372,7 +372,7 @@ async def persist_response(
                     for old in evict:
                         old_id = old.response_id
                         await db.delete(old)
-                        remove_artifacts(old_id)
+                        remove_artifacts(os.path.basename(old_id))
                     logger.info(
                         "responses_store_evicted",
                         user_id=ctx.user_id, count=len(evict),
