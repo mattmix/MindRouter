@@ -37,6 +37,7 @@ the SDKs parse it.
 """
 
 import asyncio
+import os
 from typing import Any, Optional, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -577,7 +578,7 @@ async def delete_response(
             404, f"Response with id '{response_id}' not found.",
             code="response_not_found",
         )
-    responses_store.remove_artifacts(response_id)
+    responses_store.remove_artifacts(os.path.basename(response_id))
     return {"id": response_id, "object": "response", "deleted": True}
 
 

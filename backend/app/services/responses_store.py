@@ -39,6 +39,7 @@ Design constraints (see docs/responses-api-plan.md §2):
 
 import base64
 import json
+import os
 import shutil
 import uuid
 from pathlib import Path
@@ -81,11 +82,15 @@ def _artifact_dir(rel_key: str, subdir: str = "responses_store") -> Path:
     if not rel_key:
         raise ValueError("empty artifact key")
     root = Path(get_settings().artifact_storage_path) / subdir
-    # Inline realpath + strictly-below-root containment (kept inline, not behind
-    # a helper, so the static analyzer recognizes it as a traversal sanitizer
-    # for the reinflate/offload callers). '== root' is rejected too, so a key
-    # that collapses to the store root can never rmtree the whole store.
-    target = (root / rel_key).resolve()
+    # Sanitize each key SEGMENT with os.path.basename (a recognized traversal
+    # sanitizer) so a segment can carry neither a path separator nor a directory
+    # prefix, then keep the inline realpath + strictly-below-root containment as
+    # a backstop ('== root' rejected too, so a key that collapses to the store
+    # root can never rmtree the whole store).
+    segments = [os.path.basename(s) for s in str(rel_key).split("/") if s]
+    if not segments:
+        raise ValueError(f"invalid artifact key path: {rel_key!r}")
+    target = root.joinpath(*segments).resolve()
     root_str = str(root.resolve())
     if str(target) == root_str or not str(target).startswith(root_str + "/"):
         raise ValueError(f"invalid artifact key path: {rel_key!r}")

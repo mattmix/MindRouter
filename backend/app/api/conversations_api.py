@@ -21,6 +21,7 @@ use the OpenAI error envelope. Gated by the same feature flag as the
 Responses API (they are one feature family).
 """
 
+import os
 from typing import Any, Optional, Tuple
 
 from fastapi import APIRouter, Depends, Query, Request
@@ -160,7 +161,7 @@ async def delete_conversation(
     conversation = await crud.delete_conversation(db, conversation_id, user.id)
     if not conversation:
         return _not_found(conversation_id)
-    conversations_store.remove_conversation_artifacts(conversation_id)
+    conversations_store.remove_conversation_artifacts(os.path.basename(conversation_id))
     return conversations_store.deleted_object(conversation_id)
 
 
