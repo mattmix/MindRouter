@@ -147,3 +147,35 @@ class TestDocsTruthful:
             assert "DLP" in text[idx - 1500:idx + 1500], (
                 f"{doc.name}: DLP interaction not documented near the toggles"
             )
+
+
+class TestAuditSearchPaginationContract:
+    """The /audit/search endpoint must only pass kwargs that
+    crud.search_requests actually accepts. 88c457b moved crud to keyset/page
+    pagination while the endpoint kept passing skip=, which 500'd from v2.4.1
+    until 2.9.36. AST-based (no imports) per the repo's structural-test rules."""
+
+    def test_search_audit_kwargs_match_crud_signature(self):
+        import ast
+        root = Path(__file__).resolve().parents[4]
+        crud_tree = ast.parse((root / "backend/app/db/crud.py").read_text())
+        sig_params = None
+        for node in ast.walk(crud_tree):
+            if isinstance(node, ast.AsyncFunctionDef) and node.name == "search_requests":
+                a = node.args
+                sig_params = {p.arg for p in a.args + a.kwonlyargs}
+                break
+        assert sig_params, "crud.search_requests not found"
+
+        api_tree = ast.parse((root / "backend/app/api/admin_api.py").read_text())
+        checked = 0
+        for node in ast.walk(api_tree):
+            if isinstance(node, ast.Call):
+                f = node.func
+                if (isinstance(f, ast.Attribute) and f.attr == "search_requests"
+                        and isinstance(f.value, ast.Name) and f.value.id == "crud"):
+                    passed = {kw.arg for kw in node.keywords if kw.arg}
+                    unknown = passed - sig_params
+                    assert not unknown, f"kwargs not in crud.search_requests: {unknown}"
+                    checked += 1
+        assert checked >= 1, "no crud.search_requests call found in admin_api.py"

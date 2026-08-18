@@ -1170,7 +1170,9 @@ async def search_audit(
         start_date=start_date,
         end_date=end_date,
         search_text=search_text,
-        skip=skip,
+        # search_requests moved to keyset/page pagination (88c457b); translate
+        # the endpoint's skip/limit contract: skip rounds down to a page boundary.
+        page=(skip // limit) + 1,
         limit=limit,
     )
 
