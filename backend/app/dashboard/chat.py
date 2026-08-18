@@ -299,16 +299,17 @@ def _build_llm_messages(messages_with_attachments, *, model_supports_multimodal:
                             "text": f"[Image omitted — model does not support multimodal input: {att.filename}]",
                         })
                         continue
-                    # Rebuild the path INLINE from clean components only — config
-                    # root + the sharded dir from the int att.id + the literal
-                    # suffix (the _sharded_path layout, inlined so the analyzer
-                    # sees the construction directly) — so no stored path string
-                    # reaches open().
+                    # Rebuild the path from clean components only — config root +
+                    # the sharded dir + literal suffix, derived from int(att.id).
+                    # The int() coercion is a path-traversal sanitizer (the id is
+                    # an integer PK and provably cannot carry a separator), so no
+                    # tainted value reaches open().
                     try:
+                        aid = int(att.id)
                         safe = os.path.join(
                             get_settings().chat_files_path,
-                            str(att.id % 1000),
-                            f"{att.id}.jpg",
+                            str(aid % 1000),
+                            f"{aid}.jpg",
                         )
                         with open(safe, "rb") as f:
                             img_bytes = f.read()
@@ -327,10 +328,11 @@ def _build_llm_messages(messages_with_attachments, *, model_supports_multimodal:
                     text = att.extracted_text
                     if not text and att.storage_path and not att.is_image:
                         try:
+                            aid = int(att.id)
                             safe = os.path.join(
                                 get_settings().chat_files_path,
-                                str(att.id % 1000),
-                                f"{att.id}_extracted.txt",
+                                str(aid % 1000),
+                                f"{aid}_extracted.txt",
                             )
                             with open(safe, "r", encoding="utf-8") as f:
                                 text = f.read()
