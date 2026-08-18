@@ -44,7 +44,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from backend.app.core.pathsafe import PathEscapeError, resolve_under, safe_key
+from backend.app.core.pathsafe import PathEscapeError, safe_key
 from backend.app.db import crud
 from backend.app.db.models import StoredResponse, StoredResponseStatus
 from backend.app.db.session import get_async_db_context
@@ -81,12 +81,15 @@ def _artifact_dir(rel_key: str, subdir: str = "responses_store") -> Path:
     if not rel_key:
         raise ValueError("empty artifact key")
     root = Path(get_settings().artifact_storage_path) / subdir
-    resolved = Path(resolve_under(root, rel_key))
-    # Must resolve strictly BELOW the store root, never to the root itself — so a
-    # key that collapses to root (e.g. '.') can never rmtree the whole store.
-    if resolved == root.resolve():
-        raise ValueError(f"artifact key resolves to the store root: {rel_key!r}")
-    return resolved
+    # Inline realpath + strictly-below-root containment (kept inline, not behind
+    # a helper, so the static analyzer recognizes it as a traversal sanitizer
+    # for the reinflate/offload callers). '== root' is rejected too, so a key
+    # that collapses to the store root can never rmtree the whole store.
+    target = (root / rel_key).resolve()
+    root_str = str(root.resolve())
+    if str(target) == root_str or not str(target).startswith(root_str + "/"):
+        raise ValueError(f"invalid artifact key path: {rel_key!r}")
+    return target
 
 
 def remove_artifacts(rel_key: str, subdir: str = "responses_store") -> None:
