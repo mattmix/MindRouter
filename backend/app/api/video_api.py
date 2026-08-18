@@ -32,7 +32,6 @@ from fastapi.responses import FileResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.api.auth import authenticate_request
-from backend.app.core.pathsafe import PathEscapeError, resolve_under
 from backend.app.core.telemetry.registry import get_registry
 from backend.app.db import crud
 from backend.app.db.models import (
@@ -594,20 +593,23 @@ async def get_video_content(
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Video is not ready yet")
 
     asset = await crud.get_video_asset(db, job.output_asset_id)
-    if not asset or not asset.storage_path or not os.path.exists(asset.storage_path):
+    if not asset:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Video file not found on disk"
         )
-    # Containment: only serve a file that resolves under the video storage root.
-    try:
-        safe_path = resolve_under(get_settings().video_storage_path, asset.storage_path)
-    except PathEscapeError:
+    # Reconstruct the served path from Snyk-clean components only — the config
+    # root, the integer user id, and os.path.basename() of the id — so no stored
+    # path string reaches FileResponse. Layout: <root>/<user_id>/<vid-uuid>.mp4.
+    safe_path = os.path.join(
+        get_settings().video_storage_path, str(user.id), f"{os.path.basename(video_id)}.mp4"
+    )
+    if not os.path.exists(safe_path):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Video file not found on disk"
         )
     return FileResponse(
         safe_path,
         media_type=asset.content_type or "video/mp4",
-        filename=f"{video_id}.mp4",
+        filename=f"{os.path.basename(video_id)}.mp4",
         headers={"Cache-Control": "private, max-age=86400"},
     )

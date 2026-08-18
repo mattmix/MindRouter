@@ -28,7 +28,6 @@ from backend.app.dashboard.routes import get_masquerade_user_id, get_session_use
 from backend.app.db import crud
 import os as _os
 
-from backend.app.core.pathsafe import PathEscapeError, resolve_under
 from backend.app.db.models import ApiKey, User, VideoJobStatus
 from backend.app.db.session import get_async_db
 from backend.app.settings import get_settings
@@ -360,12 +359,15 @@ async def video_serve(video_id: str, request: Request, db: AsyncSession = Depend
     if not job or job.output_asset_id is None:
         raise HTTPException(status_code=404, detail="Video not found")
     asset = await crud.get_video_asset(db, job.output_asset_id)
-    if not asset or not asset.storage_path or not os.path.exists(asset.storage_path):
+    if not asset:
         raise HTTPException(status_code=404, detail="Video file not found on disk")
-    # Containment: only serve a file that resolves under the video storage root.
-    try:
-        safe_path = resolve_under(get_settings().video_storage_path, asset.storage_path)
-    except PathEscapeError:
+    # Reconstruct the served path from Snyk-clean components only (config root +
+    # int user id + os.path.basename(id)) so no stored path string reaches
+    # FileResponse. Layout: <root>/<user_id>/<vid-uuid>.mp4.
+    safe_path = os.path.join(
+        get_settings().video_storage_path, str(user.id), f"{os.path.basename(video_id)}.mp4"
+    )
+    if not os.path.exists(safe_path):
         raise HTTPException(status_code=404, detail="Video file not found on disk")
     return FileResponse(
         safe_path,

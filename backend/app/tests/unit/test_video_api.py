@@ -460,19 +460,20 @@ async def test_content_file_missing_on_disk_404(monkeypatch):
 @pytest.mark.asyncio
 async def test_content_streams_file_response(monkeypatch, tmp_path):
     import os
-    # The served path must resolve under the video storage root (path-traversal
-    # containment, 2.9.24), so point the root at tmp_path and store the file
-    # beneath it.
-    user_dir = tmp_path / "1"
+    # 2.9.26 serves a path RECONSTRUCTED from clean components —
+    # <root>/<user.id>/<video_id>.mp4 (user id 7 from _auth, id 'vid-abc123') —
+    # never the stored path. Place the file at the reconstructed location.
+    user_dir = tmp_path / "7"
     user_dir.mkdir()
-    f = user_dir / "out.mp4"
+    f = user_dir / "vid-abc123.mp4"
     f.write_bytes(b"\x00\x00\x00\x18ftypmp42fakebytes")
     monkeypatch.setattr(_mod, "get_settings", lambda: SimpleNamespace(video_storage_path=str(tmp_path)))
     job = _job(status=_JS.COMPLETED, output_asset_id=5)
     monkeypatch.setattr(_mod.crud, "get_video_job_by_uuid", AsyncMock(return_value=job))
     monkeypatch.setattr(
         _mod.crud, "get_video_asset",
-        AsyncMock(return_value=SimpleNamespace(storage_path=str(f), content_type="video/mp4")),
+        # storage_path is deliberately bogus — reconstruction must ignore it.
+        AsyncMock(return_value=SimpleNamespace(storage_path="/not/used", content_type="video/mp4")),
     )
     resp = await get_video_content("vid-abc123", db=_db(), auth=_auth())
     # FileResponse streams from disk (Range/206 handled by starlette), never
@@ -484,24 +485,24 @@ async def test_content_streams_file_response(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_content_rejects_path_outside_root(monkeypatch, tmp_path):
-    # A stored path that resolves OUTSIDE the video root (traversal / bad
-    # relocation) must 404, not serve an arbitrary file — even though the file
-    # exists on disk. (2.9.24 path-traversal containment.)
-    outside = tmp_path / "outside" / "secret.mp4"
-    outside.parent.mkdir(parents=True)
-    outside.write_bytes(b"secret")
+async def test_content_traversal_video_id_neutralized(monkeypatch, tmp_path):
+    # A traversal video_id is neutralized by os.path.basename() in the
+    # reconstructed path, so it can never read a file outside <root>/<user>/ —
+    # even when the DB lookup is mocked to return a job. (2.9.26 reconstruction.)
     root = tmp_path / "video"
-    root.mkdir()
+    (root / "7").mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "passwd.mp4").write_bytes(b"secret")  # must NOT be served
     monkeypatch.setattr(_mod, "get_settings", lambda: SimpleNamespace(video_storage_path=str(root)))
     job = _job(status=_JS.COMPLETED, output_asset_id=5)
     monkeypatch.setattr(_mod.crud, "get_video_job_by_uuid", AsyncMock(return_value=job))
     monkeypatch.setattr(
         _mod.crud, "get_video_asset",
-        AsyncMock(return_value=SimpleNamespace(storage_path=str(outside), content_type="video/mp4")),
+        AsyncMock(return_value=SimpleNamespace(storage_path="/x", content_type="video/mp4")),
     )
     with pytest.raises(HTTPException) as e:
-        await get_video_content("vid-abc123", db=_db(), auth=_auth())
+        await get_video_content("../outside/passwd", db=_db(), auth=_auth())
     assert e.value.status_code == 404
 
 
