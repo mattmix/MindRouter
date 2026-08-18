@@ -299,9 +299,15 @@ def _build_llm_messages(messages_with_attachments, *, model_supports_multimodal:
                             "text": f"[Image omitted — model does not support multimodal input: {att.filename}]",
                         })
                         continue
-                    # Read processed image from filesystem (contained under root)
+                    # Rebuild the path from clean components — config root, the
+                    # sharded dir from the int att.id, and os.path.basename() of
+                    # the stored name — so no stored path string reaches open().
                     try:
-                        safe = resolve_under(get_settings().chat_files_path, att.storage_path)
+                        safe = os.path.join(
+                            get_settings().chat_files_path,
+                            str(att.id % 1000),
+                            os.path.basename(att.storage_path),
+                        )
                         with open(safe, "rb") as f:
                             img_bytes = f.read()
                         b64 = base64.b64encode(img_bytes).decode("utf-8")
@@ -311,18 +317,22 @@ def _build_llm_messages(messages_with_attachments, *, model_supports_multimodal:
                                 "url": f"data:image/jpeg;base64,{b64}",
                             },
                         })
-                    except (OSError, IOError, PathEscapeError):
-                        # File missing or outside the storage root — skip
+                    except (OSError, IOError):
+                        # File missing — skip
                         pass
                 elif att.extracted_text or att.storage_path:
                     # Read extracted text from filesystem (new) or DB (legacy)
                     text = att.extracted_text
                     if not text and att.storage_path and not att.is_image:
                         try:
-                            safe = resolve_under(get_settings().chat_files_path, att.storage_path)
+                            safe = os.path.join(
+                                get_settings().chat_files_path,
+                                str(att.id % 1000),
+                                os.path.basename(att.storage_path),
+                            )
                             with open(safe, "r", encoding="utf-8") as f:
                                 text = f.read()
-                        except (OSError, IOError, PathEscapeError):
+                        except (OSError, IOError):
                             text = None
                     if text:
                         content_blocks.append({
@@ -745,7 +755,7 @@ async def chat_upload(
                                 ocr_result = await perform_ocr(
                                     file_bytes=file_bytes,
                                     content_type="application/pdf",
-                                    filename=filename,
+                                    filename=os.path.basename(filename),
                                     model=ocr_config["model"],
                                     output_format="markdown",
                                     chunk_size=ocr_config["chunk_size"],
