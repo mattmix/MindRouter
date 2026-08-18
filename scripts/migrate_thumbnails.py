@@ -66,7 +66,10 @@ def main():
         print(f"Found {total} attachments to migrate")
 
         for row in rows:
-            att_id = row.id
+            # id is an integer PK; int() coercion clears the Snyk
+            # path-traversal source (2.9.31 pattern), % 1000 sharding below
+            # proves it is numeric anyway.
+            att_id = int(row.id)
             b64_data = row.thumbnail_base64
 
             try:
