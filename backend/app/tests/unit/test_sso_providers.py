@@ -349,7 +349,9 @@ def _profile(sso, **kw):
 
 
 def _run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
+    # asyncio.run, not get_event_loop().run_until_complete: Python 3.12 raises
+    # RuntimeError from get_event_loop() when no loop exists in the thread.
+    return asyncio.run(coro)
 
 
 def test_jit_existing_by_subject_updates(sso):

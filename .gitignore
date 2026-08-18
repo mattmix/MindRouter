@@ -145,3 +145,4 @@ bench_results/
 # Security remediation deliverables (keep local — never commit)
 REMEDIATION_PLAN_*.md
 snyk-remediation-plan.*
+base-image-eval-2026-08-18.txt
