@@ -299,15 +299,11 @@ def _build_llm_messages(messages_with_attachments, *, model_supports_multimodal:
                             "text": f"[Image omitted — model does not support multimodal input: {att.filename}]",
                         })
                         continue
-                    # Rebuild the path from clean components — config root, the
-                    # sharded dir from the int att.id, and os.path.basename() of
-                    # the stored name — so no stored path string reaches open().
+                    # Rebuild the path from clean components only — the same
+                    # _sharded_path(config root, int att.id, literal suffix) that
+                    # wrote it — so no stored path string reaches open().
                     try:
-                        safe = os.path.join(
-                            get_settings().chat_files_path,
-                            str(att.id % 1000),
-                            os.path.basename(att.storage_path),
-                        )
+                        safe = _sharded_path(get_settings().chat_files_path, att.id, ".jpg")
                         with open(safe, "rb") as f:
                             img_bytes = f.read()
                         b64 = base64.b64encode(img_bytes).decode("utf-8")
@@ -325,10 +321,8 @@ def _build_llm_messages(messages_with_attachments, *, model_supports_multimodal:
                     text = att.extracted_text
                     if not text and att.storage_path and not att.is_image:
                         try:
-                            safe = os.path.join(
-                                get_settings().chat_files_path,
-                                str(att.id % 1000),
-                                os.path.basename(att.storage_path),
+                            safe = _sharded_path(
+                                get_settings().chat_files_path, att.id, "_extracted.txt"
                             )
                             with open(safe, "r", encoding="utf-8") as f:
                                 text = f.read()
