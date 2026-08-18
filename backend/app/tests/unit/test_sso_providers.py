@@ -282,14 +282,40 @@ def test_oidc_absolute_redirect_uri_uses_public_base_url(sso):
     assert f(req, "https://other.example/cb") == "https://other.example/cb"
 
 
-def test_oidc_redirect_uri_falls_back_to_forwarded_proto(sso):
+def test_public_base_url_fails_closed_and_ignores_host(sso):
+    """public_base_url returns the configured origin and NEVER trusts request
+    headers; when APP_BASE_URL is empty it raises SSOConfigError. (2.9.24)"""
+    base = sso["base"]
+    req = MagicMock()
+    req.headers = {"host": "attacker.example", "x-forwarded-host": "attacker.example"}
+    req.url.netloc = "attacker.example"
+    # Configured -> returns it, trailing slash stripped, headers ignored.
+    _use(FakeSettings(app_base_url="https://mr.example.edu/"))
+    assert base.public_base_url(req) == "https://mr.example.edu"
+    # Unset -> fail closed (no Host fallback).
+    _use(FakeSettings(app_base_url=""))
+    with pytest.raises(base.SSOConfigError):
+        base.public_base_url(req)
+
+
+def test_oidc_redirect_uri_fails_closed_without_app_base_url(sso):
+    # Empty app_base_url must NOT fall back to the attacker-controllable Host /
+    # X-Forwarded-* headers — it fails closed (SSOConfigError), which begin_login
+    # turns into an error redirect. (2.9.24 SSO redirect hardening.)
     _use(FakeSettings(app_base_url=""))
     req = MagicMock()
     req.url.scheme = "http"
     req.url.netloc = "internal:8000"
     req.headers = {"x-forwarded-proto": "https", "host": "mr.example.edu"}
+    with pytest.raises(sso["base"].SSOConfigError):
+        sso["oidc"]._absolute_redirect_uri(req, "/login/oidc/authorized")
+    # With app_base_url set it resolves against the configured origin, ignoring
+    # the request headers entirely.
+    _use(FakeSettings(app_base_url="https://mr.example.edu"))
     assert sso["oidc"]._absolute_redirect_uri(req, "/login/oidc/authorized") == \
         "https://mr.example.edu/login/oidc/authorized"
+    # An already-absolute redirect_uri is returned unchanged.
+    assert sso["oidc"]._absolute_redirect_uri(req, "https://x/y") == "https://x/y"
 
 
 def test_generic_config_strips_trailing_slash(sso):

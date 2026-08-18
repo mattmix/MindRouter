@@ -31,6 +31,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.core.canonical_schemas import CanonicalModelInfo
 from backend.app.core.latex_normalize import normalize_latex
+from backend.app.core.pathsafe import PathEscapeError, resolve_under
 from backend.app.core.telemetry.registry import get_registry
 from backend.app.core.translators.openai_in import OpenAIInTranslator
 from backend.app.db import crud
@@ -298,9 +299,10 @@ def _build_llm_messages(messages_with_attachments, *, model_supports_multimodal:
                             "text": f"[Image omitted — model does not support multimodal input: {att.filename}]",
                         })
                         continue
-                    # Read processed image from filesystem
+                    # Read processed image from filesystem (contained under root)
                     try:
-                        with open(att.storage_path, "rb") as f:
+                        safe = resolve_under(get_settings().chat_files_path, att.storage_path)
+                        with open(safe, "rb") as f:
                             img_bytes = f.read()
                         b64 = base64.b64encode(img_bytes).decode("utf-8")
                         content_blocks.append({
@@ -309,17 +311,18 @@ def _build_llm_messages(messages_with_attachments, *, model_supports_multimodal:
                                 "url": f"data:image/jpeg;base64,{b64}",
                             },
                         })
-                    except (OSError, IOError):
-                        # File missing — skip
+                    except (OSError, IOError, PathEscapeError):
+                        # File missing or outside the storage root — skip
                         pass
                 elif att.extracted_text or att.storage_path:
                     # Read extracted text from filesystem (new) or DB (legacy)
                     text = att.extracted_text
                     if not text and att.storage_path and not att.is_image:
                         try:
-                            with open(att.storage_path, "r", encoding="utf-8") as f:
+                            safe = resolve_under(get_settings().chat_files_path, att.storage_path)
+                            with open(safe, "r", encoding="utf-8") as f:
                                 text = f.read()
-                        except (OSError, IOError):
+                        except (OSError, IOError, PathEscapeError):
                             text = None
                     if text:
                         content_blocks.append({
@@ -864,7 +867,12 @@ async def serve_medium_thumbnail(
         else:
             raise HTTPException(status_code=404, detail="Image file not found")
 
-    return FileResponse(medium_path, media_type="image/jpeg")
+    # Containment: only serve a file that resolves under the chat storage root.
+    try:
+        safe_medium = resolve_under(settings.chat_files_path, medium_path)
+    except PathEscapeError:
+        raise HTTPException(status_code=404, detail="Image file not found")
+    return FileResponse(safe_medium, media_type="image/jpeg")
 
 
 # ---------------------------------------------------------------------------
@@ -887,9 +895,13 @@ async def serve_thumbnail(
     if not att:
         raise HTTPException(status_code=404, detail="Attachment not found")
 
-    # Serve filesystem thumbnail
+    # Serve filesystem thumbnail (contained under the chat storage root)
     if att.thumbnail_path and os.path.exists(att.thumbnail_path):
-        return FileResponse(att.thumbnail_path, media_type="image/png")
+        try:
+            safe_thumb = resolve_under(get_settings().chat_files_path, att.thumbnail_path)
+        except PathEscapeError:
+            raise HTTPException(status_code=404, detail="Thumbnail not found")
+        return FileResponse(safe_thumb, media_type="image/png")
 
     raise HTTPException(status_code=404, detail="Thumbnail not found")
 
@@ -964,8 +976,9 @@ async def chat_completions(
                     total_attachment_chars += len(att.extracted_text)
                 elif att.storage_path:
                     try:
-                        total_attachment_chars += os.path.getsize(att.storage_path)
-                    except OSError:
+                        safe = resolve_under(get_settings().chat_files_path, att.storage_path)
+                        total_attachment_chars += os.path.getsize(safe)
+                    except (OSError, PathEscapeError):
                         pass
 
         if total_attachment_chars > 0:

@@ -28,6 +28,7 @@ import re
 import secrets
 from typing import Any, Optional
 
+from backend.app.core.pathsafe import PathEscapeError, resolve_under
 from backend.app.db import crud
 from backend.app.db.session import get_async_db_context
 from backend.app.logging_config import get_logger
@@ -393,13 +394,14 @@ def _ensure_storage_dir() -> str:
 def asset_path(filename: str) -> Optional[str]:
     """Resolve a stored asset filename to an absolute path, guarding traversal.
 
-    Returns None if the name is unsafe or the file does not exist.
+    Returns None if the name is unsafe or the file does not exist. Uses
+    realpath containment (symlink-safe) under the branding storage root.
     """
     if not filename or "/" in filename or "\\" in filename or filename.startswith("."):
         return None
-    d = storage_dir()
-    full = os.path.abspath(os.path.join(d, filename))
-    if os.path.dirname(full) != os.path.abspath(d):
+    try:
+        full = resolve_under(storage_dir(), filename)
+    except PathEscapeError:
         return None
     if not os.path.isfile(full):
         return None

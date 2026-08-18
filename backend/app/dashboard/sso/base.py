@@ -68,6 +68,39 @@ def validate_state(query_state: Optional[str], cookie_state: Optional[str]) -> b
         return False
 
 
+class SSOConfigError(Exception):
+    """SSO cannot proceed because required deployment configuration is absent.
+
+    Raised by :func:`public_base_url` when ``app_base_url`` is unset. Provider
+    drivers catch it and return a login redirect with an error banner rather
+    than letting it surface as a bare 500 at the IdP callback.
+    """
+
+
+def public_base_url(request=None) -> str:
+    """Return this deployment's public base URL (``scheme://host``, no trailing
+    slash), FAILING CLOSED when it is not configured.
+
+    The IdP ``redirect_uri``, the SAML Destination/Recipient/ACS URL, and SP
+    metadata must all match one externally-visible origin exactly. Deriving that
+    origin from request headers (``Host`` / ``X-Forwarded-*``) is attacker-
+    controllable — a spoofed ``Host`` would mint a redirect pointing at a host
+    the attacker chose — so this reads only the operator-set ``app_base_url``
+    and refuses the login when it is empty rather than trusting the request.
+
+    ``request`` is accepted for call-site symmetry but is deliberately NOT
+    consulted: there is no safe header-derived fallback here.
+    """
+    base = (get_settings().app_base_url or "").rstrip("/")
+    if base:
+        return base
+    logger.error(
+        "sso_app_base_url_missing",
+        note="set APP_BASE_URL to the public https origin; SSO redirect_uri / ACS / metadata must match it exactly",
+    )
+    raise SSOConfigError("app_base_url is not configured")
+
+
 async def find_or_create_sso_user(
     db: AsyncSession,
     profile: SSOProfile,

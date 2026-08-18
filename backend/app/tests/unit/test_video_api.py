@@ -27,6 +27,17 @@ import pytest
 from fastapi import HTTPException
 
 _api_dir = Path(__file__).resolve().parents[2] / "api"
+_core_dir = Path(__file__).resolve().parents[2] / "core"
+
+# Load the REAL, dependency-free pathsafe (only imports os/re) so video_api's
+# `from backend.app.core.pathsafe import ...` resolves to genuine containment
+# behavior even though backend.app.core is stubbed below (self-contained; not
+# reliant on another test importing it first).
+_ps_spec = importlib.util.spec_from_file_location(
+    "backend.app.core.pathsafe", _core_dir / "pathsafe.py"
+)
+_pathsafe = importlib.util.module_from_spec(_ps_spec)
+_ps_spec.loader.exec_module(_pathsafe)
 
 
 class _JS:
@@ -54,12 +65,16 @@ _STUBS = {
     "backend.app.api": MagicMock(),
     "backend.app.api.auth": MagicMock(),
     "backend.app.core": MagicMock(),
+    "backend.app.core.pathsafe": _pathsafe,
     "backend.app.core.telemetry": MagicMock(),
     "backend.app.core.telemetry.registry": MagicMock(),
     "backend.app.db": MagicMock(),
     "backend.app.db.crud": MagicMock(),
     "backend.app.db.session": MagicMock(),
     "backend.app.db.models": _models_stub,
+    "backend.app.settings": MagicMock(
+        get_settings=MagicMock(return_value=SimpleNamespace(video_storage_path="/data/video")),
+    ),
     "backend.app.logging_config": MagicMock(
         get_logger=MagicMock(return_value=MagicMock()),
         bind_request_context=MagicMock(),
@@ -444,8 +459,15 @@ async def test_content_file_missing_on_disk_404(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_content_streams_file_response(monkeypatch, tmp_path):
-    f = tmp_path / "out.mp4"
+    import os
+    # The served path must resolve under the video storage root (path-traversal
+    # containment, 2.9.24), so point the root at tmp_path and store the file
+    # beneath it.
+    user_dir = tmp_path / "1"
+    user_dir.mkdir()
+    f = user_dir / "out.mp4"
     f.write_bytes(b"\x00\x00\x00\x18ftypmp42fakebytes")
+    monkeypatch.setattr(_mod, "get_settings", lambda: SimpleNamespace(video_storage_path=str(tmp_path)))
     job = _job(status=_JS.COMPLETED, output_asset_id=5)
     monkeypatch.setattr(_mod.crud, "get_video_job_by_uuid", AsyncMock(return_value=job))
     monkeypatch.setattr(
@@ -457,8 +479,30 @@ async def test_content_streams_file_response(monkeypatch, tmp_path):
     # loading the whole file into a single in-memory Response.
     from fastapi.responses import FileResponse
     assert isinstance(resp, FileResponse)
-    assert resp.path == str(f)
+    assert os.path.realpath(resp.path) == os.path.realpath(str(f))
     assert resp.media_type == "video/mp4"
+
+
+@pytest.mark.asyncio
+async def test_content_rejects_path_outside_root(monkeypatch, tmp_path):
+    # A stored path that resolves OUTSIDE the video root (traversal / bad
+    # relocation) must 404, not serve an arbitrary file — even though the file
+    # exists on disk. (2.9.24 path-traversal containment.)
+    outside = tmp_path / "outside" / "secret.mp4"
+    outside.parent.mkdir(parents=True)
+    outside.write_bytes(b"secret")
+    root = tmp_path / "video"
+    root.mkdir()
+    monkeypatch.setattr(_mod, "get_settings", lambda: SimpleNamespace(video_storage_path=str(root)))
+    job = _job(status=_JS.COMPLETED, output_asset_id=5)
+    monkeypatch.setattr(_mod.crud, "get_video_job_by_uuid", AsyncMock(return_value=job))
+    monkeypatch.setattr(
+        _mod.crud, "get_video_asset",
+        AsyncMock(return_value=SimpleNamespace(storage_path=str(outside), content_type="video/mp4")),
+    )
+    with pytest.raises(HTTPException) as e:
+        await get_video_content("vid-abc123", db=_db(), auth=_auth())
+    assert e.value.status_code == 404
 
 
 @pytest.mark.asyncio

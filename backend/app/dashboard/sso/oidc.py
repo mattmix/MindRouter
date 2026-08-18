@@ -26,10 +26,12 @@ from fastapi import Request
 from fastapi.responses import RedirectResponse
 
 from backend.app.dashboard.sso.base import (
+    SSOConfigError,
     SSOProfile,
     find_or_create_sso_user,
     finish_login,
     new_signed_state,
+    public_base_url,
     validate_state,
 )
 from backend.app.logging_config import get_logger
@@ -98,12 +100,10 @@ def _absolute_redirect_uri(request: Request, redirect_uri: str) -> str:
     """
     if redirect_uri.startswith("http://") or redirect_uri.startswith("https://"):
         return redirect_uri
-    base = (get_settings().app_base_url or "").rstrip("/")
-    if not base:
-        proto = request.headers.get("x-forwarded-proto", request.url.scheme)
-        host = request.headers.get("host", request.url.netloc)
-        base = f"{proto}://{host}"
-    return base + redirect_uri
+    # Fail closed on the configured public base URL; never derive it from the
+    # attacker-controllable Host / X-Forwarded-* headers (raises SSOConfigError
+    # when APP_BASE_URL is unset — begin_login turns it into an error redirect).
+    return public_base_url(request) + redirect_uri
 
 
 async def discover(issuer: str) -> Optional[dict]:
@@ -138,10 +138,14 @@ async def begin_login(request: Request, cfg: OIDCConfig):
         return RedirectResponse(url="/login?error=SSO+provider+discovery+failed", status_code=302)
 
     signed_state = new_signed_state()
+    try:
+        redirect_uri = _absolute_redirect_uri(request, cfg.redirect_uri)
+    except SSOConfigError:
+        return RedirectResponse(url="/login?error=SSO+is+misconfigured", status_code=302)
     params = {
         "client_id": cfg.client_id,
         "response_type": "code",
-        "redirect_uri": _absolute_redirect_uri(request, cfg.redirect_uri),
+        "redirect_uri": redirect_uri,
         "scope": cfg.scopes,
         "state": signed_state,
     }
@@ -185,11 +189,15 @@ async def handle_callback(
     if not meta:
         return RedirectResponse(url="/login?error=SSO+provider+discovery+failed", status_code=302)
 
+    try:
+        callback_redirect_uri = _absolute_redirect_uri(request, cfg.redirect_uri)
+    except SSOConfigError:
+        return RedirectResponse(url="/login?error=SSO+is+misconfigured", status_code=302)
     token_data = {
         "client_id": cfg.client_id,
         "client_secret": cfg.client_secret,
         "code": code,
-        "redirect_uri": _absolute_redirect_uri(request, cfg.redirect_uri),
+        "redirect_uri": callback_redirect_uri,
         "grant_type": "authorization_code",
     }
     async with httpx.AsyncClient(timeout=15.0) as client:

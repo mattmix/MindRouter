@@ -28,6 +28,7 @@ from backend.app.dashboard.routes import get_masquerade_user_id, get_session_use
 from backend.app.db import crud
 import os as _os
 
+from backend.app.core.pathsafe import PathEscapeError, resolve_under
 from backend.app.db.models import ApiKey, User, VideoJobStatus
 from backend.app.db.session import get_async_db
 from backend.app.settings import get_settings
@@ -361,8 +362,13 @@ async def video_serve(video_id: str, request: Request, db: AsyncSession = Depend
     asset = await crud.get_video_asset(db, job.output_asset_id)
     if not asset or not asset.storage_path or not os.path.exists(asset.storage_path):
         raise HTTPException(status_code=404, detail="Video file not found on disk")
+    # Containment: only serve a file that resolves under the video storage root.
+    try:
+        safe_path = resolve_under(get_settings().video_storage_path, asset.storage_path)
+    except PathEscapeError:
+        raise HTTPException(status_code=404, detail="Video file not found on disk")
     return FileResponse(
-        asset.storage_path,
+        safe_path,
         media_type=asset.content_type or "video/mp4",
         headers={"Cache-Control": "private, max-age=86400"},
     )

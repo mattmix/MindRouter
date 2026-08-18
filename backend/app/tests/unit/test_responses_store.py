@@ -127,6 +127,21 @@ class TestStampItemIds:
         items = _mod.stamp_item_ids([{"type": "message", "id": "msg_keep"}])
         assert items[0]["id"] == "msg_keep"
 
+    def test_restamps_unsafe_ids(self):
+        # A client-supplied id that could traverse the artifact key
+        # (<conv_id>/<item_id>) is replaced with a fresh server id; a plain
+        # valid id is kept. (2.9.24 cross-tenant traversal fix.)
+        items = _mod.stamp_item_ids([
+            {"type": "message", "id": "../conv_victim/msg_x"},
+            {"type": "message", "id": "a/b"},
+            {"type": "message", "id": ".."},
+            {"type": "message", "id": "msg_ok-1.v2"},
+        ])
+        assert items[0]["id"].startswith("msg_") and "/" not in items[0]["id"]
+        assert items[1]["id"].startswith("msg_") and "/" not in items[1]["id"]
+        assert items[2]["id"].startswith("msg_") and items[2]["id"] != ".."
+        assert items[3]["id"] == "msg_ok-1.v2"  # safe id preserved
+
 
 class TestImageOffload:
     def test_offload_and_reinflate_round_trip(self, tmp_path):

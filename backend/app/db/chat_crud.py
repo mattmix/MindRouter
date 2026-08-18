@@ -24,7 +24,9 @@ from sqlalchemy.orm import selectinload
 
 from sqlalchemy import func
 
+from backend.app.core.pathsafe import PathEscapeError, resolve_under
 from backend.app.db.models import ChatAttachment, ChatConversation, ChatMessage, User
+from backend.app.settings import get_settings
 
 
 # ---------------------------------------------------------------------------
@@ -179,12 +181,14 @@ async def delete_conversation(
     await db.delete(conv)
     await db.flush()
 
-    # Clean up files from filesystem
+    # Clean up files from filesystem (only paths contained under the root)
+    chat_root = get_settings().chat_files_path
     for path in file_paths:
         try:
-            if os.path.exists(path):
-                os.remove(path)
-        except OSError:
+            safe = resolve_under(chat_root, path)
+            if os.path.exists(safe):
+                os.remove(safe)
+        except (OSError, PathEscapeError):
             pass
 
     return True
@@ -296,26 +300,14 @@ async def delete_orphan_attachments(
     )
     orphans = list(result.scalars().all())
 
+    chat_root = get_settings().chat_files_path
     for att in orphans:
         if att.storage_path:
-            try:
-                if os.path.exists(att.storage_path):
-                    os.remove(att.storage_path)
-            except OSError:
-                pass
+            _safe_unlink(chat_root, att.storage_path)
             # Also remove medium thumbnail if it exists
-            medium = att.storage_path.replace('.jpg', '_medium.jpg')
-            try:
-                if os.path.exists(medium):
-                    os.remove(medium)
-            except OSError:
-                pass
+            _safe_unlink(chat_root, att.storage_path.replace('.jpg', '_medium.jpg'))
         if att.thumbnail_path:
-            try:
-                if os.path.exists(att.thumbnail_path):
-                    os.remove(att.thumbnail_path)
-            except OSError:
-                pass
+            _safe_unlink(chat_root, att.thumbnail_path)
 
     if orphans:
         await db.execute(
@@ -368,21 +360,26 @@ async def delete_all_orphan_attachments(
     return len(orphans)
 
 
+def _safe_unlink(root: str, path: Optional[str]) -> None:
+    """Delete a file only if it resolves under ``root`` (path-traversal safe)."""
+    if not path:
+        return
+    try:
+        safe = resolve_under(root, path)
+        if os.path.exists(safe):
+            os.remove(safe)
+    except (OSError, PathEscapeError):
+        pass
+
+
 def _remove_attachment_files(att: ChatAttachment) -> None:
-    """Remove all filesystem files for an attachment."""
+    """Remove all filesystem files for an attachment (contained under root)."""
+    chat_root = get_settings().chat_files_path
     if att.storage_path:
-        for path in [att.storage_path, att.storage_path.replace('.jpg', '_medium.jpg')]:
-            try:
-                if os.path.exists(path):
-                    os.remove(path)
-            except OSError:
-                pass
+        _safe_unlink(chat_root, att.storage_path)
+        _safe_unlink(chat_root, att.storage_path.replace('.jpg', '_medium.jpg'))
     if att.thumbnail_path:
-        try:
-            if os.path.exists(att.thumbnail_path):
-                os.remove(att.thumbnail_path)
-        except OSError:
-            pass
+        _safe_unlink(chat_root, att.thumbnail_path)
 
 
 # ---------------------------------------------------------------------------

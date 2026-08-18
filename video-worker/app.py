@@ -15,6 +15,7 @@
 """FastAPI application for the video worker."""
 
 import hmac
+import os
 from contextlib import asynccontextmanager
 from typing import Optional
 
@@ -148,8 +149,15 @@ def create_app(config: WorkerConfig | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail="job not found")
         if job.status != "completed" or not job.output_path:
             raise HTTPException(status_code=409, detail="job not completed")
+        # Containment: only serve a file that resolves under the worker's output
+        # dir (job.output_path is always <output_dir>/<uuid>.mp4, but never trust
+        # a stored path blindly).
+        out_dir = os.path.realpath(app.state.config.output_dir)
+        real = os.path.realpath(job.output_path)
+        if real != out_dir and not real.startswith(out_dir + os.sep):
+            raise HTTPException(status_code=404, detail="job not found")
         # FileResponse (starlette) serves Accept-Ranges + 206 partial content.
-        return FileResponse(job.output_path, media_type="video/mp4", filename=f"{job_id}.mp4")
+        return FileResponse(real, media_type="video/mp4", filename=f"{job_id}.mp4")
 
     @app.delete("/v1/videos/{job_id}", dependencies=guarded)
     async def cancel(job_id: str):

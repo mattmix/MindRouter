@@ -44,6 +44,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from backend.app.core.pathsafe import PathEscapeError, resolve_under, safe_key
 from backend.app.db import crud
 from backend.app.db.models import StoredResponse, StoredResponseStatus
 from backend.app.db.session import get_async_db_context
@@ -77,11 +78,15 @@ def _artifact_dir(rel_key: str, subdir: str = "responses_store") -> Path:
     Keys are always server-generated, but validate anyway so a crafted
     id can never traverse outside the store root.
     """
+    if not rel_key:
+        raise ValueError("empty artifact key")
     root = Path(get_settings().artifact_storage_path) / subdir
-    target = (root / rel_key).resolve()
-    if not str(target).startswith(str(root.resolve()) + "/"):
-        raise ValueError(f"invalid artifact key path: {rel_key!r}")
-    return target
+    resolved = Path(resolve_under(root, rel_key))
+    # Must resolve strictly BELOW the store root, never to the root itself — so a
+    # key that collapses to root (e.g. '.') can never rmtree the whole store.
+    if resolved == root.resolve():
+        raise ValueError(f"artifact key resolves to the store root: {rel_key!r}")
+    return resolved
 
 
 def remove_artifacts(rel_key: str, subdir: str = "responses_store") -> None:
@@ -99,13 +104,33 @@ def remove_artifacts(rel_key: str, subdir: str = "responses_store") -> None:
 # Item id stamping + image offload
 # ---------------------------------------------------------------------------
 
+def _is_safe_item_id(value: Any) -> bool:
+    """True if an item id is a single safe path segment (see pathsafe.safe_key).
+
+    Item ids are concatenated into artifact directory keys
+    (``<conv_id>/<item_id>``), so a client-supplied id containing ``/`` or
+    ``..`` could otherwise redirect reads/writes into another conversation's
+    directory. Such ids are re-stamped with a fresh server id below.
+    """
+    try:
+        safe_key(value)
+        return True
+    except PathEscapeError:
+        return False
+
+
 def stamp_item_ids(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Ensure every item has a stable id (used by input_items pagination
-    and item_reference resolution)."""
+    """Ensure every item has a stable, path-safe id (used by input_items
+    pagination, item_reference resolution, and artifact directory keys).
+
+    A missing id OR a client-supplied id that is not a safe single path
+    segment is replaced with a freshly minted server id, so an item id can
+    never introduce a path separator or traversal segment.
+    """
     stamped = []
     for item in items:
         item = dict(item)
-        if not item.get("id"):
+        if not _is_safe_item_id(item.get("id")):
             item_type = item.get("type") or ("message" if "role" in item else "item")
             prefix = _ID_PREFIX_BY_TYPE.get(item_type, "item")
             item["id"] = f"{prefix}_{uuid.uuid4().hex}"

@@ -16,6 +16,7 @@
 
 import base64
 import json
+import os
 import time
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
@@ -573,7 +574,7 @@ async def ocr(
         result = await perform_ocr(
             file_bytes=file_bytes,
             content_type=content_type,
-            filename=file.filename or "document",
+            filename=os.path.basename(file.filename or "document"),
             model=model,
             output_format=output_format,
             chunk_size=chunk_size,
@@ -675,7 +676,7 @@ async def ocrmd(
         result = await perform_ocr(
             file_bytes=file_bytes,
             content_type=content_type,
-            filename=file.filename or "document",
+            filename=os.path.basename(file.filename or "document"),
             model=model,
             output_format="markdown",
             chunk_size=chunk_size,

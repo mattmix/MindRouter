@@ -585,7 +585,14 @@ async def delete_user(db: AsyncSession, user_id: int) -> bool:
     """
     from backend.app.db.models import ChatAttachment, ChatConversation, ChatMessage
 
-    file_paths: list[str] = []
+    # (path, containment root) — each file is unlinked only if it resolves under
+    # its declared storage root (chat vs video), never blindly by stored path.
+    from backend.app.core.pathsafe import PathEscapeError, resolve_under
+    from backend.app.settings import get_settings as _get_settings
+    _settings = _get_settings()
+    _chat_root = _settings.chat_files_path
+    _video_root = _settings.video_storage_path
+    file_paths: list[tuple[str, str]] = []
 
     # --- Chat (conversations -> messages -> attachments + files) ---
     conv_result = await db.execute(
@@ -597,10 +604,10 @@ async def delete_user(db: AsyncSession, user_id: int) -> bool:
     )
     for att in att_result.scalars().all():
         if att.storage_path:
-            file_paths.append(att.storage_path)
-            file_paths.append(att.storage_path.replace(".jpg", "_medium.jpg"))
+            file_paths.append((att.storage_path, _chat_root))
+            file_paths.append((att.storage_path.replace(".jpg", "_medium.jpg"), _chat_root))
         if att.thumbnail_path:
-            file_paths.append(att.thumbnail_path)
+            file_paths.append((att.thumbnail_path, _chat_root))
     await db.execute(delete(ChatAttachment).where(ChatAttachment.user_id == user_id))
     if conv_ids:
         await db.execute(
@@ -618,9 +625,9 @@ async def delete_user(db: AsyncSession, user_id: int) -> bool:
     )
     for storage_path, poster_path in asset_result.all():
         if storage_path:
-            file_paths.append(storage_path)
+            file_paths.append((storage_path, _video_root))
         if poster_path:
-            file_paths.append(poster_path)
+            file_paths.append((poster_path, _video_root))
     job_result = await db.execute(
         select(VideoJob.id).where(VideoJob.user_id == user_id)
     )
@@ -755,11 +762,12 @@ async def delete_user(db: AsyncSession, user_id: int) -> bool:
         # Best-effort file cleanup once the DB deletes have flushed.
         import os
 
-        for path in file_paths:
+        for path, root in file_paths:
             try:
-                if path and os.path.exists(path):
-                    os.remove(path)
-            except OSError:
+                safe = resolve_under(root, path)
+                if os.path.exists(safe):
+                    os.remove(safe)
+            except (OSError, PathEscapeError):
                 pass
         if image_storage_paths:
             from backend.app.storage.artifacts import get_artifact_storage
@@ -5443,10 +5451,19 @@ async def delete_video_job(db: AsyncSession, job: VideoJob) -> list[str]:
         for aid in (s.output_asset_id, s.first_frame_asset_id, s.last_frame_asset_id, s.source_asset_id):
             if aid:
                 asset_ids.add(aid)
+    # Only return on-disk paths that resolve under the video storage root; a
+    # relocated/legacy path outside it is skipped (file orphaned, but the DB
+    # rows + quota are still cleaned up below).
+    from backend.app.core.pathsafe import PathEscapeError, resolve_under
+    from backend.app.settings import get_settings
+    video_root = get_settings().video_storage_path
     for aid in asset_ids:
         a = await get_video_asset(db, aid)
         if a and a.storage_path:
-            paths.append(a.storage_path)
+            try:
+                paths.append(resolve_under(video_root, a.storage_path))
+            except PathEscapeError:
+                pass
 
     project_id = job.project_id
     job_id = job.id

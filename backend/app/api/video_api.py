@@ -32,6 +32,7 @@ from fastapi.responses import FileResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.api.auth import authenticate_request
+from backend.app.core.pathsafe import PathEscapeError, resolve_under
 from backend.app.core.telemetry.registry import get_registry
 from backend.app.db import crud
 from backend.app.db.models import (
@@ -44,6 +45,7 @@ from backend.app.db.models import (
 )
 from backend.app.db.session import get_async_db
 from backend.app.logging_config import bind_request_context, get_logger
+from backend.app.settings import get_settings
 
 router = APIRouter(prefix="/v1", tags=["video"])
 logger = get_logger(__name__)
@@ -596,8 +598,15 @@ async def get_video_content(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Video file not found on disk"
         )
+    # Containment: only serve a file that resolves under the video storage root.
+    try:
+        safe_path = resolve_under(get_settings().video_storage_path, asset.storage_path)
+    except PathEscapeError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Video file not found on disk"
+        )
     return FileResponse(
-        asset.storage_path,
+        safe_path,
         media_type=asset.content_type or "video/mp4",
         filename=f"{video_id}.mp4",
         headers={"Cache-Control": "private, max-age=86400"},

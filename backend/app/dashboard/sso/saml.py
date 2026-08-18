@@ -31,9 +31,11 @@ from fastapi.responses import RedirectResponse, Response
 
 from backend.app.dashboard.sso.base import (
     STATE_MAX_AGE,
+    SSOConfigError,
     SSOProfile,
     find_or_create_sso_user,
     finish_login,
+    public_base_url,
     state_serializer,
 )
 from backend.app.logging_config import get_logger
@@ -217,12 +219,10 @@ async def _prepare_fastapi_request(request: Request) -> dict[str, Any]:
     if request.method == "POST":
         form = dict(await request.form())
 
-    base = (get_settings().app_base_url or "").rstrip("/")
-    if base:
-        scheme, _, host = base.partition("://")
-    else:
-        scheme = request.url.scheme
-        host = request.headers.get("host", request.url.netloc)
+    # Fail closed on the configured public base URL; never fall back to the
+    # attacker-controllable Host header (raises SSOConfigError when APP_BASE_URL
+    # is unset — callers turn it into an error redirect).
+    scheme, _, host = public_base_url(request).partition("://")
 
     return {
         "https": "on" if scheme == "https" else "off",
@@ -245,7 +245,10 @@ async def begin_login(request: Request):
         return RedirectResponse(
             url="/login?error=SAML+support+is+not+installed+(python3-saml)", status_code=302
         )
-    req = await _prepare_fastapi_request(request)
+    try:
+        req = await _prepare_fastapi_request(request)
+    except SSOConfigError:
+        return RedirectResponse(url="/login?error=SSO+is+misconfigured", status_code=302)
     saml_settings = build_saml_settings(_scheme_host(req))
     if not saml_settings:
         return RedirectResponse(url="/login?error=SAML+is+not+configured", status_code=302)
@@ -283,7 +286,10 @@ async def handle_acs(request: Request, db):
         return RedirectResponse(
             url="/login?error=SAML+support+is+not+installed+(python3-saml)", status_code=302
         )
-    req = await _prepare_fastapi_request(request)
+    try:
+        req = await _prepare_fastapi_request(request)
+    except SSOConfigError:
+        return RedirectResponse(url="/login?error=SSO+is+misconfigured", status_code=302)
     saml_settings = build_saml_settings(_scheme_host(req))
     if not saml_settings:
         return RedirectResponse(url="/login?error=SAML+is+not+configured", status_code=302)
@@ -374,7 +380,10 @@ def profile_from_assertion(
 
 async def metadata_response(request: Request) -> Response:
     """Serve SP metadata XML for registration with the IdP / federation."""
-    req = await _prepare_fastapi_request(request)
+    try:
+        req = await _prepare_fastapi_request(request)
+    except SSOConfigError:
+        return RedirectResponse(url="/login?error=SSO+is+misconfigured", status_code=302)
     saml_settings = build_saml_settings(_scheme_host(req))
     if not saml_settings:
         return Response(content="SAML is not configured", status_code=404)
