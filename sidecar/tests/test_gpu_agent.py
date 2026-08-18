@@ -9,6 +9,7 @@
 """Unit tests for the GPU sidecar agent with mocked pynvml."""
 
 import os
+import secrets
 import sys
 from unittest.mock import MagicMock, patch
 
@@ -17,7 +18,7 @@ from fastapi.testclient import TestClient
 
 
 # ---- Set required env var before importing the agent ----
-TEST_SECRET_KEY = "test-secret-key-for-unit-tests"
+TEST_SECRET_KEY = f"test-{secrets.token_hex(16)}"
 os.environ["SIDECAR_SECRET_KEY"] = TEST_SECRET_KEY
 
 # ---- Create mock pynvml before importing the agent ----

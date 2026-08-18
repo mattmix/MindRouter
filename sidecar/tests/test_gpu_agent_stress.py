@@ -13,6 +13,7 @@ and missing keys. Verifies auth holds up under sustained load.
 """
 
 import os
+import secrets
 import sys
 import time
 import threading
@@ -24,7 +25,7 @@ from fastapi.testclient import TestClient
 
 
 # ---- Set required env var before importing the agent ----
-TEST_SECRET_KEY = "stress-test-secret-key-abc123"
+TEST_SECRET_KEY = f"stress-{secrets.token_hex(16)}"
 os.environ["SIDECAR_SECRET_KEY"] = TEST_SECRET_KEY
 
 # ---- Create mock pynvml before importing the agent ----

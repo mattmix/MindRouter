@@ -1212,6 +1212,21 @@ async def revoke_key(
     return RedirectResponse(url="/dashboard", status_code=302)
 
 
+def _admin_redirect_target(redirect_to: Optional[str]) -> str:
+    """Allowlist the post-revoke redirect and rebuild it from the match.
+
+    Only the user-detail page posts a redirect_to today; the returned value is
+    reconstructed from the matched id, so no request-supplied bytes reach the
+    Location header (open-redirect guard). A future template posting a new
+    redirect_to value lands on /admin/api-keys until this allowlist is
+    extended.
+    """
+    m = re.fullmatch(r"/admin/users/(\d+)", redirect_to or "")
+    if m:
+        return f"/admin/users/{int(m.group(1))}"
+    return "/admin/api-keys"
+
+
 @dashboard_router.post("/admin/api-keys/{key_id}/revoke")
 async def admin_revoke_api_key(
     request: Request,
@@ -1228,9 +1243,8 @@ async def admin_revoke_api_key(
     if not user or (not user.group or not user.group.is_admin):
         return RedirectResponse(url="/dashboard", status_code=302)
 
-    # Only allow redirects back into the admin area (no open redirect).
-    if not redirect_to.startswith("/admin/"):
-        redirect_to = "/admin/api-keys"
+    # Open-redirect guard: allowlist + reconstruct, never echo the raw value.
+    redirect_to = _admin_redirect_target(redirect_to)
 
     revoked = await crud.revoke_api_key(db, key_id)
     if not revoked:
@@ -3760,7 +3774,7 @@ async def create_local_user(
         username=new_user.username,
         group=group.name,
     )
-    return RedirectResponse(url=f"/admin/users/{new_user.id}?success=created", status_code=302)
+    return RedirectResponse(url=f"/admin/users/{int(new_user.id)}?success=created", status_code=302)
 
 
 # ---------------------------------------------------------------------------

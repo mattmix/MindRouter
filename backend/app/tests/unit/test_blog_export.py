@@ -13,7 +13,7 @@ import importlib.util
 import os
 from datetime import datetime, timezone
 from types import SimpleNamespace
-from xml.dom import minidom
+from defusedxml import minidom
 
 _MODPATH = os.path.abspath(
     os.path.join(os.path.dirname(__file__), "..", "..", "dashboard", "blog_export.py")

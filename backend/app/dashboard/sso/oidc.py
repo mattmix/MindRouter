@@ -19,7 +19,7 @@ call, no local JWT validation needed for a confidential client.
 import time
 from dataclasses import dataclass
 from typing import Optional
-from urllib.parse import urlencode
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import httpx
 from fastapi import Request
@@ -91,7 +91,7 @@ def generic_config() -> Optional[OIDCConfig]:
     )
 
 
-def _absolute_redirect_uri(request: Request, redirect_uri: str) -> str:
+def _absolute_redirect_uri(redirect_uri: str) -> str:
     """Allow relative redirect URIs in config; resolve against the public base URL.
 
     request.base_url would report http:// behind a TLS-terminating proxy that
@@ -103,7 +103,7 @@ def _absolute_redirect_uri(request: Request, redirect_uri: str) -> str:
     # Fail closed on the configured public base URL; never derive it from the
     # attacker-controllable Host / X-Forwarded-* headers (raises SSOConfigError
     # when APP_BASE_URL is unset — begin_login turns it into an error redirect).
-    return public_base_url(request) + redirect_uri
+    return public_base_url() + redirect_uri
 
 
 async def discover(issuer: str) -> Optional[dict]:
@@ -137,23 +137,44 @@ async def begin_login(request: Request, cfg: OIDCConfig):
     if not meta:
         return RedirectResponse(url="/login?error=SSO+provider+discovery+failed", status_code=302)
 
+    # Pin the browser redirect to the configured issuer's https origin: the
+    # discovery document is remote input, and its authorization_endpoint must
+    # not choose where the user gets sent (open-redirect guard).
+    issuer_netloc = urlsplit(cfg.issuer).netloc
+    ep = urlsplit(meta["authorization_endpoint"])
+    if ep.scheme != "https" or ep.netloc.lower() != issuer_netloc.lower():
+        logger.error(
+            "oidc_authorization_endpoint_rejected",
+            provider=cfg.provider_id,
+            issuer=cfg.issuer,
+            authorization_endpoint=meta["authorization_endpoint"],
+        )
+        return RedirectResponse(
+            url="/login?error=SSO+provider+returned+an+unexpected+authorization+endpoint",
+            status_code=302,
+        )
+
     signed_state = new_signed_state()
     try:
-        redirect_uri = _absolute_redirect_uri(request, cfg.redirect_uri)
+        redirect_uri = _absolute_redirect_uri(cfg.redirect_uri)
     except SSOConfigError:
         return RedirectResponse(url="/login?error=SSO+is+misconfigured", status_code=302)
-    params = {
+    # RFC 6749 s3.1: a query component in the authorization endpoint URL must
+    # be retained. Endpoint-supplied params first, so ours always win.
+    params = dict(parse_qsl(ep.query))
+    params.update({
         "client_id": cfg.client_id,
         "response_type": "code",
         "redirect_uri": redirect_uri,
         "scope": cfg.scopes,
         "state": signed_state,
-    }
+    })
     if cfg.hosted_domain:
         params["hd"] = cfg.hosted_domain
 
     response = RedirectResponse(
-        url=f"{meta['authorization_endpoint']}?{urlencode(params)}", status_code=302
+        url=urlunsplit(("https", issuer_netloc, ep.path, urlencode(params), "")),
+        status_code=302,
     )
     response.set_cookie(
         key=_state_cookie(cfg.provider_id),
@@ -190,7 +211,7 @@ async def handle_callback(
         return RedirectResponse(url="/login?error=SSO+provider+discovery+failed", status_code=302)
 
     try:
-        callback_redirect_uri = _absolute_redirect_uri(request, cfg.redirect_uri)
+        callback_redirect_uri = _absolute_redirect_uri(cfg.redirect_uri)
     except SSOConfigError:
         return RedirectResponse(url="/login?error=SSO+is+misconfigured", status_code=302)
     token_data = {

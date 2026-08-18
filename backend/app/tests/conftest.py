@@ -15,6 +15,8 @@
 """Pytest configuration and shared fixtures for MindRouter tests."""
 
 import asyncio
+import secrets
+
 import pytest
 from datetime import datetime, timezone
 from typing import AsyncGenerator, Generator
@@ -229,7 +231,7 @@ def mock_user(mock_group):
     user = MagicMock(spec=User)
     user.id = 1
     user.uuid = "test-user-uuid"
-    user.username = "testuser"
+    user.username = f"testuser-{secrets.token_hex(4)}"
     user.email = "test@example.com"
     user.role = UserRole.FACULTY
     user.is_active = True

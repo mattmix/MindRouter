@@ -23,6 +23,7 @@ Covers:
 """
 
 import importlib
+import secrets
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -74,6 +75,7 @@ class TestBraveWebSearchApiKey:
     @pytest.mark.asyncio
     async def test_explicit_api_key_used(self):
         """When api_key is passed, it should be used instead of settings."""
+        key = f"brave-{secrets.token_hex(8)}"
         mock_response = MagicMock()
         mock_response.json.return_value = {
             "web": {
@@ -91,13 +93,13 @@ class TestBraveWebSearchApiKey:
 
         with patch.object(_ws_mod, "httpx") as mock_httpx:
             mock_httpx.AsyncClient.return_value = mock_client
-            results = await brave_web_search("test query", api_key="explicit-key")
+            results = await brave_web_search("test query", api_key=key)
 
         assert len(results) == 1
         assert results[0]["title"] == "Test"
         # Verify the explicit key was used in headers
         call_kwargs = mock_client.get.call_args
-        assert call_kwargs[1]["headers"]["X-Subscription-Token"] == "explicit-key"
+        assert call_kwargs[1]["headers"]["X-Subscription-Token"] == key
 
     @pytest.mark.asyncio
     async def test_no_api_key_falls_back_to_settings(self):
@@ -151,7 +153,7 @@ class TestCallMindRouterLLM:
                 prompt="Describe this model",
                 system_prompt="You are helpful",
                 model="qwen3:32b",
-                api_key="test-key",
+                api_key=secrets.token_hex(8),
             )
 
         assert result == "- **Architecture**: Llama 3\n- **Parameters**: 8B"
@@ -168,13 +170,14 @@ class TestCallMindRouterLLM:
         mock_client.__aenter__ = AsyncMock(return_value=mock_client)
         mock_client.__aexit__ = AsyncMock(return_value=False)
 
+        key = secrets.token_hex(8)
         with patch.object(_enrich_mod, "httpx") as mock_httpx:
             mock_httpx.AsyncClient.return_value = mock_client
             await _call_mindrouter_llm(
                 prompt="test prompt",
                 system_prompt="test system",
                 model="testmodel",
-                api_key="key123",
+                api_key=key,
                 port=9000,
             )
 
@@ -185,7 +188,7 @@ class TestCallMindRouterLLM:
         assert call_args[1]["json"]["think"] is False
         assert call_args[1]["json"]["messages"][0]["role"] == "system"
         assert call_args[1]["json"]["messages"][1]["role"] == "user"
-        assert call_args[1]["headers"]["Authorization"] == "Bearer key123"
+        assert call_args[1]["headers"]["Authorization"] == f"Bearer {key}"
         assert "localhost:9000" in call_args[0][0]
 
     @pytest.mark.asyncio
@@ -371,6 +374,7 @@ class TestEnrichModelDescription:
     @pytest.mark.asyncio
     async def test_brave_api_key_passed_through(self):
         """brave_api_key should be forwarded to brave_web_search."""
+        brave_key = f"brave-{secrets.token_hex(8)}"
         with (
             patch.object(_enrich_mod, "brave_web_search", new_callable=AsyncMock, return_value=[]) as mock_search,
             patch.object(_enrich_mod, "_call_mindrouter_llm", new_callable=AsyncMock, return_value="desc"),
@@ -380,10 +384,10 @@ class TestEnrichModelDescription:
                 model_metadata={},
                 enrich_model="m",
                 api_key="k",
-                brave_api_key="brave-key-123",
+                brave_api_key=brave_key,
             )
 
-        assert mock_search.call_args[1]["api_key"] == "brave-key-123"
+        assert mock_search.call_args[1]["api_key"] == brave_key
 
     @pytest.mark.asyncio
     async def test_custom_port(self):

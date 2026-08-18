@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mindrouter"
-version = "2.9.36"
+version = "2.9.37"
 description = "Production-ready LLM inference load balancer for Ollama and vLLM backends"
 readme = "README.md"
 license = {text = "Apache-2.0"}
@@ -105,6 +105,7 @@ dev = [
     "types-redis>=4.6.0",
     "sqlalchemy-stubs>=0.4",
     "faker>=22.0.0",
+    "defusedxml>=0.7.1",
 ]
 test = [
     "pytest>=7.4.0",
@@ -112,6 +113,7 @@ test = [
     "pytest-cov>=4.1.0",
     "httpx>=0.26.0",
     "faker>=22.0.0",
+    "defusedxml>=0.7.1",
 ]
 
 [project.urls]

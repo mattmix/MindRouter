@@ -246,9 +246,19 @@ async def begin_login(request: Request):
             url="/login?error=SAML+support+is+not+installed+(python3-saml)", status_code=302
         )
     try:
-        req = await _prepare_fastapi_request(request)
+        # Config/literal-only request dict: the AuthnRequest redirect must not
+        # carry any request-derived scheme/host/path/query. public_base_url
+        # fails closed (SSOConfigError) when APP_BASE_URL is unset.
+        scheme, _, host = public_base_url().partition("://")
     except SSOConfigError:
         return RedirectResponse(url="/login?error=SSO+is+misconfigured", status_code=302)
+    req = {
+        "https": "on" if scheme == "https" else "off",
+        "http_host": host,
+        "script_name": "/login/saml",
+        "get_data": {},
+        "post_data": {},
+    }
     saml_settings = build_saml_settings(_scheme_host(req))
     if not saml_settings:
         return RedirectResponse(url="/login?error=SAML+is+not+configured", status_code=302)

@@ -114,8 +114,14 @@ class TestRevokeKeyScoping:
         fn = _extract_function(ROUTES_SRC, "admin_revoke_api_key")
         assert "is_admin" in fn
         assert "log_admin_action" in fn
-        # open-redirect guard
-        assert 'redirect_to.startswith("/admin/")' in fn
+        # open-redirect guard: the target is allowlisted AND reconstructed —
+        # no request-supplied bytes reach the Location header
+        assert "_admin_redirect_target(redirect_to)" in fn
+        helper = _extract_function(ROUTES_SRC, "_admin_redirect_target")
+        assert "re.fullmatch" in helper
+        assert r"/admin/users/(\d+)" in helper
+        assert "int(m.group(1))" in helper
+        assert '"/admin/api-keys"' in helper
 
     def test_dashboard_admin_helper_rejects_deactivated_admins(self):
         """A deactivated admin's surviving session cookie must not keep

@@ -9,6 +9,8 @@ remain untouched by the framework.
 
 import asyncio
 import importlib.util
+import inspect
+import secrets
 import sys
 import types
 from pathlib import Path
@@ -273,13 +275,14 @@ def test_oidc_hosted_domain_enforced(sso):
 
 def test_oidc_absolute_redirect_uri_uses_public_base_url(sso):
     """Regression: request.base_url reports http:// behind an untrusted proxy,
-    and IdPs match the redirect URI exactly -> use the configured public URL."""
+    and IdPs match the redirect URI exactly -> use the configured public URL.
+    The helper no longer accepts a request at all, so header influence is
+    structurally impossible."""
     _use(FakeSettings(app_base_url="https://mr.example.edu"))
-    req = MagicMock()
-    req.base_url = "http://localhost:8000/"      # what an untrusted proxy yields
     f = sso["oidc"]._absolute_redirect_uri
-    assert f(req, "/login/google/authorized") == "https://mr.example.edu/login/google/authorized"
-    assert f(req, "https://other.example/cb") == "https://other.example/cb"
+    assert list(inspect.signature(f).parameters) == ["redirect_uri"]
+    assert f("/login/google/authorized") == "https://mr.example.edu/login/google/authorized"
+    assert f("https://other.example/cb") == "https://other.example/cb"
 
 
 def test_public_base_url_fails_closed_and_ignores_host(sso):
@@ -300,22 +303,52 @@ def test_public_base_url_fails_closed_and_ignores_host(sso):
 
 def test_oidc_redirect_uri_fails_closed_without_app_base_url(sso):
     # Empty app_base_url must NOT fall back to the attacker-controllable Host /
-    # X-Forwarded-* headers — it fails closed (SSOConfigError), which begin_login
-    # turns into an error redirect. (2.9.24 SSO redirect hardening.)
+    # X-Forwarded-* headers (the helper cannot even see the request) — it fails
+    # closed (SSOConfigError), which begin_login turns into an error redirect.
+    # (2.9.24 SSO redirect hardening.)
     _use(FakeSettings(app_base_url=""))
-    req = MagicMock()
-    req.url.scheme = "http"
-    req.url.netloc = "internal:8000"
-    req.headers = {"x-forwarded-proto": "https", "host": "mr.example.edu"}
     with pytest.raises(sso["base"].SSOConfigError):
-        sso["oidc"]._absolute_redirect_uri(req, "/login/oidc/authorized")
-    # With app_base_url set it resolves against the configured origin, ignoring
-    # the request headers entirely.
+        sso["oidc"]._absolute_redirect_uri("/login/oidc/authorized")
+    # With app_base_url set it resolves against the configured origin.
     _use(FakeSettings(app_base_url="https://mr.example.edu"))
-    assert sso["oidc"]._absolute_redirect_uri(req, "/login/oidc/authorized") == \
+    assert sso["oidc"]._absolute_redirect_uri("/login/oidc/authorized") == \
         "https://mr.example.edu/login/oidc/authorized"
     # An already-absolute redirect_uri is returned unchanged.
-    assert sso["oidc"]._absolute_redirect_uri(req, "https://x/y") == "https://x/y"
+    assert sso["oidc"]._absolute_redirect_uri("https://x/y") == "https://x/y"
+
+
+def test_oidc_begin_login_pins_authorization_endpoint_to_issuer(sso):
+    """The discovery document is remote input: an authorization_endpoint off
+    the issuer's https origin must never receive the browser, and the accepted
+    redirect is rebuilt from the issuer origin + endpoint path."""
+    _use(FakeSettings(google_sso_client_id="cid", google_sso_client_secret="cs",
+                      session_cookie_secure=True))
+    cfg = sso["oidc"].google_config()
+    orig_discover = sso["oidc"].discover
+
+    def _meta(authz):
+        return AsyncMock(return_value={
+            "authorization_endpoint": authz,
+            "token_endpoint": "https://accounts.google.com/token",
+        })
+
+    try:
+        for bad in ("https://evil.example/auth",
+                    "http://accounts.google.com/o/oauth2/v2/auth"):
+            sso["oidc"].discover = _meta(bad)
+            resp = _run(sso["oidc"].begin_login(MagicMock(), cfg))
+            assert resp.status_code == 302
+            assert "unexpected+authorization+endpoint" in resp.headers["location"], bad
+            assert "evil.example" not in resp.headers["location"]
+
+        sso["oidc"].discover = _meta("https://accounts.google.com/o/oauth2/v2/auth")
+        resp = _run(sso["oidc"].begin_login(MagicMock(), cfg))
+        assert resp.status_code == 302
+        assert resp.headers["location"].startswith(
+            "https://accounts.google.com/o/oauth2/v2/auth?"
+        )
+    finally:
+        sso["oidc"].discover = orig_discover
 
 
 def test_generic_config_strips_trailing_slash(sso):
@@ -658,6 +691,45 @@ def test_saml_request_dict_ignores_forwarded_host(sso):
     assert req["https"] == "on"
 
 
+def test_saml_begin_login_request_dict_is_config_only(sso):
+    """begin_login builds the python3-saml request dict from configuration and
+    literals only — a hostile request (forwarded-host, weird path, query) must
+    contribute nothing to the AuthnRequest redirect."""
+    _use(_saml_configured())
+    captured = {}
+    auth = MagicMock()
+    auth.login.return_value = "https://idp/sso?SAMLRequest=xyz"
+    auth.get_last_request_id.return_value = "req-abc"
+
+    def _auth_factory(req, settings):
+        captured.update(req)
+        return auth
+
+    orig = sso["saml"]._import_onelogin
+    sso["saml"]._import_onelogin = lambda: (_auth_factory, MagicMock())
+    try:
+        request = MagicMock()
+        request.method = "GET"
+        request.url.scheme = "http"
+        request.url.netloc = "internal:8000"
+        request.url.path = "/evil/path"
+        request.query_params = {"RelayState": "https://evil.example/"}
+        request.headers = {"x-forwarded-host": "evil.example.com", "host": "evil.example.com"}
+        resp = _run(sso["saml"].begin_login(request))
+    finally:
+        sso["saml"]._import_onelogin = orig
+
+    assert resp.status_code == 302
+    assert resp.headers["location"] == "https://idp/sso?SAMLRequest=xyz"
+    assert captured == {
+        "https": "on",
+        "http_host": "mr.example.edu",
+        "script_name": "/login/saml",
+        "get_data": {},
+        "post_data": {},
+    }
+
+
 def test_saml_request_id_cookie_defined(sso):
     assert sso["saml"].REQUEST_ID_COOKIE == "saml_request_id"
     src = (_SSO_DIR / "saml.py").read_text()
@@ -872,16 +944,22 @@ def test_azure_missing_group_guard_logs_safely():
 
 # ── 2.9.7: SAML SP key pair ──────────────────────────────────────
 
-_TEST_CERT = (
-    "-----BEGIN CERTIFICATE-----\n"
-    "MIIBfakeCERTIFICATEbodyForUnitTestsOnly==\n"
-    "-----END CERTIFICATE-----"
-)
-_TEST_KEY = (
-    "-----BEGIN PRIVATE KEY-----\n"
-    "MIIBfakePRIVATEKEYbodyForUnitTestsOnly==\n"
-    "-----END PRIVATE KEY-----"
-)
+def _fake_pem(kind: str) -> str:
+    """Random PEM-shaped blob — no real key material.
+
+    saml.py's _load_pem branches on the ``-----BEGIN {kind}-----`` header
+    (anything without one is treated as a file path), so the header must
+    be genuine even though the body is random.
+    """
+    return (
+        f"-----BEGIN {kind}-----\n"
+        f"{secrets.token_urlsafe(32)}\n"
+        f"-----END {kind}-----"
+    )
+
+
+_TEST_CERT = _fake_pem("CERTIFICATE")
+_TEST_KEY = _fake_pem("PRIVATE KEY")
 
 
 def _saml_settings(sso, **kw):

@@ -23,6 +23,7 @@ Covers:
 """
 
 import importlib
+import secrets
 import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -380,7 +381,7 @@ class TestLLMResponseParsing:
             def __getattr__(self, _):
                 return lambda *a, **k: None
 
-        secret = "SENTINEL-9182-SECRET"
+        secret = f"SENTINEL-{secrets.token_hex(8)}"
         orig = _scanner_mod.logger
         _scanner_mod.logger = _Capture()
         try:
