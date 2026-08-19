@@ -468,13 +468,19 @@ class InferenceService:
         )
         job.request_id = db_request.request_uuid
 
+        completion_started = False
         try:
             # Route and proxy with retry
             response, backend = await self._proxy_with_retry(
                 request, job, user, proxy_fn="_proxy_chat_request"
             )
 
-            # Update records
+            # Update records. Once the shielded completion starts,
+            # _fail_request must not run: cancellation here leaves the
+            # shielded write finishing in the background, and a concurrent
+            # _fail_request would use the same session mid-transaction
+            # (and double-release the scheduler slot).
+            completion_started = True
             await self._complete_request(
                 db_request, backend.id, response, job
             )
@@ -482,10 +488,11 @@ class InferenceService:
             return response
 
         except BaseException as e:
-            try:
-                await self._fail_request(db_request, None, str(e), job)
-            except Exception:
-                pass
+            if not completion_started:
+                try:
+                    await self._fail_request(db_request, None, str(e), job)
+                except Exception:
+                    pass
             raise
 
     async def stream_chat_completion(
@@ -531,6 +538,7 @@ class InferenceService:
         inflight_total_tokens = 0
         real_usage = None  # populated from the backend's usage chunk, if present
         completed = False
+        completion_started = False
         coalescer = StreamCoalescer(
             self._settings.stream_coalesce_events,
             self._settings.stream_coalesce_ms,
@@ -613,6 +621,11 @@ class InferenceService:
             # CancelledError from client disconnect after [DONE] cannot
             # interrupt unshielded scheduler awaits before the DB write.
             if routed_backend:
+                # Once the shielded completion starts, _fail_request must not
+                # run: cancellation of THIS generator leaves the shielded task
+                # finishing in the background, and a concurrent _fail_request
+                # would use the same session mid-transaction.
+                completion_started = True
                 await asyncio.shield(self._complete_streaming_request(
                     db_request, routed_backend.id, full_content, chunk_count, job,
                     finish_reason=last_finish_reason,
@@ -642,12 +655,13 @@ class InferenceService:
             # in Python 3.9+) and GeneratorExit from client disconnects — both
             # of which would otherwise leak the scheduler queue depth counter.
             backend_id = routed_backend.id if routed_backend else None
-            try:
-                await asyncio.shield(
-                    self._fail_request(db_request, backend_id, str(e), job)
-                )
-            except BaseException:
-                pass
+            if not completion_started:
+                try:
+                    await asyncio.shield(
+                        self._fail_request(db_request, backend_id, str(e), job)
+                    )
+                except BaseException:
+                    pass
             # Mid-stream backend failure: drain token events the backend
             # already delivered so the client's truncated stream matches
             # main's per-event write behavior. Never yield for
@@ -684,6 +698,7 @@ class InferenceService:
         )
         job.request_id = db_request.request_uuid
 
+        completion_started = False
         try:
             response, backend = await self._proxy_with_retry(
                 request, job, user,
@@ -691,6 +706,9 @@ class InferenceService:
                 proxy_fn="_proxy_embedding_request",
             )
 
+            # Gate _fail_request once the shielded completion starts
+            # (same session-race rationale as chat_completion).
+            completion_started = True
             await self._complete_request(
                 db_request, backend.id, response, job,
                 modality=Modality.EMBEDDING
@@ -699,10 +717,11 @@ class InferenceService:
             return response
 
         except BaseException as e:
-            try:
-                await self._fail_request(db_request, None, str(e), job)
-            except Exception:
-                pass
+            if not completion_started:
+                try:
+                    await self._fail_request(db_request, None, str(e), job)
+                except Exception:
+                    pass
             raise
 
     async def rerank(
@@ -725,6 +744,7 @@ class InferenceService:
         )
         job.request_id = db_request.request_uuid
 
+        completion_started = False
         try:
             response, backend = await self._proxy_with_retry(
                 request, job, user,
@@ -732,6 +752,9 @@ class InferenceService:
                 proxy_fn="_proxy_rerank_request",
             )
 
+            # Gate _fail_request once the shielded completion starts
+            # (same session-race rationale as chat_completion).
+            completion_started = True
             await self._complete_request(
                 db_request, backend.id, response, job,
                 modality=Modality.RERANKING
@@ -740,10 +763,11 @@ class InferenceService:
             return response
 
         except BaseException as e:
-            try:
-                await self._fail_request(db_request, None, str(e), job)
-            except Exception:
-                pass
+            if not completion_started:
+                try:
+                    await self._fail_request(db_request, None, str(e), job)
+                except Exception:
+                    pass
             raise
 
     async def score(
@@ -766,6 +790,7 @@ class InferenceService:
         )
         job.request_id = db_request.request_uuid
 
+        completion_started = False
         try:
             response, backend = await self._proxy_with_retry(
                 request, job, user,
@@ -773,6 +798,9 @@ class InferenceService:
                 proxy_fn="_proxy_score_request",
             )
 
+            # Gate _fail_request once the shielded completion starts
+            # (same session-race rationale as chat_completion).
+            completion_started = True
             await self._complete_request(
                 db_request, backend.id, response, job,
                 modality=Modality.RERANKING
@@ -781,10 +809,11 @@ class InferenceService:
             return response
 
         except BaseException as e:
-            try:
-                await self._fail_request(db_request, None, str(e), job)
-            except Exception:
-                pass
+            if not completion_started:
+                try:
+                    await self._fail_request(db_request, None, str(e), job)
+                except Exception:
+                    pass
             raise
 
     async def image_generation(
@@ -807,6 +836,7 @@ class InferenceService:
         )
         job.request_id = db_request.request_uuid
 
+        completion_started = False
         try:
             response, backend = await self._proxy_with_retry(
                 request, job, user,
@@ -814,6 +844,9 @@ class InferenceService:
                 proxy_fn="_proxy_image_request",
             )
 
+            # Gate _fail_request once the shielded completion starts
+            # (same session-race rationale as chat_completion).
+            completion_started = True
             await self._complete_request(
                 db_request, backend.id, response, job,
                 modality=Modality.IMAGE_GENERATION
@@ -822,10 +855,11 @@ class InferenceService:
             return response
 
         except BaseException as e:
-            try:
-                await self._fail_request(db_request, None, str(e), job)
-            except Exception:
-                pass
+            if not completion_started:
+                try:
+                    await self._fail_request(db_request, None, str(e), job)
+                except Exception:
+                    pass
             raise
 
     async def ollama_chat(
@@ -847,11 +881,15 @@ class InferenceService:
         )
         job.request_id = db_request.request_uuid
 
+        completion_started = False
         try:
             response, backend = await self._proxy_with_retry(
                 request, job, user, proxy_fn="_proxy_ollama_chat"
             )
 
+            # Gate _fail_request once the shielded completion starts
+            # (same session-race rationale as chat_completion).
+            completion_started = True
             await self._complete_request(
                 db_request, backend.id, response, job
             )
@@ -859,10 +897,11 @@ class InferenceService:
             return response
 
         except BaseException as e:
-            try:
-                await self._fail_request(db_request, None, str(e), job)
-            except Exception:
-                pass
+            if not completion_started:
+                try:
+                    await self._fail_request(db_request, None, str(e), job)
+                except Exception:
+                    pass
             raise
 
     async def stream_ollama_chat(
@@ -890,6 +929,7 @@ class InferenceService:
         inflight_chars = 0
         inflight_total_tokens = 0
         last_finish_reason = None
+        completion_started = False
         coalescer = StreamCoalescer(
             self._settings.stream_coalesce_events,
             self._settings.stream_coalesce_ms,
@@ -948,6 +988,9 @@ class InferenceService:
                     inflight_total_tokens += estimated
 
             if routed_backend:
+                # Once the shielded completion starts, _fail_request must not
+                # run concurrently on the same session (see stream_chat_completion).
+                completion_started = True
                 await asyncio.shield(self._complete_streaming_request(
                     db_request, routed_backend.id, full_content, chunk_count, job,
                     finish_reason=last_finish_reason,
@@ -970,12 +1013,13 @@ class InferenceService:
             # BaseException catches CancelledError and GeneratorExit from
             # client disconnects that would otherwise leak queue depth.
             backend_id = routed_backend.id if routed_backend else None
-            try:
-                await asyncio.shield(
-                    self._fail_request(db_request, backend_id, str(e), job)
-                )
-            except BaseException:
-                pass
+            if not completion_started:
+                try:
+                    await asyncio.shield(
+                        self._fail_request(db_request, backend_id, str(e), job)
+                    )
+                except BaseException:
+                    pass
             # Mid-stream backend failure: drain token events the backend
             # already delivered so the client's truncated stream matches
             # main's per-event write behavior. Never yield for
@@ -2386,14 +2430,92 @@ class InferenceService:
             completion_tokens, tokens_estimated, total_tokens,
         ))
 
+    # Attempts for the completion DB transaction. Hot-row deadlocks (quotas /
+    # api_keys under concurrent same-user traffic, MariaDB error 1213) are
+    # transient; more than a few retries means something structural (the
+    # durable fix is atomic increments in update_quota_usage/update_api_key_usage).
+    _COMPLETION_DB_ATTEMPTS = 5
+
+    async def _run_completion_db(self, request_id: int, write_once, path: str) -> None:
+        """Run a completion DB transaction; retry deadlocks; never raise.
+
+        The whole completion write (status flip, response row, quota and key
+        usage) is one transaction. A quotas hot-row deadlock aborts it, and
+        swallowing that silently loses the response row, the accounting, AND
+        the DLP scan while the client already got its 200 — so terminal
+        failures are logged loudly and the request is still enqueued for DLP:
+        its prompt was committed at creation and can be scanned regardless.
+
+        Takes the scalar request id, not the ORM instance: rollback() expires
+        ORM objects, and touching an expired attribute on an async session
+        raises MissingGreenlet. write_once must likewise close over scalars
+        captured before the first attempt.
+        """
+        for attempt in range(1, self._COMPLETION_DB_ATTEMPTS + 1):
+            try:
+                await write_once()
+                return
+            except asyncio.CancelledError:
+                # Shutdown/cancellation: keep the loud-failure + DLP contract,
+                # then propagate — callers must still observe cancellation.
+                logger.error(
+                    "request_completion_db_failed",
+                    request_id=request_id,
+                    path=path,
+                    error="CancelledError",
+                    db_error_code=None,
+                    attempts=attempt,
+                )
+                try:
+                    from backend.app.services.dlp_worker import enqueue_for_dlp
+                    await enqueue_for_dlp(request_id)
+                except Exception:
+                    pass
+                raise
+            except Exception as e:
+                try:
+                    await self.db.rollback()
+                except Exception:
+                    pass
+                code = getattr(getattr(e, "orig", None), "args", (None,))[0]
+                # Deadlocks (1213) fail fast and retry cheaply. Lock-wait
+                # timeouts (1205) pin a pooled connection for the whole wait —
+                # retrying them multiplies pool occupancy, so at most one retry.
+                retryable = (code == 1213 and attempt < self._COMPLETION_DB_ATTEMPTS) or (
+                    code == 1205 and attempt < 2
+                )
+                if retryable:
+                    await asyncio.sleep(0.05 * (2 ** (attempt - 1)))
+                    continue
+                logger.error(
+                    "request_completion_db_failed",
+                    request_id=request_id,
+                    path=path,
+                    error=type(e).__name__,
+                    db_error_code=code,
+                    attempts=attempt,
+                )
+                try:
+                    from backend.app.services.dlp_worker import enqueue_for_dlp
+                    await enqueue_for_dlp(request_id)
+                except Exception:
+                    pass
+                return
+
     async def _do_complete_db(
         self, db_request, backend_id, response, prompt_tokens,
         completion_tokens, tokens_estimated, total_tokens,
     ) -> None:
         """DB writes for request completion (run inside asyncio.shield)."""
-        try:
+        # Scalars only past this point: a retry's rollback expires the ORM
+        # instance and touching it afterwards raises MissingGreenlet.
+        request_id = db_request.id
+        user_id = db_request.user_id
+        api_key_id = db_request.api_key_id
+
+        async def write_once():
             await crud.update_request_completed(
-                self.db, db_request.id,
+                self.db, request_id,
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
                 tokens_estimated=tokens_estimated,
@@ -2411,28 +2533,25 @@ class InferenceService:
                 content = None
 
             await crud.create_response(
-                self.db, db_request.id,
+                self.db, request_id,
                 content=content,
                 finish_reason=response.get("choices", [{}])[0].get("finish_reason"),
             )
 
-            await crud.update_quota_usage(self.db, db_request.user_id, total_tokens)
-            await crud.update_api_key_usage(self.db, db_request.api_key_id)
+            await crud.update_quota_usage(self.db, user_id, total_tokens)
+            await crud.update_api_key_usage(self.db, api_key_id)
 
             await self.db.commit()
             # Increment Redis quota only after DB commit succeeds to prevent drift
-            await crud.incr_quota_redis(db_request.user_id, total_tokens)
+            await crud.incr_quota_redis(user_id, total_tokens)
             # Enqueue for DLP scanning (best-effort, never affects inference)
             try:
                 from backend.app.services.dlp_worker import enqueue_for_dlp
-                await enqueue_for_dlp(db_request.id)
+                await enqueue_for_dlp(request_id)
             except Exception:
                 pass
-        except Exception:
-            try:
-                await self.db.rollback()
-            except Exception:
-                pass
+
+        await self._run_completion_db(request_id, write_once, "complete")
 
     async def _complete_streaming_request(
         self,
@@ -2486,9 +2605,16 @@ class InferenceService:
         finish_reason: str = "stop",
     ) -> None:
         """DB writes for streaming completion (run inside asyncio.shield)."""
-        try:
+        # Scalars only past this point: a retry's rollback expires the ORM
+        # instance and touching it afterwards raises MissingGreenlet.
+        request_id = db_request.id
+        user_id = db_request.user_id
+        api_key_id = db_request.api_key_id
+
+        async def write_once():
+            stored_content = content
             await crud.update_request_completed(
-                self.db, db_request.id,
+                self.db, request_id,
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
                 tokens_estimated=True,
@@ -2499,31 +2625,28 @@ class InferenceService:
                 self._settings.audit_log_enabled
                 and self._settings.audit_log_responses
             ):
-                content = None
+                stored_content = None
             await crud.create_response(
-                self.db, db_request.id,
-                content=content,
+                self.db, request_id,
+                content=stored_content,
                 chunk_count=chunk_count,
                 finish_reason=finish_reason,
             )
 
-            await crud.update_quota_usage(self.db, db_request.user_id, total_tokens)
-            await crud.update_api_key_usage(self.db, db_request.api_key_id)
+            await crud.update_quota_usage(self.db, user_id, total_tokens)
+            await crud.update_api_key_usage(self.db, api_key_id)
 
             await self.db.commit()
             # Increment Redis quota only after DB commit succeeds to prevent drift
-            await crud.incr_quota_redis(db_request.user_id, total_tokens)
+            await crud.incr_quota_redis(user_id, total_tokens)
             # Enqueue for DLP scanning (best-effort, never affects inference)
             try:
                 from backend.app.services.dlp_worker import enqueue_for_dlp
-                await enqueue_for_dlp(db_request.id)
+                await enqueue_for_dlp(request_id)
             except Exception:
                 pass
-        except Exception:
-            try:
-                await self.db.rollback()
-            except Exception:
-                pass
+
+        await self._run_completion_db(request_id, write_once, "complete_streaming")
 
     async def _fail_request(
         self,
@@ -2554,17 +2677,30 @@ class InferenceService:
 
     async def _do_fail_db(self, db_request, error_message: str) -> None:
         """DB writes for failed request (run inside asyncio.shield)."""
+        # Scalars up front: if any earlier rollback expired this ORM instance,
+        # touching its attributes mid-transaction raises MissingGreenlet.
+        try:
+            request_id = db_request.id
+            api_key_id = db_request.api_key_id
+        except Exception:
+            logger.error("request_fail_db_skipped", error="expired_orm_instance")
+            return
         try:
             await crud.update_request_failed(
-                self.db, db_request.id,
+                self.db, request_id,
                 error_message=error_message,
             )
 
-            await crud.update_api_key_usage(self.db, db_request.api_key_id)
+            await crud.update_api_key_usage(self.db, api_key_id)
 
             await self.db.commit()
-        except Exception:
+        except Exception as e:
             try:
                 await self.db.rollback()
             except Exception:
                 pass
+            logger.error(
+                "request_fail_db_failed",
+                request_id=request_id,
+                error=type(e).__name__,
+            )

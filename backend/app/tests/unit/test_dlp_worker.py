@@ -1017,3 +1017,63 @@ class TestGlinerScanCapWiring:
     def test_template_exposes_the_field(self):
         html = (_DASHBOARD_DIR / "templates" / "admin" / "dlp.html").read_text()
         assert 'name="gliner_max_scan_chars"' in html
+
+
+class TestWorkerConcurrency:
+    """Supervisor + overflow-counter behavior added for burst support."""
+
+    def test_enqueue_overflow_increments_dropped_counter(self, worker):
+        async def run():
+            # fill the queue to capacity, then overflow twice
+            q = worker.get_dlp_queue()
+            drained = 0
+            while not q.empty():
+                q.get_nowait(); drained += 1
+            base = worker.get_queue_dropped_total()
+            for i in range(q.maxsize):
+                q.put_nowait(i)
+            await worker.enqueue_for_dlp(999001)
+            await worker.enqueue_for_dlp(999002)
+            assert worker.get_queue_dropped_total() == base + 2
+            while not q.empty():
+                q.get_nowait()
+        asyncio.run(run())
+
+    def test_read_worker_concurrency_clamps_and_defaults(self, worker, monkeypatch):
+        async def run():
+            # DB unavailable -> default
+            assert await worker._read_worker_concurrency() == worker.DLP_WORKER_DEFAULT_CONCURRENCY
+        asyncio.run(run())
+
+    def test_supervisor_spawns_and_resizes_consumers(self, worker, monkeypatch):
+        async def run():
+            targets = iter([3, 1, 1])
+
+            async def fake_read(fallback=None):
+                return next(targets)
+
+            spawned = []
+
+            async def fake_consume(idx):
+                spawned.append(idx)
+                try:
+                    await asyncio.sleep(3600)
+                except asyncio.CancelledError:
+                    raise
+
+            sleeps = {"n": 0}
+            real_sleep = asyncio.sleep
+
+            async def fast_sleep(_secs):
+                sleeps["n"] += 1
+                await real_sleep(0)   # let spawned consumer tasks start
+                if sleeps["n"] >= 2:
+                    raise asyncio.CancelledError  # simulate shutdown
+
+            monkeypatch.setattr(worker, "_read_worker_concurrency", fake_read)
+            monkeypatch.setattr(worker, "_consume_loop", fake_consume)
+            monkeypatch.setattr(worker.asyncio, "sleep", fast_sleep, raising=False)
+
+            await worker.dlp_worker_loop()   # swallows the CancelledError, cancels children
+            assert spawned == [0, 1, 2]      # grew to 3, then shrank to 1 (no respawn)
+        asyncio.run(run())

@@ -22,6 +22,7 @@ Covers:
 - ScanResult dataclass
 """
 
+import asyncio
 import importlib
 import secrets
 import sys
@@ -601,3 +602,78 @@ class TestGlinerScanCap:
         monkeypatch.setattr(_scanner_mod, "_load_gliner", _fake_load)
         await _scanner_mod.scan_gliner("just a short message", max_chars=10000)
         assert seen["len"] == len("just a short message")
+
+
+class TestLuhnValidation:
+    """Built-in credit-card pattern requires a Luhn-valid digit sequence."""
+
+    def test_luhn_valid_cards_still_detected(self):
+        for text in (
+            "Card: 4111 1111 1111 1111",       # visa, spaced
+            "card=4111-1111-1111-1111",        # visa, hyphenated
+            "amex 378282246310005 on file",    # 15-digit amex
+        ):
+            findings = scan_regex(text)
+            cats = {f.category for f in findings}
+            assert "credit card number" in cats, text
+
+    def test_luhn_invalid_lookalikes_not_flagged(self):
+        for text in (
+            "order id 4111111111111112",        # last digit off -> Luhn fails
+            "EAN barcode 4006381333931",        # EAN-13-style digits failing Luhn
+            # (note: ~10% of EAN-13s coincidentally PASS Luhn — the validator
+            # removes most, not all, barcode false positives)
+            "tracking 9400 1000 0000 0000 0001",
+        ):
+            findings = scan_regex(text)
+            cats = {f.category for f in findings}
+            assert "credit card number" not in cats, text
+
+    def test_custom_patterns_bypass_luhn(self):
+        # Admin-supplied patterns keep raw regex semantics even for the same category.
+        custom = [{"name": "raw16", "pattern": r"\b\d{16}\b",
+                   "category": "credit card number", "severity": "major"}]
+        findings = scan_regex("val 4111111111111112", custom_patterns=custom)
+        assert any(f.category == "credit card number" for f in findings)
+
+    def test_luhn_helper(self):
+        assert _scanner_mod._luhn_ok("4111 1111 1111 1111")
+        assert not _scanner_mod._luhn_ok("4111111111111112")
+        assert not _scanner_mod._luhn_ok("1234")           # too short
+
+
+class TestGlinerDefaultCategories:
+    def test_person_not_in_defaults(self):
+        # 'person' measured at precision 0.34 (headers/greetings) — opt-in only.
+        import inspect
+        src = inspect.getsource(_scanner_mod.scan_gliner)
+        assert '"person",' not in src.split("categories = [")[1].split("]")[0]
+
+
+class TestLuhnGluedPrefixRecovery:
+    """A validator failure must re-attempt INSIDE the span, not skip past it —
+    the greedy card pattern glues short digit prefixes ('cvv 123 <card>') onto
+    the card, and the glued span fails Luhn."""
+
+    def test_card_after_short_digit_token_still_detected(self):
+        for text in (
+            "cvv 123 4111111111111111",
+            "id 12 4111 1111 1111 1111",
+            "pin 1 378282246310005",
+        ):
+            findings = scan_regex(text)
+            cc = [f for f in findings if f.category == "credit card number"]
+            assert cc, text
+            assert any("4111" in f.text or "3782" in f.text for f in cc), text
+
+    def test_luhn_invalid_after_prefix_still_not_flagged(self):
+        findings = scan_regex("order 99 4111111111111112")
+        assert not any(f.category == "credit card number" for f in findings)
+
+
+class TestGlinerEmptyCategories:
+    def test_explicit_empty_list_scans_nothing(self):
+        # Explicitly-empty admin list means "no categories" — returns []
+        # before any model load, so this runs without gliner installed.
+        result = asyncio.run(_scanner_mod.scan_gliner("ssn 123-45-6789", categories=[]))
+        assert result == []

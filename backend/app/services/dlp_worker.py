@@ -28,6 +28,20 @@ logger = get_logger(__name__)
 # Module-level queue — bounded to 10,000 to prevent unbounded memory growth
 _dlp_queue: asyncio.Queue = asyncio.Queue(maxsize=10_000)
 
+# Scans dropped on queue overflow, per process — exposed via /metrics so
+# coverage loss under load is observable (it used to be a log line only).
+_queue_dropped_total: int = 0
+
+# Concurrent scan consumers per worker process. One serial consumer let scan
+# lag reach p95 ~77s under GLiNER bursts (measured); a few concurrent scans
+# parallelize across the thread-pool executor (torch releases the GIL).
+# Admin-tunable via app_config dlp.worker.concurrency, re-read every
+# CONCURRENCY_CHECK_SECONDS, clamped to [1, MAX] (each GLiNER scan can pin a
+# CPU thread — the cap protects the inference API sharing this process).
+DLP_WORKER_DEFAULT_CONCURRENCY = 3
+DLP_WORKER_MAX_CONCURRENCY = 8
+CONCURRENCY_CHECK_SECONDS = 60.0
+
 # Cap on masked snippets stored per alert (see _process_one).
 MAX_STORED_ENTITIES = 50
 
@@ -102,17 +116,44 @@ def get_dlp_queue() -> asyncio.Queue:
     return _dlp_queue
 
 
+def get_queue_dropped_total() -> int:
+    """Scans dropped on overflow in this process (for /metrics)."""
+    return _queue_dropped_total
+
+
 async def enqueue_for_dlp(request_id: int) -> None:
     """Enqueue a request ID for DLP scanning. Non-blocking, drops if full."""
+    global _queue_dropped_total
     try:
         _dlp_queue.put_nowait(request_id)
     except asyncio.QueueFull:
-        logger.warning("dlp_queue_full", dropped_request_id=request_id)
+        _queue_dropped_total += 1
+        logger.warning("dlp_queue_full", dropped_request_id=request_id,
+                       dropped_total=_queue_dropped_total)
 
 
-async def dlp_worker_loop() -> None:
-    """Main DLP worker loop. Runs as a background task during app lifespan."""
-    logger.info("dlp_worker_started")
+async def _read_worker_concurrency(fallback: int = DLP_WORKER_DEFAULT_CONCURRENCY) -> int:
+    """Target consumer count from app_config, clamped.
+
+    On any error returns ``fallback`` (the caller passes its last-known-good
+    target): one transient failed poll must not snap an admin-raised pool back
+    to the default and cancel live consumers mid-scan.
+    """
+    try:
+        from backend.app.db import crud
+        from backend.app.db.session import get_async_db_context
+        async with get_async_db_context() as db:
+            raw = await crud.get_config_json(
+                db, "dlp.worker.concurrency", DLP_WORKER_DEFAULT_CONCURRENCY)
+        return max(1, min(DLP_WORKER_MAX_CONCURRENCY, int(raw)))
+    except Exception as e:
+        logger.warning("dlp_concurrency_poll_failed", error=type(e).__name__,
+                       keeping=fallback)
+        return fallback
+
+
+async def _consume_loop(worker_idx: int) -> None:
+    """One scan consumer. Exits only via cancellation (resize/shutdown)."""
     while True:
         try:
             request_id = await _dlp_queue.get()
@@ -123,11 +164,47 @@ async def dlp_worker_loop() -> None:
             finally:
                 _dlp_queue.task_done()
         except asyncio.CancelledError:
-            logger.info("dlp_worker_cancelled")
-            break
+            raise
         except Exception:
-            logger.exception("dlp_worker_error")
+            logger.exception("dlp_worker_error", worker=worker_idx)
             await asyncio.sleep(1)
+
+
+async def dlp_worker_loop() -> None:
+    """DLP worker supervisor. Runs as a background task during app lifespan.
+
+    Keeps dlp.worker.concurrency consumer tasks draining the shared queue and
+    hot-resizes when the config changes (checked every CONCURRENCY_CHECK_SECONDS).
+    Shrinking cancels the newest consumer; a scan cancelled mid-item is lost,
+    which matches the queue's existing best-effort contract. Per-process state
+    the consumers share (_dedup_seen, _email_budget, _scanner_error_seen) is
+    mutated only in synchronous sections, so concurrent consumers on one event
+    loop cannot interleave inside a check-and-set.
+    """
+    logger.info("dlp_worker_started")
+    consumers: list = []
+    target = DLP_WORKER_DEFAULT_CONCURRENCY
+    try:
+        while True:
+            target = await _read_worker_concurrency(fallback=target)
+            # Restart any consumer that died (should not happen — belt and braces).
+            for i, t in enumerate(consumers):
+                if t.done():
+                    logger.error("dlp_consumer_died", worker=i)
+                    consumers[i] = asyncio.create_task(_consume_loop(i))
+            while len(consumers) < target:
+                consumers.append(asyncio.create_task(_consume_loop(len(consumers))))
+                logger.info("dlp_consumer_started", total=len(consumers))
+            while len(consumers) > target:
+                t = consumers.pop()
+                t.cancel()
+                logger.info("dlp_consumer_stopped", total=len(consumers))
+            await asyncio.sleep(CONCURRENCY_CHECK_SECONDS)
+    except asyncio.CancelledError:
+        logger.info("dlp_worker_cancelled")
+        for t in consumers:
+            t.cancel()
+        await asyncio.gather(*consumers, return_exceptions=True)
 
 
 async def _process_one(request_id: int) -> None:

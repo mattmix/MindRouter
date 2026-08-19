@@ -63,6 +63,16 @@ TOKENS_PROCESSED = Counter(
     "Total tokens processed",
     ["type"],  # prompt, completion
 )
+# Per-process values (each uvicorn worker has its own DLP queue) — a scrape
+# reports whichever worker answered, same caveat as every gauge here.
+DLP_QUEUE_SIZE = Gauge(
+    "mindrouter_dlp_queue_size",
+    "DLP scan queue depth in this worker process",
+)
+DLP_QUEUE_DROPPED = Gauge(
+    "mindrouter_dlp_queue_dropped",
+    "DLP scans dropped on queue overflow in this worker process (running total)",
+)
 
 
 @router.get("/healthz")
@@ -121,16 +131,30 @@ async def prometheus_metrics() -> Response:
 
     Returns metrics in Prometheus text format.
     """
+    # In-process DLP gauges first — they cannot fail on a DB/registry outage,
+    # which is exactly when the queue balloons and stale values would hide it.
     try:
-        # Update dynamic metrics
+        from backend.app.services.dlp_worker import (
+            get_dlp_queue, get_queue_dropped_total,
+        )
+        DLP_QUEUE_SIZE.set(get_dlp_queue().qsize())
+        DLP_QUEUE_DROPPED.set(get_queue_dropped_total())
+    except Exception:
+        pass
+
+    # Each remote-state gauge fails independently so one outage does not
+    # freeze the others at stale values.
+    try:
         scheduler = get_scheduler()
         stats = await scheduler.get_stats()
         QUEUE_SIZE.set(stats["queue"]["total"])
+    except Exception:
+        pass
 
+    try:
         registry = get_registry()
         backends = await registry.get_healthy_backends()
         ACTIVE_BACKENDS.set(len(backends))
-
     except Exception:
         pass
 

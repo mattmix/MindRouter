@@ -1232,35 +1232,33 @@ async def create_quota(
 
 async def update_quota_usage(
     db: AsyncSession, user_id: int, tokens_used: int
-) -> Optional[Quota]:
+) -> None:
     """Update quota token usage in DB (Redis increment happens post-commit).
 
-    When Redis is available, this only stages the DB quota object for return;
-    the caller must call ``incr_quota_redis(user_id, tokens_used)`` **after**
+    The caller must call ``incr_quota_redis(user_id, tokens_used)`` **after**
     a successful ``db.commit()`` to avoid drift between Redis and the ledger.
-
-    When Redis is unavailable, falls back to a direct DB increment that will
-    be committed with the rest of the transaction.
+    When Redis is unavailable, the period counter is also incremented in the
+    DB and commits with the rest of the transaction.
 
     lifetime_tokens_used is always incremented in the DB regardless of Redis
     availability — it is a monotonic counter that never resets.
+
+    Atomic ``SET x = x + n`` on purpose: the quotas row is the hottest row a
+    bursty single user touches, and the previous SELECT-then-flush pattern
+    made concurrent completion transactions deadlock (MariaDB 1213) — which
+    aborted the whole completion write. No row load, no read-modify-write
+    window, deadlock-free ordering with update_api_key_usage.
     """
     from backend.app.core.redis_client import is_available
 
-    result = await db.execute(select(Quota).where(Quota.user_id == user_id))
-    quota = result.scalar_one_or_none()
-    if not quota:
-        return None
-
-    # Always increment lifetime counter in DB
-    quota.lifetime_tokens_used += tokens_used
-
+    values = {"lifetime_tokens_used": Quota.lifetime_tokens_used + tokens_used}
     if not is_available():
-        # Fallback: also increment period counter in DB
-        quota.tokens_used += tokens_used
+        # Fallback: also increment the period counter in the DB
+        values["tokens_used"] = Quota.tokens_used + tokens_used
 
-    await db.flush()
-    return quota
+    await db.execute(
+        update(Quota).where(Quota.user_id == user_id).values(**values)
+    )
 
 
 async def incr_quota_redis(user_id: int, tokens_used: int) -> None:
