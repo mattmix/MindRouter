@@ -1,4 +1,4 @@
-.PHONY: help dev test test-unit test-int test-e2e test-smoke test-stress test-matrix test-thinking test-tools test-a11y test-sidecar test-all lint format migrate seed docker-up docker-down clean
+.PHONY: help dev test test-unit test-int test-e2e test-smoke test-stress test-matrix test-thinking test-tools test-a11y test-sidecar test-all lint format migrate seed docker-up docker-down clean dlp-corpus dlp-offline dlp-mock dlp-e2e dlp-load dlp-report
 
 # Default target
 help:
@@ -24,6 +24,14 @@ help:
 	@echo "  make test-sidecar  - Run GPU sidecar tests"
 	@echo "  make test-all      - Run unit + integration + sidecar tests"
 	@echo "  make coverage      - Run tests with coverage report"
+	@echo ""
+	@echo "DLP Evaluation Harness (dlp_harness/README.md; local stack only):"
+	@echo "  make dlp-corpus    - Generate a labeled synthetic corpus (PROFILE/SIZE/SEED)"
+	@echo "  make dlp-offline   - Offline scanner eval over CORPUS= (SCANNERS=regex,gliner)"
+	@echo "  make dlp-mock      - Serve the mock vLLM backend (PORT=9101)"
+	@echo "  make dlp-e2e       - E2E detection run: CORPUS= API_KEY= ADMIN_KEY= (MODE=regex)"
+	@echo "  make dlp-load      - Load/overhead matrix: CORPUS= ADMIN_KEY= (MODES, CONCURRENCIES)"
+	@echo "  make dlp-report    - Build HTML/JSON report from RUNS=dir1,dir2,..."
 	@echo ""
 	@echo "Code Quality:"
 	@echo "  make lint          - Run linters"
@@ -103,6 +111,29 @@ test-all:
 coverage:
 	pytest backend/app/tests --cov=backend/app --cov-report=html --cov-report=term-missing
 	@echo "Coverage report generated in htmlcov/"
+
+# DLP Evaluation Harness (dlp_harness/ — see dlp_harness/README.md)
+# BASE_URL deliberately never defaults to production; the harness itself
+# also refuses non-local gateways/DB hosts without an explicit override.
+comma := ,
+
+dlp-corpus:
+	python -m dlp_harness corpus --profile $(or $(PROFILE),accuracy) --size $(or $(SIZE),500) --seed $(or $(SEED),42)
+
+dlp-offline:
+	python -m dlp_harness offline --corpus $(CORPUS) --scanners $(or $(SCANNERS),regex) --gliner-threshold $(or $(GLINER_THRESHOLD),0.5) $(DLP_OFFLINE_FLAGS)
+
+dlp-mock:
+	python -m dlp_harness mock serve --host $(or $(HOST),127.0.0.1) --port $(or $(PORT),9101)
+
+dlp-e2e:
+	python -m dlp_harness e2e --corpus $(CORPUS) --base-url $(or $(BASE_URL),http://localhost:8000) --api-key $(API_KEY) --admin-key $(ADMIN_KEY) --mode $(or $(MODE),regex) --plant-side $(or $(PLANT_SIDE),mixed) --concurrency $(or $(CONCURRENCY),4)
+
+dlp-load:
+	python -m dlp_harness load --corpus $(CORPUS) --base-url $(or $(BASE_URL),http://localhost:8000) --admin-key $(ADMIN_KEY) --provision $(or $(USERS),4) --modes $(or $(MODES),off$(comma)regex) --concurrencies $(or $(CONCURRENCIES),1$(comma)4$(comma)16) --duration $(or $(DURATION),60) --warmup $(or $(WARMUP),10)
+
+dlp-report:
+	python -m dlp_harness report --runs $(RUNS) --title "$(or $(TITLE),DLP Evaluation Report)"
 
 # Code Quality
 lint:

@@ -21,6 +21,7 @@
 | `run sidecar tests`   | `make test-sidecar`| GPU sidecar agent tests                              |
 | `run all tests`       | `make test-all`    | Unit + integration + E2E + smoke + sidecar tests     |
 | `run coverage`        | `make coverage`    | Unit + integration tests with coverage report        |
+| `run dlp harness`     | `make dlp-corpus` / `dlp-offline` / `dlp-mock` / `dlp-e2e` / `dlp-load` / `dlp-report` | DLP evaluation harness runs against the local stack (section 12; its unit tests run under `make test-unit`) |
 
 ---
 
@@ -67,6 +68,14 @@
 | `backend/app/tests/unit/test_dlp.py` | 45 | DLP scanner: regex (SSN, CC, email, keywords, custom patterns), severity classification, text extraction (messages, images, response), ScanResult/ScanFinding dataclasses; 2.9.9: scan_llm takes an injected completion callable (no api_key/base_url/httpx), `<think>` + markdown-fence stripping, parse failures never log scanned content, snippet masking, malformed custom patterns can't abort a scan, scan-text cap |
 | `backend/app/tests/unit/test_config_export_redaction.py` | 39 | Role-scoped config backup export (2.9.9): `_redact_row` nulls password hashes, API key hashes, and secret app_config values while leaving `key_prefix` and ordinary settings intact; the secret matcher must NOT match bare `token` (would blank `ocr.max_tokens`, `stats.token_offset`, `vid.token_cost_per_second`); serialized-payload sentinel check; `redact_secrets` defaults off so admin restores keep working; metadata `redacted` flag; `import_config_tables` refuses a redacted backup; route redacts for non-admins, names the file distinctly, audit-logs the download; auditors are told their copy is redacted; restore no longer reflects exception text |
 | `backend/app/tests/unit/test_dlp_worker.py` | 69 | DLP worker + admin surface (2.9.9, previously untested): credential removal (no raw key in app_config, no `ensure_internal_api_key`, migration 071 revokes before deleting), `_internal_chat` direct-to-backend dispatch (no Authorization header, thinking disabled on vLLM, raises when no healthy backend / circuit open), email contract (AST cross-check that every `email_service.*` call resolves — the `send_email()` that never existed), subject/body correctness, flood-guard burst + suppressed-count carry-over, config-save validation (invalid regex/JSON shape/threshold/email rejected with zero writes), fail-closed `_json_ready` guard so a dead page script can't wipe severity rules/patterns, **template block-name contract (every child `{% block %}` must exist in its parent — `dlp.html` used `scripts` where `base.html` defines `extra_js`, silently killing all page JS)**, public-documentation truth, filter-param normalization, `dlp_alerts` retention wiring |
+| `backend/app/tests/unit/test_dlp_harness_e2e.py` | 21 | DLP harness e2e layer (`dlp_harness/gateway.py` + `dlp_harness/e2e.py`), no live HTTP/DB (fake ASGI gateway via httpx.ASGITransport + dict-backed FakeDB with the HarnessDB surface): send_chat request_uuid extraction (non-stream body `id`, streaming first-chunk `id` the gateway stamps), transport errors never raise, plant_side=response carries only base64 (raw PII absent from the prompt, present only in the mock's reply); active-scope map per scanner mode; full run_e2e scoring (coverage + in-scope split, clean-FP rate, per-category detection, severity matrix, `dlp_scanner_error` alerts excluded everywhere but counted, multi-alert-per-request keeps first + notes extras, purge cleanup incl. canary, keep_alerts skips purge); config lifecycle (snapshot → mode + SAFE_RUN_OVERRIDES → restore in finally, incl. on mid-run exception and preflight failure; skip_config touches nothing); preflight failure modes (audit prompt/response capture OFF, canary SSN never alerts); drain settle logic under a fake clock (settles after count stable, gives up at timeout); prod guard on run_e2e and every gateway function |
+| `backend/app/tests/unit/test_dlp_harness_corpus.py` | 11 | DLP harness corpus generator (`dlp_harness/corpus.py` + `generators.py`): every ground-truth span slices back to its exact planted text across all four profiles, byte-identical determinism per seed, planted credit cards are Luhn-valid while `luhn_invalid` negatives fail Luhn, ABA routing checksums, negatives declare what they mimic, regex-detectability smoke against the ACTUAL built-in scanner patterns, load-profile value uniqueness + meta, scale-profile depth positions, adversarial profile all-dirty marking, write_corpus round trip |
+| `backend/app/tests/unit/test_dlp_harness_matching.py` | 42 | DLP harness finding↔ground-truth matcher (`dlp_harness/matching.py`): normalize_findings (dict/object/Finding passthrough, unmapped categories, malformed span collapse, empty input), lenient vs strict span matching, multi-scanner overlap, adjacency double-count, duplicate findings, boundary/zero-width entities, `iou_threshold` gating, spanless LLM findings (all three match branches + non-match→FP), false-positive + negative-trap attribution (dedup, sorted), severity prediction (unmapped→moderate, none→minor) + severity_expected, DocEval bookkeeping, scan_error passthrough, match_corpus |
+| `backend/app/tests/unit/test_dlp_harness_metrics.py` | 26 | DLP harness metric reductions (`dlp_harness/metrics.py`): span confusion micro/per-category/macro, strict mode demotes mislabeled hits to FN, scan-error docs excluded, hand-computed doc confusion incl. all-clean/all-dirty None ratios, severity accuracy, recall_by difficulty/carrier (+unknown-key rejection), scope splits (empty bucket → None), bootstrap CIs (reproducible per seed, contains point estimate, degenerate flags), threshold sweeps (recall monotone, hand-checked AUCs, no-valid-points), percentile interpolation + latency summaries |
+| `backend/app/tests/unit/test_dlp_harness_bridge.py` | 12 | DLP harness scanner bridge (`dlp_harness/scanner_bridge.py`): spec-loads the REAL `dlp_scanner.py` without triggering the app import chain (nulled logger), scanner path resolution, gliner availability probing, scan_documents finding/latency/error normalization over regex, prod-default config shape |
+| `backend/app/tests/unit/test_dlp_harness_load.py` | 22 | DLP harness load/overhead driver (`dlp_harness/load.py`), pure functions only — no network/DB/docker: phase summarization (warmup exclusion, RPS, non-stream ttfb/ttft nulled), off-vs-mode baseline pairing math incl. null latencies, docker-stats + gateway-queue Prometheus parsers (units, dashes, prefix collisions), drain-settle under a fake clock (settles, times out, zero settle window), per-phase DLP measurement (error alerts + warmup excluded, no-uuids→nulls), DocCycler round-robin determinism + dirty-rate extremes + validation, prod guard + argument validation |
+| `backend/app/tests/unit/test_dlp_harness_report.py` | 17 | DLP harness report builder (`dlp_harness/report.py`): full generate_report over contract-shaped run dirs (markdown + HTML + JSON), healthy data yields zero findings, each recommendation rule fires on its trigger (Luhn CC precision, trap specificity, threshold move, coverage drop = critical + names the phase, drain backlog, overhead, scan errors, truncation blindness) and stays silent when healthy, findings sorted most-severe first, empty/malformed/missing run dirs warn instead of crashing, load_phases merged across dirs |
+| `backend/app/tests/unit/test_dlp_harness_cli.py` | 23 | DLP harness CLI + offline orchestration (`dlp_harness/__main__.py` + `offline_eval.py`): argparse dispatch for every subcommand against stubbed module entry points (args forwarded faithfully incl. `--modes`/`--concurrencies`/`--api-keys` list parsing and `mock serve` remainder argv), REAL corpus + offline regex runs into tmp (offline_metrics.json keys match the artifact contract; sweep + bootstrap present), `--runs-root` override, teardown-by-prefix over a fake httpx transport deletes only `_dlpharness_` users, prod guards on mock/provision/e2e/load, load provision+teardown incl. teardown-still-runs-when-the-run-fails, report dispatch, db-check with a stubbed HarnessDB |
 | `backend/app/tests/unit/test_latex_normalize.py` | 29 | LaTeX normalization: $$-block preservation (v2.4.2 regression), bare command/operator wrapping, display math promotion, inline preservation, mixed content, code block immunity, \\begin/\\end environments |
 | `backend/app/tests/unit/test_ocr.py` | 27 | OCR pipeline: chunking logic, fence stripping, prompt building, overlap detection, deterministic merge, image conversion, PDF fixture |
 | `backend/app/tests/unit/test_responses_in.py` | 46 | ResponsesIn translator: input polymorphism (string/items/typeless), function-call round trip via call_id, flat tool re-nesting + non-function strip, text.format, reasoning.effort→think, truncation flag, format_response/build_snapshot, vLLM round trip |
@@ -362,6 +371,51 @@ sharing the GPU poisoned an earlier run — always bench on an **exclusive** GPU
 depth 1–2 (83%/71%) but **collapses at depth 3 (29%)**, where it drafts 7,104 tokens to accept
 2,086 and yields *no more* tokens/forward than mtp-1 — landing back at the 0.23 baseline. **mtp-2
 is the deployed optimum** for the 122b, while qwen3.6-27b/35b hold 73–85% at depth 3 and use mtp-3.
+
+---
+
+## 12. DLP Evaluation Harness
+
+**Runner:** `python -m dlp_harness <subcommand>` (harness runs); `pytest backend/app/tests/unit/ -k dlp_harness -q` (its unit tests — 174 across 8 files, all included in `make test-unit`)
+**Makefile:** `make dlp-corpus`, `make dlp-offline`, `make dlp-mock`, `make dlp-e2e`, `make dlp-load`, `make dlp-report`
+**Requirements:** Unit tests: none beyond the unit suite (no live HTTP, no real DB — stubs, fakes, httpx mock/ASGI transports). Harness *runs*: the local stack (`docker compose up -d --build`) plus `httpx` and `pymysql`; `offline --in-container` shells out to docker compose; e2e/load additionally need the mock backend registered and an admin key. Safety: every command that touches a gateway or DB refuses non-local hosts without `--allow-prod`; scanner-mode changes snapshot all `dlp.*` config keys and restore them in a `finally:`; `SAFE_RUN_OVERRIDES` forces DLP email off and dedup off on every run; e2e purges the alert rows it created unless `--keep-alerts`.
+
+Measurement suite for the DLP subsystem (`backend/app/services/dlp_scanner.py` + `dlp_worker.py`): synthetic corpora with span-exact ground truth, the production scanner code exercised offline and end-to-end through the gateway (mock vLLM backend), reduced to precision/recall/F1, threshold sweeps, coverage/scan-lag, and DLP-on-vs-off overhead with an HTML/JSON report. Artifacts land under `dlp_harness_runs/<ts>-<kind>/`. Full operator guide: `dlp_harness/README.md`.
+
+```bash
+# Offline (no services needed for regex; gliner via the app container)
+python -m dlp_harness corpus --profile accuracy --size 500 --seed 42
+python -m dlp_harness offline --corpus dlp_harness_runs/<ts>-corpus/corpus.jsonl --scanners regex
+python -m dlp_harness offline --corpus <corpus.jsonl> --scanners regex,gliner --in-container --sweep
+
+# Online (local stack): mock backend + harness users + e2e + load
+python -m dlp_harness mock serve --port 9101
+python -m dlp_harness mock register --base-url http://localhost:8000 --admin-key $ADMIN_KEY \
+    --backend-url http://host.docker.internal:9101
+python -m dlp_harness provision --base-url http://localhost:8000 --admin-key $ADMIN_KEY --users 4
+python -m dlp_harness e2e --corpus <corpus.jsonl> --base-url http://localhost:8000 \
+    --api-key <mr2_user_key> --admin-key $ADMIN_KEY --mode regex --plant-side mixed
+python -m dlp_harness load --corpus <load-corpus.jsonl> --base-url http://localhost:8000 \
+    --admin-key $ADMIN_KEY --provision 4 --modes off,regex --concurrencies 1,4,16 --duration 60
+python -m dlp_harness report --runs <offline-run>,<e2e-run>,<load-run>
+
+# Sanity + cleanup
+python -m dlp_harness db-check     # DB reachable, dlp.enabled, alert count, dlp.* key inventory
+python -m dlp_harness provision --base-url http://localhost:8000 --admin-key $ADMIN_KEY --teardown
+```
+
+| File | What it covers |
+|------|----------------|
+| `backend/app/tests/unit/test_dlp_harness_corpus.py` | Corpus generator: span integrity, per-seed determinism, Luhn/ABA checksums (valid entities, invalid traps), regex-detectability against the actual built-in patterns, load/scale/adversarial profile invariants, round trip |
+| `backend/app/tests/unit/test_dlp_harness_matching.py` | Finding↔ground-truth matcher: normalization, lenient vs strict spans, IoU gating, spanless LLM findings, FP + trap attribution, severity prediction, DocEval bookkeeping |
+| `backend/app/tests/unit/test_dlp_harness_metrics.py` | Metric reductions: doc/span confusion (micro/macro, strict), scope splits, grouped recall, severity accuracy, bootstrap CIs, threshold sweeps + AUC, percentiles |
+| `backend/app/tests/unit/test_dlp_harness_bridge.py` | Scanner bridge: spec-loads the real `dlp_scanner.py` outside the app import chain, gliner availability, scan_documents normalization, prod-default config |
+| `backend/app/tests/unit/test_dlp_harness_e2e.py` | Gateway layer + e2e run: uuid correlation (non-stream body id, stamped SSE id), plant-side base64 isolation, config snapshot→overrides→restore-in-finally, preflight (audit capture, canary), drain settle, scoring incl. `dlp_scanner_error` exclusion, purge, prod guards |
+| `backend/app/tests/unit/test_dlp_harness_load.py` | Load driver pure functions: phase summarization, baseline pairing, docker-stats/queue parsers, drain settle under fake clock, DocCycler determinism, prod guard |
+| `backend/app/tests/unit/test_dlp_harness_report.py` | Report builder: contract-shaped run dirs → md/HTML/JSON, every recommendation rule (fires on trigger, silent when healthy), severity ordering, tolerant of missing/malformed artifacts |
+| `backend/app/tests/unit/test_dlp_harness_cli.py` | CLI dispatch for every subcommand (stubbed entry points, list parsing, `mock serve` remainder), real corpus + offline regex artifact runs, teardown-by-prefix via fake transport, prod guards, db-check with stubbed HarnessDB |
+
+Per-file test counts live in the section 1 table (`test_dlp_harness_*` rows).
 
 ---
 
