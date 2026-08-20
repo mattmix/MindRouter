@@ -254,6 +254,18 @@
         div.textContent = typeof text === 'string' ? text : JSON.stringify(text);
         return div.innerHTML;
     }
+
+    // Deep-link target (e.g. from the DLP alerts table): the filtered result is
+    // the single matching request — expand its detail and scroll to it so the
+    // page lands directly on the record instead of a collapsed one-row list.
+    var focusUuid = {{ focus_uuid | tojson }};
+    if (focusUuid) {
+        var focusBtn = document.querySelector('.audit-reveal-btn[data-req-uuid="' + focusUuid + '"]');
+        if (focusBtn) {
+            focusBtn.click();
+            focusBtn.closest('tr').scrollIntoView({block: 'center'});
+        }
+    }
 })();
 </script>
 {% endblock %}

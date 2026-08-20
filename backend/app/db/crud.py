@@ -3055,6 +3055,7 @@ def _build_request_filter_conditions(
     start_date: Optional[datetime] = None,
     end_date: Optional[datetime] = None,
     search_text: Optional[str] = None,
+    request_uuid: Optional[str] = None,
 ) -> list:
     """Build shared filter conditions for request queries."""
     conditions = []
@@ -3068,14 +3069,16 @@ def _build_request_filter_conditions(
         conditions.append(Request.created_at >= start_date)
     if end_date:
         conditions.append(Request.created_at <= end_date)
+    # Exact, indexed lookup of a single request (request_uuid is unique+indexed).
+    # Used for deep-links like the DLP alerts table — resolves instantly instead
+    # of the leading-wildcard content scan that search_text below performs.
+    if request_uuid:
+        conditions.append(Request.request_uuid == request_uuid)
     if search_text:
         conditions.append(
             or_(
                 Request.prompt.ilike(f"%{search_text}%"),
                 func.json_extract(Request.messages, "$").ilike(f"%{search_text}%"),
-                # Lets a search land a single request by its UUID — e.g. the DLP
-                # alerts table deep-links here as /admin/audit?search=<uuid>.
-                Request.request_uuid.ilike(f"%{search_text}%"),
             )
         )
     return conditions
@@ -3089,6 +3092,7 @@ async def search_requests(
     start_date: Optional[datetime] = None,
     end_date: Optional[datetime] = None,
     search_text: Optional[str] = None,
+    request_uuid: Optional[str] = None,
     cursor_before: Optional[int] = None,
     page: Optional[int] = None,
     last_page: bool = False,
@@ -3103,7 +3107,7 @@ async def search_requests(
     - None of the above: first page (equivalent to page=1)
     """
     base_conditions = _build_request_filter_conditions(
-        user_id, model, status, start_date, end_date, search_text
+        user_id, model, status, start_date, end_date, search_text, request_uuid
     )
     count_where = and_(*base_conditions) if base_conditions else True
     count_result = await db.execute(

@@ -2901,6 +2901,7 @@ async def admin_energy(
 async def admin_audit(
     request: Request,
     search: Optional[str] = None,
+    request_uuid: Optional[str] = None,
     user_id_filter: Optional[str] = None,
     model_filter: Optional[str] = None,
     status_filter: Optional[str] = None,
@@ -2971,6 +2972,7 @@ async def admin_audit(
     filter_kwargs = dict(
         user_id=parsed_user_id, model=model_filter, status=parsed_status,
         start_date=parsed_start, end_date=parsed_end, search_text=search,
+        request_uuid=request_uuid,
     )
 
     audit_requests, total = await crud.search_requests(
@@ -3015,6 +3017,7 @@ async def admin_audit(
             "next_cursor": next_cursor,
             "using_cursor": using_cursor,
             "search": search or "",
+            "focus_uuid": request_uuid or "",
             "user_id_filter": user_id_filter or "",
             "model_filter": model_filter or "",
             "status_filter": status_filter or "",

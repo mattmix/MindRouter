@@ -533,7 +533,7 @@
                                     <td>{{ alert.user.email if alert.user else 'N/A' }}</td>
                                     <td>
                                         {% if alert.request and alert.request.request_uuid %}
-                                        <a href="/admin/audit?search={{ alert.request.request_uuid }}" class="text-decoration-none" title="View this request in the audit log">#{{ alert.request_id }}</a>
+                                        <a href="/admin/audit?request_uuid={{ alert.request.request_uuid }}" class="text-decoration-none" title="View this request in the audit log">#{{ alert.request_id }}</a>
                                         {% elif alert.request_id %}
                                         <span class="text-muted">#{{ alert.request_id }}</span>
                                         {% else %}
