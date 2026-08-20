@@ -85,6 +85,11 @@ async def ollama_chat(
 
     service = InferenceService(db)
 
+    # Inline DLP prompt gate (no-op unless blocking is on).
+    await service.enforce_prompt_dlp(
+        canonical, user, api_key, request, endpoint="/api/chat"
+    )
+
     # Ollama defaults to streaming
     if canonical.stream:
         return StreamingResponse(

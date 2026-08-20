@@ -707,6 +707,24 @@ def create_app() -> FastAPI:
     instrument_app(app)
 
     # Exception handlers
+    from backend.app.services.dlp_enforcement import DlpBlockedError
+
+    @app.exception_handler(DlpBlockedError)
+    async def dlp_blocked_handler(request: Request, exc: DlpBlockedError):
+        """Inline DLP block -> 422 with a clear, non-leaking explanation."""
+        return JSONResponse(
+            status_code=422,
+            content={
+                "error": {
+                    "message": exc.client_message(),
+                    "type": "dlp_policy_violation",
+                    "code": "dlp_blocked",
+                    "severity": exc.severity,
+                    "categories": exc.categories,
+                }
+            },
+        )
+
     @app.exception_handler(Exception)
     async def global_exception_handler(request: Request, exc: Exception):
         """Global exception handler."""

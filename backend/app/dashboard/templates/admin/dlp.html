@@ -390,31 +390,57 @@
                             </div>
                         </div>
 
-                        <!-- ==================== Email Notifications ==================== -->
+                        <!-- ==================== Detection Action ==================== -->
                         <div class="card mb-4">
-                            <div class="card-header"><h5 class="mb-0">Email Notifications</h5></div>
+                            <div class="card-header"><h5 class="mb-0">Detection Action</h5></div>
                             <div class="card-body">
-                                <p class="text-muted small">For each severity, choose how alerts are delivered: <strong>Immediate</strong> (email now to that severity's recipients), <strong>Digest</strong> (roll into the scheduled report below), or <strong>Off</strong> (logged only, no email). Separate multiple addresses with commas. Requires SMTP configured in Settings.</p>
+                                <p class="text-muted small">For each severity, choose what happens when DLP detects sensitive data: <strong>Block</strong> the request (the caller receives a <code>422</code> with a clear explanation) and/or <strong>Alert</strong> by email. The two are independent &mdash; enable either, both, or neither. Alerting is asynchronous and adds <strong>no latency</strong>; blocking runs an inline scan and only adds latency when at least one Block is on.</p>
 
-                                {% for row in [
-                                    {"key": "minor", "label": "Minor", "badge": "bg-info", "ph": "user@example.com"},
-                                    {"key": "moderate", "label": "Moderate", "badge": "bg-warning text-dark", "ph": "security@example.com"},
-                                    {"key": "major", "label": "Major", "badge": "bg-danger", "ph": "ciso@example.com, compliance@example.com"}
-                                ] %}
-                                {% set mode = config['email_' ~ row.key ~ '_mode'] %}
                                 <div class="mb-3">
-                                    <label class="form-label" for="email_{{ row.key }}"><span class="badge {{ row.badge }}">{{ row.label }}</span></label>
-                                    <div class="d-flex gap-2">
-                                        <select class="form-select form-select-sm" style="max-width: 10rem;" name="email_{{ row.key }}_mode" id="email_{{ row.key }}_mode">
-                                            <option value="immediate" {% if mode == 'immediate' %}selected{% endif %}>Immediate</option>
-                                            <option value="digest" {% if mode == 'digest' %}selected{% endif %}>Digest</option>
-                                            <option value="off" {% if mode == 'off' %}selected{% endif %}>Off (log only)</option>
-                                        </select>
-                                        <input type="text" class="form-control form-control-sm" id="email_{{ row.key }}" name="email_{{ row.key }}"
-                                               value="{{ config['email_' ~ row.key] }}" placeholder="{{ row.ph }}">
-                                    </div>
+                                    <label class="form-label fw-bold" for="block_scope">Block scope</label>
+                                    <select class="form-select form-select-sm" style="max-width: 30rem;" name="block_scope" id="block_scope">
+                                        <option value="prompt" {% if config.block_scope == 'prompt' %}selected{% endif %}>Prompt only &mdash; reject the request before the model runs</option>
+                                        <option value="response" {% if config.block_scope == 'response' %}selected{% endif %}>Response only &mdash; withhold the model's output</option>
+                                        <option value="both" {% if config.block_scope == 'both' %}selected{% endif %}>Both prompt and response</option>
+                                    </select>
+                                    <div class="form-text">What a <strong>Block</strong> action inspects. <strong>Prompt only</strong> (default) rejects before generation and does not affect streaming. Response/both buffer the output (no token streaming) for scanned requests. If the scanners are unavailable, blocking <strong>fails open</strong> &mdash; the request is allowed and the gap is logged &mdash; so a DLP outage cannot take down the gateway. The inline scan uses regex + GLiNER on the off-host pool.</div>
                                 </div>
-                                {% endfor %}
+
+                                <div class="table-responsive">
+                                <table class="table table-sm align-middle mb-1">
+                                    <thead><tr>
+                                        <th>Severity</th>
+                                        <th class="text-center">Block<br><small class="text-muted fw-normal">422</small></th>
+                                        <th class="text-center">Alert<br><small class="text-muted fw-normal">email</small></th>
+                                        <th>Delivery</th>
+                                        <th>Recipients</th>
+                                        <th class="text-center">Email<br><small class="text-muted fw-normal">user</small></th>
+                                    </tr></thead>
+                                    <tbody>
+                                    {% for row in [
+                                        {"key": "major", "label": "Major", "badge": "bg-danger", "ph": "ciso@example.com, compliance@example.com"},
+                                        {"key": "moderate", "label": "Moderate", "badge": "bg-warning text-dark", "ph": "security@example.com"},
+                                        {"key": "minor", "label": "Minor", "badge": "bg-info", "ph": "user@example.com"}
+                                    ] %}
+                                    {% set mode = config['email_' ~ row.key ~ '_mode'] %}
+                                    <tr>
+                                        <td><span class="badge {{ row.badge }}">{{ row.label }}</span></td>
+                                        <td class="text-center"><input class="form-check-input" type="checkbox" name="block_{{ row.key }}" id="block_{{ row.key }}" {% if config['block_' ~ row.key] %}checked{% endif %}></td>
+                                        <td class="text-center"><input class="form-check-input" type="checkbox" name="alert_{{ row.key }}" id="alert_{{ row.key }}" {% if config['alert_' ~ row.key] %}checked{% endif %}></td>
+                                        <td>
+                                            <select class="form-select form-select-sm" style="max-width: 9rem;" name="email_{{ row.key }}_mode" id="email_{{ row.key }}_mode">
+                                                <option value="immediate" {% if mode == 'immediate' %}selected{% endif %}>Immediate</option>
+                                                <option value="digest" {% if mode == 'digest' %}selected{% endif %}>Digest</option>
+                                            </select>
+                                        </td>
+                                        <td><textarea class="form-control form-control-sm" rows="1" name="email_{{ row.key }}" id="email_{{ row.key }}" placeholder="{{ row.ph }}">{{ config['email_' ~ row.key] }}</textarea></td>
+                                        <td class="text-center"><input class="form-check-input" type="checkbox" name="notify_user_{{ row.key }}" id="notify_user_{{ row.key }}" {% if config['notify_user_' ~ row.key] %}checked{% endif %}></td>
+                                    </tr>
+                                    {% endfor %}
+                                    </tbody>
+                                </table>
+                                </div>
+                                <div class="form-text mb-3"><strong>Recipients</strong> accept multiple addresses separated by commas or new lines. <strong>Email user</strong> also sends the alert to the requesting user's own address. <strong>Delivery</strong> controls Alert timing: Immediate emails now; Digest rolls into the scheduled report below. Alerting requires SMTP configured in Settings.</div>
 
                                 <hr>
                                 <h6 class="mb-1">Digest report</h6>

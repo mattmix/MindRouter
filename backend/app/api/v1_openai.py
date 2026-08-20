@@ -108,6 +108,12 @@ async def chat_completions(
     # Create inference service
     service = InferenceService(db)
 
+    # Inline DLP prompt gate (before the stream branch so a block returns a
+    # clean 422 rather than a broken SSE stream). No-op unless blocking is on.
+    await service.enforce_prompt_dlp(
+        canonical, user, api_key, request, endpoint="/v1/chat/completions"
+    )
+
     # Handle streaming vs non-streaming
     if canonical.stream:
         return StreamingResponse(
@@ -180,6 +186,11 @@ async def completions(
         )
 
     service = InferenceService(db)
+
+    # Inline DLP prompt gate (no-op unless blocking is on).
+    await service.enforce_prompt_dlp(
+        canonical, user, api_key, request, endpoint="/v1/completions"
+    )
 
     if canonical.stream:
         return StreamingResponse(
