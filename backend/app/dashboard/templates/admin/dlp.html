@@ -275,11 +275,18 @@
                                     </div>
                                     <div class="card-body">
                                         <p class="text-muted small">Run the same GLiNER model on a GPU node behind an HTTP service instead of on this host's CPU. When enabled, scans call the service; on any failure the fallback below decides what happens. Leave disabled to keep the built-in on-host scanner.</p>
+                                        <div class="alert alert-info d-flex align-items-start py-2 mb-3" role="alert">
+                                            <i class="bi bi-magic me-2 fs-5"></i>
+                                            <div class="small">
+                                                <strong>Leave the Service URLs blank to auto-discover the fleet.</strong>
+                                                With no URLs listed, MindRouter automatically uses <strong>every registered <code>engine=dlp</code> backend</strong> that is currently healthy — nodes are added and removed as the fleet changes, with no config edits here. This is the recommended setup. Only list URLs below if you want to <em>pin</em> a fixed, manual set instead.
+                                            </div>
+                                        </div>
                                         <div class="mb-3">
-                                            <label class="form-label fw-bold" for="remote_endpoints">Service URL(s)</label>
+                                            <label class="form-label fw-bold" for="remote_endpoints">Service URL(s) <span class="fw-normal text-muted">— optional; blank = auto-discover fleet DLP nodes</span></label>
                                             <textarea class="form-control form-control-sm" id="remote_endpoints" name="remote_endpoints"
-                                                      rows="3" placeholder="https://gpu-node1.hpc.uidaho.edu:8710&#10;https://gpu-node2.hpc.uidaho.edu:8710">{{ config.remote_endpoints }}</textarea>
-                                            <div class="form-text">One endpoint per line; requests go to <code>{URL}/scan</code>. Requests load-balance across the pool with automatic failover — add more nodes here to scale out. Each must start with http:// or https://.</div>
+                                                      rows="3" placeholder="Leave blank to auto-discover all healthy engine=dlp nodes in the fleet (recommended).&#10;&#10;— or — pin an explicit set, one URL per line:&#10;https://gpu-node1.hpc.uidaho.edu:8710&#10;https://gpu-node2.hpc.uidaho.edu:8710">{{ config.remote_endpoints }}</textarea>
+                                            <div class="form-text">When pinned, requests go to <code>{URL}/scan</code> and load-balance across the listed pool with automatic failover — add more nodes to scale out. Each URL must start with http:// or https://.</div>
                                         </div>
                                         <div class="mb-3">
                                             <label class="form-label fw-bold" for="remote_key">Worker key</label>
@@ -525,8 +532,10 @@
                                     </td>
                                     <td>{{ alert.user.email if alert.user else 'N/A' }}</td>
                                     <td>
-                                        {% if alert.request_id %}
-                                        <a href="/admin/requests?search={{ alert.request_id }}" class="text-decoration-none">#{{ alert.request_id }}</a>
+                                        {% if alert.request and alert.request.request_uuid %}
+                                        <a href="/admin/audit?search={{ alert.request.request_uuid }}" class="text-decoration-none" title="View this request in the audit log">#{{ alert.request_id }}</a>
+                                        {% elif alert.request_id %}
+                                        <span class="text-muted">#{{ alert.request_id }}</span>
                                         {% else %}
                                         N/A
                                         {% endif %}

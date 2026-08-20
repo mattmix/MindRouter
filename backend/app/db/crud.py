@@ -3073,6 +3073,9 @@ def _build_request_filter_conditions(
             or_(
                 Request.prompt.ilike(f"%{search_text}%"),
                 func.json_extract(Request.messages, "$").ilike(f"%{search_text}%"),
+                # Lets a search land a single request by its UUID — e.g. the DLP
+                # alerts table deep-links here as /admin/audit?search=<uuid>.
+                Request.request_uuid.ilike(f"%{search_text}%"),
             )
         )
     return conditions
@@ -4448,6 +4451,9 @@ async def get_dlp_alerts(
     query = select(DlpAlert).options(
         selectinload(DlpAlert.user),
         selectinload(DlpAlert.acknowledger),
+        # Needed so the alerts table can deep-link each row to its request's
+        # audit-log entry (request.request_uuid) without an async lazy-load.
+        selectinload(DlpAlert.request),
     )
     count_query = select(func.count(DlpAlert.id))
 

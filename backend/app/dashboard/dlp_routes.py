@@ -281,8 +281,10 @@ async def save_dlp_config(
         return _err(f"Too many off-host GLiNER endpoints (max {MAX_REMOTE_ENDPOINTS})")
     # First endpoint doubles as the legacy single-URL value for compatibility.
     remote_url = remote_endpoints[0] if remote_endpoints else ""
-    if remote_enabled and not remote_endpoints:
-        return _err("Enter at least one service URL to enable the off-host GLiNER scanner")
+    # An empty endpoint list is intentional, not an error: with off-host enabled
+    # and no explicit URLs, the worker auto-discovers every registered
+    # engine=dlp backend into the pool (health-authoritative). Listing URLs here
+    # only overrides that auto-discovery for a fixed/pinned set.
     remote_key = (form.get("remote_key") or "").strip()
     if len(remote_key) > 200:
         return _err("Off-host GLiNER worker key is too long (max 200 characters)")
