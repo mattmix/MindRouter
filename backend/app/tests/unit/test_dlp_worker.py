@@ -1008,7 +1008,10 @@ class TestGlinerScanCapWiring:
         assert 'get_config_json(\n        db, "dlp.gliner.max_scan_chars"' in WORKER_SRC \
             or 'dlp.gliner.max_scan_chars' in WORKER_SRC
         assert 'GLINER_DEFAULT_MAX_CHARS' in WORKER_SRC
-        assert 'max_chars=config.get("gliner.max_scan_chars")' in SCANNER_SRC
+        # run_dlp_scan hoists the cap into a local (shared by the on-host and
+        # off-host GLiNER branches) and passes it through as max_chars.
+        assert 'config.get("gliner.max_scan_chars")' in SCANNER_SRC
+        assert 'max_chars=gliner_max_chars' in SCANNER_SRC
 
     def test_route_validates_and_persists_the_cap(self):
         assert '"dlp.gliner.max_scan_chars", gliner_max_chars' in ROUTES_SRC

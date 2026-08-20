@@ -22,6 +22,8 @@ import concurrent.futures
 import json
 import re
 import time
+
+import httpx
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
@@ -51,6 +53,16 @@ class DlpScannerError(Exception):
     errors must never be treated as "clean" (that is the silent fail-open the
     audit flagged).  run_dlp_scan collects these so the worker can surface a
     degraded scanner instead of letting it pass sensitive data unnoticed.
+    """
+
+
+class DlpRemoteOversubscribed(DlpScannerError):
+    """The off-host GLiNER service replied 503 — its queue is full.
+
+    A DlpScannerError subclass so run_dlp_scan can treat oversubscription like
+    any other remote failure for fallback purposes, while the caller can still
+    tell WHY the remote failed (backpressure, not a crash) when it logs or
+    decides whether to fall back to the in-process scanner.
     """
 
 
@@ -317,6 +329,224 @@ async def scan_gliner(
 
 
 # ---------------------------------------------------------------------------
+# Off-host GLiNER scanner (optional) — same model, run over HTTP on a GPU node
+# ---------------------------------------------------------------------------
+
+async def scan_gliner_remote(
+    text: str,
+    url: str,
+    key: str,
+    categories: Optional[List[str]] = None,
+    threshold: float = 0.5,
+    max_chars: Optional[int] = None,
+    timeout: float = 10.0,
+    remote_verify: bool = True,
+    client: Optional[httpx.AsyncClient] = None,
+) -> List[ScanFinding]:
+    """Scan text using an OFF-HOST GLiNER service over HTTP.
+
+    An optional alternative to the in-process scan_gliner: the SAME PII model
+    (urchade/gliner_multi_pii-v1) runs behind a small HTTP service on a GPU
+    node, so the CPU-bound torch inference leaves the worker host.  The wire
+    contract mirrors scan_gliner exactly — same findings shape, same category /
+    confidence / char-offset semantics, and the service applies the same
+    max_chars prefix-cut itself (offsets are into the possibly-truncated text).
+
+    Args:
+        text: Text to scan.
+        url: Base URL of the remote service; the request goes to {url}/scan.
+        key: Shared secret sent as the X-Worker-Key header.
+        categories: Entity categories to detect (None -> the service default).
+        threshold: Minimum confidence threshold.
+        max_chars: Cap the text the service scans (positive int -> prefix cut,
+            mirroring scan_gliner); None leaves it to the service default.
+        timeout: Per-request timeout in seconds.
+        remote_verify: TLS certificate verification.  The cluster node may
+            present a self-signed cert — pass False (from
+            dlp.gliner.remote.verify_tls) to accept it.  Defaults True.
+        client: An injected httpx.AsyncClient (tests / connection reuse).  When
+            None, one is created and closed per call.
+
+    Returns:
+        List of ScanFinding objects with scanner="gliner".
+
+    Raises:
+        DlpRemoteOversubscribed: the service returned 503 (queue full).
+        DlpScannerError: connect/timeout error, 401, any non-200 status, or an
+            unparseable body — the scan did not run, so it is not clean.
+    """
+    # Send max_chars only when it's a usable positive int; the service treats
+    # a null as "use my default", exactly as scan_gliner does locally.
+    send_max_chars = max_chars if (isinstance(max_chars, int) and max_chars > 0) else None
+    payload = {
+        "text": text,
+        "categories": categories,
+        "threshold": threshold,
+        "max_chars": send_max_chars,
+    }
+    headers = {"X-Worker-Key": key, "Content-Type": "application/json"}
+    endpoint = f"{url.rstrip('/')}/scan"
+
+    owns_client = client is None
+    if owns_client:
+        client = httpx.AsyncClient(timeout=timeout, verify=remote_verify)
+    try:
+        resp = await client.post(endpoint, json=payload, headers=headers)
+    except httpx.HTTPError as e:
+        # Connection refused, DNS failure, read timeout — the scan did not run.
+        raise DlpScannerError(f"gliner remote unreachable: {type(e).__name__}") from e
+    finally:
+        if owns_client:
+            await client.aclose()
+
+    status = resp.status_code
+    if status == 503:
+        # Backpressure, not a crash.  A DISTINCT signal so run_dlp_scan can log
+        # WHY it fell back while still treating it as a failure.
+        depth = maxq = None
+        try:
+            body = resp.json()
+            depth = body.get("queue_depth")
+            maxq = body.get("max_queue")
+        except Exception:
+            pass
+        raise DlpRemoteOversubscribed(
+            f"gliner remote oversubscribed (queue_depth={depth}, max_queue={maxq})"
+        )
+    if status == 401:
+        raise DlpScannerError("gliner remote rejected worker key (401)")
+    if status != 200:
+        raise DlpScannerError(f"gliner remote returned HTTP {status}")
+
+    try:
+        body = resp.json()
+    except (json.JSONDecodeError, ValueError, TypeError) as e:
+        raise DlpScannerError("gliner remote returned unparseable body") from e
+
+    raw_findings = body.get("findings") if isinstance(body, dict) else None
+    if not isinstance(raw_findings, list):
+        raise DlpScannerError("gliner remote response missing findings array")
+
+    findings: List[ScanFinding] = []
+    for ent in raw_findings:
+        if not isinstance(ent, dict):
+            continue
+        try:
+            findings.append(ScanFinding(
+                scanner="gliner",
+                category=str(ent.get("category", "unknown")),
+                text=str(ent.get("text", "")),
+                confidence=float(ent.get("confidence", threshold)),
+                start=int(ent.get("start", 0)),
+                end=int(ent.get("end", 0)),
+            ))
+        except (TypeError, ValueError):
+            # A single malformed finding entry must not abort the whole scan.
+            continue
+
+    return findings
+
+
+# ---------------------------------------------------------------------------
+# Off-host GLiNER endpoint POOL (multiple services for scale-out + failover)
+# ---------------------------------------------------------------------------
+
+# How long to skip an endpoint after it fails, so a dead or saturated node is
+# not retried on every single scan while it recovers.  Short by design: the
+# pool is a load spreader with fast failover, not a circuit breaker.
+REMOTE_ENDPOINT_COOLDOWN_S = 15.0
+
+# Round-robin cursor and per-endpoint cooldown, per worker process.  Best-effort
+# shared state — concurrent consumers may interleave, which at worst spreads
+# load slightly unevenly; correctness never depends on it.
+_remote_rr = 0
+_remote_cooldown: Dict[str, float] = {}
+
+
+def parse_remote_endpoints(endpoints: Any, legacy_url: str = "") -> List[str]:
+    """Normalize the configured endpoint list.
+
+    Accepts a list, or a string with newline/comma-separated URLs (the admin
+    textarea), and falls back to a single legacy ``dlp.gliner.remote.url`` when
+    no list is configured.  Order is preserved; blanks and duplicates dropped.
+    """
+    raw: List[str] = []
+    if isinstance(endpoints, (list, tuple)):
+        raw = [str(e) for e in endpoints]
+    elif isinstance(endpoints, str) and endpoints.strip():
+        raw = re.split(r"[\s,]+", endpoints.strip())
+    if not raw and legacy_url:
+        raw = [legacy_url]
+    seen: set = set()
+    out: List[str] = []
+    for e in raw:
+        u = e.strip().rstrip("/")
+        if u and u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
+
+
+async def scan_gliner_pool(
+    text: str,
+    endpoints: List[str],
+    key: str,
+    categories: Optional[List[str]] = None,
+    threshold: float = 0.5,
+    max_chars: Optional[int] = None,
+    timeout: float = 10.0,
+    remote_verify: bool = True,
+) -> List[ScanFinding]:
+    """Scan against a POOL of off-host GLiNER services with failover.
+
+    Endpoints are tried in a rotating order (spreading load across the fleet),
+    preferring ones not in a recent-failure cooldown.  The first success wins;
+    an endpoint that errors or reports 503 is put on a brief cooldown and the
+    next is tried.  Only when EVERY endpoint fails does this raise — so the
+    caller's local/skip fallback fires just once, after the whole pool is
+    exhausted.  Oversubscription is preserved (DlpRemoteOversubscribed) when it
+    was the reason the pool could not be served.
+    """
+    global _remote_rr
+    if not endpoints:
+        raise DlpScannerError("no remote GLiNER endpoints configured")
+
+    n = len(endpoints)
+    start = _remote_rr % n
+    _remote_rr = (_remote_rr + 1) % max(n, 1)
+    rotated = [endpoints[(start + i) % n] for i in range(n)]
+
+    now = time.monotonic()
+    fresh = [e for e in rotated if _remote_cooldown.get(e, 0.0) <= now]
+    cooling = [e for e in rotated if e not in fresh]
+    try_order = fresh + cooling   # cooled endpoints are still tried, but last
+
+    last_err: Optional[DlpScannerError] = None
+    saw_oversub = False
+    for url in try_order:
+        try:
+            findings = await scan_gliner_remote(
+                text, url=url, key=key, categories=categories,
+                threshold=threshold, max_chars=max_chars, timeout=timeout,
+                remote_verify=remote_verify,
+            )
+            _remote_cooldown.pop(url, None)   # success clears any cooldown
+            return findings
+        except DlpRemoteOversubscribed as e:
+            saw_oversub = True
+            last_err = e
+            _remote_cooldown[url] = time.monotonic() + REMOTE_ENDPOINT_COOLDOWN_S
+        except DlpScannerError as e:
+            last_err = e
+            _remote_cooldown[url] = time.monotonic() + REMOTE_ENDPOINT_COOLDOWN_S
+
+    detail = f"all {n} remote GLiNER endpoint(s) failed: {last_err}"
+    if saw_oversub:
+        raise DlpRemoteOversubscribed(detail)
+    raise DlpScannerError(detail)
+
+
+# ---------------------------------------------------------------------------
 # LLM contextual scanner (dispatched by an injected callable — no credential)
 # ---------------------------------------------------------------------------
 
@@ -548,13 +778,57 @@ async def run_dlp_scan(
     # still run: one broken scanner must not blind the others, and it must not
     # be silently swallowed (the fail-open the audit flagged).
     if config.get("gliner.enabled", False):
+        gliner_categories = config.get("gliner.categories")
+        gliner_threshold = config.get("gliner.threshold", 0.5)
+        gliner_max_chars = config.get("gliner.max_scan_chars")
         try:
-            gliner_findings = await scan_gliner(
-                text,
-                categories=config.get("gliner.categories"),
-                threshold=config.get("gliner.threshold", 0.5),
-                max_chars=config.get("gliner.max_scan_chars"),
-            )
+            if config.get("gliner.remote.enabled"):
+                # OFF-HOST path: run the model on a GPU node over HTTP.  On any
+                # remote failure (unreachable / timeout / 503 oversubscribed /
+                # bad body) consult dlp.gliner.remote.fallback: "local" quietly
+                # runs the in-process scanner (non-fatal, logged), "skip"
+                # surfaces the error as a degraded scan and does NOT run local.
+                # When remote is disabled the else-branch is EXACTLY today's
+                # behavior.
+                try:
+                    endpoints = parse_remote_endpoints(
+                        config.get("gliner.remote.endpoints"),
+                        legacy_url=config.get("gliner.remote.url", ""),
+                    )
+                    gliner_findings = await scan_gliner_pool(
+                        text,
+                        endpoints=endpoints,
+                        key=config.get("gliner.remote.key", ""),
+                        categories=gliner_categories,
+                        threshold=gliner_threshold,
+                        max_chars=gliner_max_chars,
+                        timeout=config.get("gliner.remote.timeout", 10.0),
+                        remote_verify=config.get("gliner.remote.verify_tls", True),
+                    )
+                except DlpScannerError as remote_err:
+                    if config.get("gliner.remote.fallback", "local") == "local":
+                        logger.warning(
+                            "dlp_remote_fallback",
+                            reason=str(remote_err),
+                            oversubscribed=isinstance(remote_err, DlpRemoteOversubscribed),
+                        )
+                        gliner_findings = await scan_gliner(
+                            text,
+                            categories=gliner_categories,
+                            threshold=gliner_threshold,
+                            max_chars=gliner_max_chars,
+                        )
+                    else:
+                        # "skip": no local run — let the outer handler record
+                        # the degraded scan so the operator sees remote is down.
+                        raise
+            else:
+                gliner_findings = await scan_gliner(
+                    text,
+                    categories=gliner_categories,
+                    threshold=gliner_threshold,
+                    max_chars=gliner_max_chars,
+                )
             all_findings.extend(gliner_findings)
             if gliner_findings:
                 scanners_used.append("gliner")

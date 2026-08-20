@@ -44,6 +44,7 @@ MAX_CATEGORIES = 60
 MAX_SEVERITY_RULES = 200
 MAX_PROMPT_CHARS = 20_000
 MAX_RECIPIENTS = 25
+MAX_REMOTE_ENDPOINTS = 16   # off-host GLiNER services in the failover pool
 
 _EMAIL_RE = re.compile(r"^[^@\s,;]+@[^@\s,;]+\.[A-Za-z]{2,}$")
 
@@ -118,6 +119,17 @@ async def admin_dlp_page(
         "gliner_threshold": await crud.get_config_json(db, "dlp.gliner.threshold", 0.5),
         "gliner_categories": await crud.get_config_json(db, "dlp.gliner.categories", []),
         "gliner_max_scan_chars": await crud.get_config_json(db, "dlp.gliner.max_scan_chars", 10000),
+        "remote_enabled": await crud.get_config_json(db, "dlp.gliner.remote.enabled", False),
+        "remote_endpoints": "\n".join(
+            await crud.get_config_json(db, "dlp.gliner.remote.endpoints", [])
+            or ([await crud.get_config_json(db, "dlp.gliner.remote.url", "")]
+                if await crud.get_config_json(db, "dlp.gliner.remote.url", "") else [])
+        ),
+        "remote_url": await crud.get_config_json(db, "dlp.gliner.remote.url", ""),
+        "remote_key": await crud.get_config_json(db, "dlp.gliner.remote.key", ""),
+        "remote_timeout": await crud.get_config_json(db, "dlp.gliner.remote.timeout", 10.0),
+        "remote_fallback": await crud.get_config_json(db, "dlp.gliner.remote.fallback", "local"),
+        "remote_verify_tls": await crud.get_config_json(db, "dlp.gliner.remote.verify_tls", True),
         "llm_enabled": await crud.get_config_json(db, "dlp.llm.enabled", False),
         "llm_model": await crud.get_config_json(db, "dlp.llm.model", ""),
         "llm_system_prompt": await crud.get_config_json(db, "dlp.llm.system_prompt", ""),
@@ -248,6 +260,42 @@ async def save_dlp_config(
     if len(categories) > MAX_CATEGORIES:
         return _err(f"Too many GLiNER categories (max {MAX_CATEGORIES})")
 
+    # Off-host GLiNER service (optional).  The url may be https with a
+    # self-signed cert on the cluster, so a verify-TLS toggle rides alongside.
+    remote_enabled = form.get("remote_enabled") == "on"
+    remote_verify_tls = form.get("remote_verify_tls") == "on"
+    # One or more endpoint URLs (textarea, one per line or comma-separated) for
+    # scale-out + failover across several GPU DLP services.
+    import re as _re
+    raw_eps = _re.split(r"[\s,]+", (form.get("remote_endpoints") or "").strip())
+    remote_endpoints: list = []
+    for ep in raw_eps:
+        u = ep.strip().rstrip("/")
+        if not u:
+            continue
+        if not (u.startswith("http://") or u.startswith("https://")):
+            return _err("Each off-host GLiNER endpoint must start with http:// or https://")
+        if u not in remote_endpoints:
+            remote_endpoints.append(u)
+    if len(remote_endpoints) > MAX_REMOTE_ENDPOINTS:
+        return _err(f"Too many off-host GLiNER endpoints (max {MAX_REMOTE_ENDPOINTS})")
+    # First endpoint doubles as the legacy single-URL value for compatibility.
+    remote_url = remote_endpoints[0] if remote_endpoints else ""
+    if remote_enabled and not remote_endpoints:
+        return _err("Enter at least one service URL to enable the off-host GLiNER scanner")
+    remote_key = (form.get("remote_key") or "").strip()
+    if len(remote_key) > 200:
+        return _err("Off-host GLiNER worker key is too long (max 200 characters)")
+    remote_fallback = (form.get("remote_fallback") or "local").strip()
+    if remote_fallback not in ("local", "skip"):
+        return _err("Off-host GLiNER fallback must be 'local' or 'skip'")
+    try:
+        remote_timeout = float(form.get("remote_timeout", "10"))
+    except (TypeError, ValueError):
+        return _err("Off-host GLiNER timeout must be a number between 1 and 120 seconds")
+    if not (1 <= remote_timeout <= 120):  # also rejects nan (all comparisons False)
+        return _err("Off-host GLiNER timeout must be between 1 and 120 seconds")
+
     # LLM scanner
     llm_model = (form.get("llm_model") or "").strip()[:200]
     if llm_enabled and not llm_model:
@@ -352,6 +400,13 @@ async def save_dlp_config(
         await crud.set_config(db, "dlp.gliner.threshold", threshold)
         await crud.set_config(db, "dlp.gliner.max_scan_chars", gliner_max_chars)
         await crud.set_config(db, "dlp.gliner.categories", categories)
+        await crud.set_config(db, "dlp.gliner.remote.enabled", remote_enabled)
+        await crud.set_config(db, "dlp.gliner.remote.endpoints", remote_endpoints)
+        await crud.set_config(db, "dlp.gliner.remote.url", remote_url)
+        await crud.set_config(db, "dlp.gliner.remote.key", remote_key)
+        await crud.set_config(db, "dlp.gliner.remote.timeout", remote_timeout)
+        await crud.set_config(db, "dlp.gliner.remote.fallback", remote_fallback)
+        await crud.set_config(db, "dlp.gliner.remote.verify_tls", remote_verify_tls)
         await crud.set_config(db, "dlp.llm.model", llm_model)
         await crud.set_config(db, "dlp.llm.system_prompt", llm_prompt)
         if json_fields_authoritative:

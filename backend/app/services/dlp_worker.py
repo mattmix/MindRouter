@@ -364,6 +364,20 @@ async def _load_dlp_config(db) -> dict:
     config["gliner.max_scan_chars"] = await crud.get_config_json(
         db, "dlp.gliner.max_scan_chars", GLINER_DEFAULT_MAX_CHARS
     )
+
+    # Off-host GLiNER service (optional).  Disabled by default: on-host GLiNER
+    # stays the behavior when these are absent.  fallback="local" means a remote
+    # failure quietly reruns the in-process scanner; "skip" surfaces it degraded.
+    config["gliner.remote.enabled"] = await crud.get_config_json(db, "dlp.gliner.remote.enabled", False)
+    # Pool of off-host endpoints (scale-out + failover); legacy single .url is
+    # still honored by parse_remote_endpoints when the list is empty.
+    config["gliner.remote.endpoints"] = await crud.get_config_json(db, "dlp.gliner.remote.endpoints", [])
+    config["gliner.remote.url"] = await crud.get_config_json(db, "dlp.gliner.remote.url", "")
+    config["gliner.remote.key"] = await crud.get_config_json(db, "dlp.gliner.remote.key", "")
+    config["gliner.remote.timeout"] = await crud.get_config_json(db, "dlp.gliner.remote.timeout", 10.0)
+    config["gliner.remote.fallback"] = await crud.get_config_json(db, "dlp.gliner.remote.fallback", "local")
+    config["gliner.remote.verify_tls"] = await crud.get_config_json(db, "dlp.gliner.remote.verify_tls", True)
+
     config["llm.enabled"] = await crud.get_config_json(db, "dlp.llm.enabled", False)
     config["llm.model"] = await crud.get_config_json(db, "dlp.llm.model", "")
     config["llm.system_prompt"] = await crud.get_config_json(db, "dlp.llm.system_prompt", "")

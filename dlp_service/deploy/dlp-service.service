@@ -1,0 +1,53 @@
+############################################################
+# mindrouter - standalone GPU DLP microservice
+# systemd unit TEMPLATE
+#
+# Placeholders to substitute before installing (install.sh
+# does this automatically from the values at its top):
+#
+#   __INSTALL_DIR__  absolute install dir on NODE-LOCAL disk
+#                    (holds the repo checkout / dlp_service pkg),
+#                    e.g. /opt/dlp_service
+#   __VENV_DIR__     absolute venv dir on NODE-LOCAL disk,
+#                    e.g. /opt/dlp_service/venv
+#   __ENV_FILE__     absolute path to the env file holding
+#                    DLP_SERVICE_KEY and the DLP_* settings,
+#                    e.g. /etc/dlp_service/dlp.env  (chmod 600)
+#   __USER__         service account, e.g. sheneman
+#
+# The venv + HuggingFace cache MUST live on node-local disk,
+# not shared ceph (ceph compile-cache poisoning + latency).
+############################################################
+
+[Unit]
+Description=MindRouter DLP GPU Service (GLiNER + dynamic batching)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__USER__
+WorkingDirectory=__INSTALL_DIR__
+
+# All DLP_* settings, incl. the shared DLP_SERVICE_KEY, come from the env file.
+# Keep it chmod 600 and owned by __USER__ — it holds the shared secret.
+EnvironmentFile=__ENV_FILE__
+
+# python -m dlp_service reads DLP_SERVICE_HOST / DLP_SERVICE_PORT itself.
+ExecStart=__VENV_DIR__/bin/python -m dlp_service
+
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+
+# Hardening: the service is stateless and writes nothing except the HF cache
+# (which lives under DLP_HF_HOME on node-local disk, granted below).
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+# Grant write to the node-local install/cache dir (adjust if DLP_HF_HOME differs):
+ReadWritePaths=__INSTALL_DIR__
+
+[Install]
+WantedBy=multi-user.target

@@ -263,6 +263,52 @@
                                     <input type="text" class="form-control" id="newCategoryInput" placeholder="Add custom category (e.g. 'vandal id', 'grant number')">
                                     <button type="button" class="btn btn-outline-primary" onclick="addCustomCategory()"><i class="bi bi-plus-lg"></i> Add</button>
                                 </div>
+
+                                <!-- Off-host GLiNER service (optional) -->
+                                <div class="card mt-4 border-secondary">
+                                    <div class="card-header py-2">
+                                        <div class="form-check form-switch mb-0">
+                                            <input class="form-check-input" type="checkbox" id="remote_enabled" name="remote_enabled"
+                                                   {% if config.remote_enabled %}checked{% endif %}>
+                                            <label class="form-check-label fw-bold" for="remote_enabled">Off-host GLiNER service (optional)</label>
+                                        </div>
+                                    </div>
+                                    <div class="card-body">
+                                        <p class="text-muted small">Run the same GLiNER model on a GPU node behind an HTTP service instead of on this host's CPU. When enabled, scans call the service; on any failure the fallback below decides what happens. Leave disabled to keep the built-in on-host scanner.</p>
+                                        <div class="mb-3">
+                                            <label class="form-label fw-bold" for="remote_endpoints">Service URL(s)</label>
+                                            <textarea class="form-control form-control-sm" id="remote_endpoints" name="remote_endpoints"
+                                                      rows="3" placeholder="https://gpu-node1.hpc.uidaho.edu:8710&#10;https://gpu-node2.hpc.uidaho.edu:8710">{{ config.remote_endpoints }}</textarea>
+                                            <div class="form-text">One endpoint per line; requests go to <code>{URL}/scan</code>. Requests load-balance across the pool with automatic failover — add more nodes here to scale out. Each must start with http:// or https://.</div>
+                                        </div>
+                                        <div class="mb-3">
+                                            <label class="form-label fw-bold" for="remote_key">Worker key</label>
+                                            <input type="password" class="form-control form-control-sm" id="remote_key" name="remote_key"
+                                                   value="{{ config.remote_key }}" autocomplete="new-password" placeholder="shared secret (X-Worker-Key)">
+                                            <div class="form-text">Shared secret sent as the <code>X-Worker-Key</code> header.</div>
+                                        </div>
+                                        <div class="row">
+                                            <div class="col-md-6 mb-3">
+                                                <label class="form-label fw-bold" for="remote_timeout">Timeout (seconds)</label>
+                                                <input type="number" class="form-control form-control-sm" id="remote_timeout" name="remote_timeout"
+                                                       value="{{ config.remote_timeout }}" min="1" max="120" step="1">
+                                            </div>
+                                            <div class="col-md-6 mb-3">
+                                                <label class="form-label fw-bold" for="remote_fallback">On failure</label>
+                                                <select class="form-select form-select-sm" id="remote_fallback" name="remote_fallback">
+                                                    <option value="local" {% if config.remote_fallback == 'local' %}selected{% endif %}>Fall back to on-host GLiNER</option>
+                                                    <option value="skip" {% if config.remote_fallback == 'skip' %}selected{% endif %}>Skip (surface a degraded scan)</option>
+                                                </select>
+                                            </div>
+                                        </div>
+                                        <div class="form-check">
+                                            <input class="form-check-input" type="checkbox" id="remote_verify_tls" name="remote_verify_tls"
+                                                   {% if config.remote_verify_tls %}checked{% endif %}>
+                                            <label class="form-check-label" for="remote_verify_tls">Verify TLS certificate</label>
+                                            <div class="form-text">Uncheck to accept a self-signed certificate on the cluster node.</div>
+                                        </div>
+                                    </div>
+                                </div>
                             </div>
                         </div>
                     </div>

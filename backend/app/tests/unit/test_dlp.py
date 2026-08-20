@@ -24,11 +24,13 @@ Covers:
 
 import asyncio
 import importlib
+import json
 import secrets
 import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 
 # ----------------------------------------------------------------
@@ -299,10 +301,16 @@ class TestLLMCredentialRemoved:
         assert "complete" in params
 
     def test_scan_llm_cannot_speak_http(self):
-        """The scanner must not be able to dispatch on its own."""
+        """The LLM scanner must not be able to dispatch on its own.
+
+        The module now speaks httpx for the OPTIONAL off-host GLiNER path
+        (scan_gliner_remote), so this invariant is scoped to scan_llm itself:
+        it holds no credential and owns no HTTP client — it dispatches only
+        through the injected `complete` callable.
+        """
         import inspect
 
-        src = inspect.getsource(_scanner_mod)
+        src = inspect.getsource(_scanner_mod.scan_llm)
         assert "httpx" not in src
         assert "localhost:8000" not in src
 
@@ -677,3 +685,304 @@ class TestGlinerEmptyCategories:
         # before any model load, so this runs without gliner installed.
         result = asyncio.run(_scanner_mod.scan_gliner("ssn 123-45-6789", categories=[]))
         assert result == []
+
+
+# ===================================================================
+# Off-host GLiNER scanner (scan_gliner_remote)
+# ===================================================================
+
+def _mock_client(handler):
+    """An httpx.AsyncClient whose transport is driven by ``handler``."""
+    return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+
+class TestScanGlinerRemote:
+    """The off-host GLiNER HTTP client — wire contract and error mapping."""
+
+    @pytest.mark.asyncio
+    async def test_success_maps_findings(self):
+        """A 200 response maps to ScanFinding(scanner='gliner'), spans preserved."""
+        def handler(request):
+            assert request.url.path == "/scan"
+            assert request.headers["X-Worker-Key"] == "secret"
+            return httpx.Response(200, json={
+                "findings": [
+                    {"category": "email", "text": "a@b.com", "confidence": 0.91, "start": 6, "end": 13},
+                    {"category": "phone number", "text": "208-555-0100", "confidence": 0.77, "start": 20, "end": 32},
+                ],
+                "latency_ms": 3.1, "queued_ms": 0.0, "batch_size": 1,
+            })
+        client = _mock_client(handler)
+        findings = await _scanner_mod.scan_gliner_remote(
+            "hello a@b.com call 208-555-0100", url="https://svc", key="secret", client=client,
+        )
+        await client.aclose()
+        assert len(findings) == 2
+        assert all(f.scanner == "gliner" for f in findings)
+        assert findings[0].category == "email"
+        assert findings[0].text == "a@b.com"
+        assert abs(findings[0].confidence - 0.91) < 1e-9
+        assert (findings[0].start, findings[0].end) == (6, 13)
+        assert (findings[1].start, findings[1].end) == (20, 32)
+
+    @pytest.mark.asyncio
+    async def test_sends_contract_body(self):
+        """The request body carries text/categories/threshold/max_chars."""
+        captured = {}
+        def handler(request):
+            captured["body"] = json.loads(request.content)
+            return httpx.Response(200, json={
+                "findings": [], "latency_ms": 0.0, "queued_ms": 0.0, "batch_size": 0,
+            })
+        client = _mock_client(handler)
+        await _scanner_mod.scan_gliner_remote(
+            "hello", url="https://svc/", key="k",
+            categories=["email"], threshold=0.6, max_chars=50, client=client,
+        )
+        await client.aclose()
+        assert captured["body"] == {
+            "text": "hello", "categories": ["email"], "threshold": 0.6, "max_chars": 50,
+        }
+
+    @pytest.mark.asyncio
+    async def test_nonpositive_max_chars_sent_as_null(self):
+        """max_chars=0/None is sent as null (service uses its default)."""
+        captured = {}
+        def handler(request):
+            captured["body"] = json.loads(request.content)
+            return httpx.Response(200, json={
+                "findings": [], "latency_ms": 0.0, "queued_ms": 0.0, "batch_size": 0,
+            })
+        client = _mock_client(handler)
+        await _scanner_mod.scan_gliner_remote(
+            "hello", url="https://svc", key="k", max_chars=0, client=client,
+        )
+        await client.aclose()
+        assert captured["body"]["max_chars"] is None
+
+    @pytest.mark.asyncio
+    async def test_503_raises_oversubscribed(self):
+        """A 503 raises the DISTINCT DlpRemoteOversubscribed (a DlpScannerError)."""
+        assert issubclass(_scanner_mod.DlpRemoteOversubscribed, _scanner_mod.DlpScannerError)
+        def handler(request):
+            return httpx.Response(503, json={
+                "error": "oversubscribed", "queue_depth": 64, "max_queue": 64,
+            })
+        client = _mock_client(handler)
+        with pytest.raises(_scanner_mod.DlpRemoteOversubscribed):
+            await _scanner_mod.scan_gliner_remote("x", url="https://svc", key="k", client=client)
+        await client.aclose()
+
+    @pytest.mark.asyncio
+    async def test_401_raises_scanner_error_not_oversubscribed(self):
+        def handler(request):
+            return httpx.Response(401, json={"error": "unauthorized"})
+        client = _mock_client(handler)
+        with pytest.raises(_scanner_mod.DlpScannerError) as exc:
+            await _scanner_mod.scan_gliner_remote("x", url="https://svc", key="bad", client=client)
+        await client.aclose()
+        assert not isinstance(exc.value, _scanner_mod.DlpRemoteOversubscribed)
+
+    @pytest.mark.asyncio
+    async def test_non200_status_raises_scanner_error(self):
+        def handler(request):
+            return httpx.Response(500, json={"error": "boom"})
+        client = _mock_client(handler)
+        with pytest.raises(_scanner_mod.DlpScannerError):
+            await _scanner_mod.scan_gliner_remote("x", url="https://svc", key="k", client=client)
+        await client.aclose()
+
+    @pytest.mark.asyncio
+    async def test_connect_error_raises_scanner_error(self):
+        """A transport error (connect refused / timeout) is a DlpScannerError."""
+        def handler(request):
+            raise httpx.ConnectError("connection refused")
+        client = _mock_client(handler)
+        with pytest.raises(_scanner_mod.DlpScannerError):
+            await _scanner_mod.scan_gliner_remote("x", url="https://svc", key="k", client=client)
+        await client.aclose()
+
+    @pytest.mark.asyncio
+    async def test_timeout_raises_scanner_error(self):
+        def handler(request):
+            raise httpx.ReadTimeout("timed out")
+        client = _mock_client(handler)
+        with pytest.raises(_scanner_mod.DlpScannerError):
+            await _scanner_mod.scan_gliner_remote("x", url="https://svc", key="k", client=client)
+        await client.aclose()
+
+    @pytest.mark.asyncio
+    async def test_unparseable_body_raises_scanner_error(self):
+        def handler(request):
+            return httpx.Response(200, content=b"this is not json")
+        client = _mock_client(handler)
+        with pytest.raises(_scanner_mod.DlpScannerError):
+            await _scanner_mod.scan_gliner_remote("x", url="https://svc", key="k", client=client)
+        await client.aclose()
+
+    @pytest.mark.asyncio
+    async def test_missing_findings_array_raises(self):
+        def handler(request):
+            return httpx.Response(200, json={"latency_ms": 1.0})
+        client = _mock_client(handler)
+        with pytest.raises(_scanner_mod.DlpScannerError):
+            await _scanner_mod.scan_gliner_remote("x", url="https://svc", key="k", client=client)
+        await client.aclose()
+
+
+# ===================================================================
+# run_dlp_scan remote dispatch + fallback
+# ===================================================================
+
+def _gliner_finding(cat="email"):
+    return _scanner_mod.ScanFinding(
+        scanner="gliner", category=cat, text="a@b.com", confidence=0.9, start=0, end=7,
+    )
+
+
+class TestRunDlpScanRemote:
+    """run_dlp_scan honors dlp.gliner.remote.* and the fallback policy."""
+
+    _BASE = {
+        "regex.enabled": False,
+        "gliner.enabled": True,
+        "gliner.remote.enabled": True,
+        "gliner.remote.url": "https://svc",
+        "gliner.remote.key": "k",
+    }
+
+    @pytest.mark.asyncio
+    async def test_remote_success_does_not_run_local(self, monkeypatch):
+        async def fake_remote(*a, **k):
+            return [_gliner_finding()]
+        async def fake_local(*a, **k):
+            raise AssertionError("local scanner must not run when remote succeeds")
+        monkeypatch.setattr(_scanner_mod, "scan_gliner_remote", fake_remote)
+        monkeypatch.setattr(_scanner_mod, "scan_gliner", fake_local)
+        result = await _scanner_mod.run_dlp_scan("hi a@b.com", dict(self._BASE))
+        assert result is not None
+        assert any(f.category == "email" for f in result.findings)
+        assert not result.scanner_errors
+
+    @pytest.mark.asyncio
+    async def test_fallback_local_runs_local_on_remote_failure(self, monkeypatch):
+        called = {}
+        async def fake_remote(*a, **k):
+            raise _scanner_mod.DlpRemoteOversubscribed("queue full")
+        async def fake_local(text, categories=None, threshold=0.5, max_chars=None):
+            called["local"] = True
+            return [_gliner_finding()]
+        monkeypatch.setattr(_scanner_mod, "scan_gliner_remote", fake_remote)
+        monkeypatch.setattr(_scanner_mod, "scan_gliner", fake_local)
+        cfg = dict(self._BASE, **{"gliner.remote.fallback": "local"})
+        result = await _scanner_mod.run_dlp_scan("hi a@b.com", cfg)
+        assert called.get("local") is True
+        assert result is not None
+        assert any(f.category == "email" for f in result.findings)
+        # Fallback is NON-fatal: no degraded-scan error surfaced.
+        assert not result.scanner_errors
+
+    @pytest.mark.asyncio
+    async def test_fallback_skip_records_error_and_skips_local(self, monkeypatch):
+        called = {}
+        async def fake_remote(*a, **k):
+            raise _scanner_mod.DlpScannerError("remote down")
+        async def fake_local(*a, **k):
+            called["local"] = True
+            return []
+        monkeypatch.setattr(_scanner_mod, "scan_gliner_remote", fake_remote)
+        monkeypatch.setattr(_scanner_mod, "scan_gliner", fake_local)
+        cfg = dict(self._BASE, **{"gliner.remote.fallback": "skip"})
+        result = await _scanner_mod.run_dlp_scan("hi a@b.com", cfg)
+        assert "local" not in called
+        assert result is not None  # degraded scan is surfaced, not clean
+        assert any("gliner" in e for e in result.scanner_errors)
+
+    @pytest.mark.asyncio
+    async def test_remote_disabled_uses_local(self, monkeypatch):
+        """With remote disabled, behavior is EXACTLY today's: local scan only."""
+        called = {}
+        async def fake_local(text, categories=None, threshold=0.5, max_chars=None):
+            called["local"] = True
+            return []
+        async def fake_remote(*a, **k):
+            raise AssertionError("remote must not be called when disabled")
+        monkeypatch.setattr(_scanner_mod, "scan_gliner", fake_local)
+        monkeypatch.setattr(_scanner_mod, "scan_gliner_remote", fake_remote)
+        result = await _scanner_mod.run_dlp_scan("nothing sensitive", {
+            "regex.enabled": False,
+            "gliner.enabled": True,
+            # gliner.remote.enabled absent -> off
+        })
+        assert called.get("local") is True
+        assert result is None  # clean scan, nothing found, nothing errored
+
+
+class TestRemoteEndpointPool:
+    """Multi-endpoint pool: parsing, round-robin, failover, oversubscription."""
+
+    def test_parse_endpoints_list_and_string(self):
+        pe = _scanner_mod.parse_remote_endpoints
+        assert pe(["https://a:1/", "https://b:2"]) == ["https://a:1", "https://b:2"]
+        assert pe("https://a:1\n https://b:2 , https://a:1") == ["https://a:1", "https://b:2"]
+        assert pe([], legacy_url="https://legacy:9") == ["https://legacy:9"]
+        assert pe("") == []
+        assert pe(None) == []
+
+    def test_pool_first_success_wins(self):
+        calls = []
+        async def fake_remote(text, url, key, **kw):
+            calls.append(url)
+            return [_scanner_mod.ScanFinding(scanner="gliner", category="email", text="x@y", confidence=0.9)]
+        orig = _scanner_mod.scan_gliner_remote
+        _scanner_mod.scan_gliner_remote = fake_remote
+        try:
+            r = asyncio.run(_scanner_mod.scan_gliner_pool("t", ["https://a", "https://b"], "k"))
+            assert len(r) == 1 and len(calls) == 1  # only one endpoint hit
+        finally:
+            _scanner_mod.scan_gliner_remote = orig
+
+    def test_pool_fails_over_to_next(self):
+        calls = []
+        async def fake_remote(text, url, key, **kw):
+            calls.append(url)
+            if url == "https://a":
+                raise _scanner_mod.DlpScannerError("down")
+            return []
+        orig = _scanner_mod.scan_gliner_remote
+        _scanner_mod._remote_cooldown.clear()
+        _scanner_mod._remote_rr = 0
+        _scanner_mod.scan_gliner_remote = fake_remote
+        try:
+            asyncio.run(_scanner_mod.scan_gliner_pool("t", ["https://a", "https://b"], "k"))
+            assert "https://a" in calls and "https://b" in calls  # failed over
+        finally:
+            _scanner_mod.scan_gliner_remote = orig
+
+    def test_pool_all_fail_raises(self):
+        async def fake_remote(text, url, key, **kw):
+            raise _scanner_mod.DlpScannerError("down")
+        orig = _scanner_mod.scan_gliner_remote
+        _scanner_mod._remote_cooldown.clear()
+        _scanner_mod.scan_gliner_remote = fake_remote
+        try:
+            with pytest.raises(_scanner_mod.DlpScannerError):
+                asyncio.run(_scanner_mod.scan_gliner_pool("t", ["https://a", "https://b"], "k"))
+        finally:
+            _scanner_mod.scan_gliner_remote = orig
+
+    def test_pool_all_oversubscribed_preserves_signal(self):
+        async def fake_remote(text, url, key, **kw):
+            raise _scanner_mod.DlpRemoteOversubscribed("full")
+        orig = _scanner_mod.scan_gliner_remote
+        _scanner_mod._remote_cooldown.clear()
+        _scanner_mod.scan_gliner_remote = fake_remote
+        try:
+            with pytest.raises(_scanner_mod.DlpRemoteOversubscribed):
+                asyncio.run(_scanner_mod.scan_gliner_pool("t", ["https://a"], "k"))
+        finally:
+            _scanner_mod.scan_gliner_remote = orig
+
+    def test_pool_empty_raises(self):
+        with pytest.raises(_scanner_mod.DlpScannerError):
+            asyncio.run(_scanner_mod.scan_gliner_pool("t", [], "k"))

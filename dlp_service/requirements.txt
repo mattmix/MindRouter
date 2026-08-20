@@ -1,0 +1,20 @@
+# ############################################################
+# mindrouter - standalone GPU DLP microservice requirements
+#
+# torch is listed for completeness, but on the GPU host you
+# MUST install the CUDA build separately and FIRST (see
+# deploy/install.sh) — the default PyPI torch wheel is CPU-only
+# and will not use the RTX A4000. gliner pulls transformers +
+# tokenizers automatically.
+# ############################################################
+
+gliner>=0.2.0
+fastapi>=0.110
+uvicorn>=0.27
+
+# Installed separately on the GPU host with the correct CUDA index URL:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu121
+torch>=2.1
+
+# Test client (unit tests use httpx.ASGITransport / TestClient).
+httpx>=0.27
