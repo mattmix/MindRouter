@@ -3679,9 +3679,17 @@ WHERE ENCRYPTION_SCHEME = 1;</code></pre>
             <section id="data-loss-prevention">
                 <h2>Data Loss Prevention (DLP)</h2>
                 <p>MindRouter includes a built-in DLP system that scans prompts and responses for sensitive data
-                   including PII, HIPAA/PHI, FERPA, PCI, and CUI. Scanning happens <strong>asynchronously after
-                   the response is delivered</strong>, so there is zero impact on inference latency. DLP is a
-                   passive, bump-on-the-wire system &mdash; it never blocks, delays, or modifies requests or responses.</p>
+                   including PII, HIPAA/PHI, FERPA, PCI, and CUI. By default it is a <strong>passive,
+                   bump-on-the-wire monitor</strong>: scanning happens <strong>asynchronously after the response
+                   is delivered</strong>, so there is zero impact on inference latency, and nothing is blocked,
+                   delayed, or modified.</p>
+                <p>Each severity can additionally be given a <strong>Detection Action</strong> &mdash;
+                   <strong>Alert</strong> (email) and/or <strong>Block</strong>. Alerting stays asynchronous
+                   (still zero latency). Blocking is opt-in and turns DLP into an active control for that
+                   severity: an <em>inline</em> scan runs before the content is released, and a match returns a
+                   <code>422</code> to the caller. Blocking only runs its inline scan when at least one severity
+                   has Block enabled, so an alert-only deployment keeps the original zero-latency behavior. See
+                   <a href="#dlp-actions">Detection Actions &amp; Blocking</a>.</p>
 
                 <h3>Architecture</h3>
                 <p>After a request completes and the response is sent to the client, the request ID is enqueued
@@ -3770,8 +3778,58 @@ WHERE ENCRYPTION_SCHEME = 1;</code></pre>
                     <li><strong>GLiNER NER Scanner</strong> &mdash; Toggle neural entity recognition. Adjust the confidence threshold (0.1&ndash;0.95). Check/uncheck built-in entity categories. Add custom entity categories for domain-specific detection (e.g. "vandal id", "grant number").</li>
                     <li><strong>LLM Contextual Scanner</strong> &mdash; Toggle LLM-based semantic analysis. Choose the model (e.g. <code>qwen/qwen3.5-4b</code>). Customize the system prompt for your compliance regime (FERPA, HIPAA, CUI).</li>
                     <li><strong>Severity Rules</strong> &mdash; Visual mapping of entity categories to severity levels. Add new mappings with the inline form. Remove mappings you don't need.</li>
-                    <li><strong>Email Notifications</strong> &mdash; Set email recipients per severity level (comma-separated). Requires SMTP to be configured in Settings.</li>
+                    <li><strong>Detection Action</strong> &mdash; Per severity, choose <strong>Block</strong> (return a <code>422</code>) and/or <strong>Alert</strong> (email). Set recipients (comma or newline separated), optionally include the requesting user, and pick immediate vs digest delivery. Also sets the global <strong>Block scope</strong> (prompt / response / both). See <a href="#dlp-actions">Detection Actions &amp; Blocking</a>. Alerting requires SMTP configured in Settings.</li>
                 </ul>
+
+                <h3 id="dlp-actions">Detection Actions &amp; Blocking</h3>
+                <p>Every finding is mapped to a severity (<strong>Minor</strong>, <strong>Moderate</strong>,
+                   <strong>Major</strong>) by the Severity Rules. Each severity then carries a
+                   <strong>Detection Action</strong>, configured under <strong>Admin &rarr; DLP &rarr; Detection
+                   Action</strong>. The two actions are independent &mdash; enable either, both, or neither:</p>
+                <ul>
+                    <li><strong>Alert</strong> &mdash; write the alert and send email. Fully asynchronous (the
+                        existing post-hoc worker), so it adds <strong>no latency</strong>. Recipients accept
+                        multiple addresses (comma or newline separated); an optional <em>Email user</em> toggle
+                        also notifies the requesting user; delivery is <em>immediate</em> or rolled into the
+                        <em>digest</em>.</li>
+                    <li><strong>Block</strong> &mdash; reject the content with an HTTP <code>422</code>. This
+                        requires an <em>inline</em>, synchronous scan, so it is opt-in and only runs when at
+                        least one severity has Block enabled. With blocking off, the request path is untouched
+                        and latency is unchanged.</li>
+                </ul>
+                <p><strong>Block scope</strong> (a single global setting) chooses what a Block inspects:</p>
+                <ul>
+                    <li><strong>Prompt only</strong> (default) &mdash; the prompt is scanned <em>before</em> the
+                        model runs; a match returns <code>422</code> and nothing is generated. Streaming is
+                        unaffected (the decision is made before any bytes are sent).</li>
+                    <li><strong>Response only</strong> &mdash; the model's output is scanned before release;
+                        a match returns <code>422</code> instead of the response. Applies to non-streaming
+                        requests; a streamed response is already on the wire and cannot be recalled, so it is
+                        covered by the Alert path rather than blocked.</li>
+                    <li><strong>Both</strong> &mdash; prompt and response.</li>
+                </ul>
+                <p>The inline block scan uses regex + GLiNER (dispatched to the
+                   <a href="#dlp-offhost">off-host GPU pool</a> when configured). It is deliberately
+                   <strong>fail-open</strong>: if every scanner is unavailable, the request is <em>allowed</em>
+                   and the coverage gap is logged, so a DLP outage cannot take the gateway down. A blocked
+                   request is still recorded in the audit log and, if that severity's Alert action is on, still
+                   emails an alert. The <code>422</code> body names only the offending categories &mdash; never
+                   the matched values:</p>
+<pre><code>{
+  "error": {
+    "message": "This request was blocked by the data-loss-prevention policy: your
+                prompt appears to contain social security number. Remove the sensitive
+                data and try again...",
+    "type": "dlp_policy_violation",
+    "code": "dlp_blocked",
+    "severity": "major",
+    "categories": ["social security number"]
+  }
+}</code></pre>
+                <p class="text-muted"><small>Blocking is enforced on the chat/completions surfaces
+                   (<code>/v1/chat/completions</code>, <code>/v1/completions</code>, <code>/api/chat</code>).
+                   The inline scan reads the live request text, so prompt blocking works even when audit
+                   content capture is disabled.</small></p>
 
                 <h3>Custom Entity Categories</h3>
                 <p>You can extend DLP detection beyond the built-in categories:</p>
@@ -3800,7 +3858,7 @@ WHERE ENCRYPTION_SCHEME = 1;</code></pre>
 
                 <h3>Performance &amp; Reliability</h3>
                 <ul>
-                    <li><strong>Zero latency impact</strong> &mdash; The only code in the request path is <code>queue.put_nowait(request_id)</code> (~100ns) wrapped in try/except. It cannot slow down or break inference.</li>
+                    <li><strong>Zero latency impact (monitoring &amp; alerting)</strong> &mdash; With no severity set to Block, the only code in the request path is <code>queue.put_nowait(request_id)</code> (~100ns) wrapped in try/except. It cannot slow down or break inference. Enabling a <a href="#dlp-actions">Block action</a> adds an inline scan (regex + off-host GLiNER) to the configured scope for that path only; a cached gate keeps the check free when blocking is off.</li>
                     <li><strong>Concurrent worker pool</strong> &mdash; The queue is drained by a pool of scan consumers (<code>dlp.worker.concurrency</code>, default 3, hot-tunable) rather than a single task, so concurrent scans run in parallel. Each consumer has its own DB session; any crash is caught and logged and the pool continues.</li>
                     <li><strong>Bounded queue with metrics</strong> &mdash; The queue holds up to 10,000 items. If it fills during a spike, new items are dropped (best-effort scanning) and counted. Queue depth and total drops are exported to Prometheus as <code>mindrouter_dlp_queue_size</code> and <code>mindrouter_dlp_queue_dropped</code> on <code>/metrics</code>, so coverage loss under load is observable.</li>
                     <li><strong>GLiNER lazy loading</strong> &mdash; The GLiNER model (~1&nbsp;GB) loads on first scan, then stays resident. On the host CPU, scans cost ~0.1&ndash;3&nbsp;s depending on load; on a <a href="#dlp-offhost">dedicated GPU node</a> they are far faster and off the gateway entirely.</li>
@@ -3870,7 +3928,7 @@ WHERE ENCRYPTION_SCHEME = 1;</code></pre>
                     <thead class="table-light"><tr><th>Setting</th><th>Config key</th><th>Meaning</th></tr></thead>
                     <tbody>
                         <tr><td>Enable off-host</td><td><code>dlp.gliner.remote.enabled</code></td><td>Route GLiNER scans to the endpoint pool. Off by default (on-host scanning).</td></tr>
-                        <tr><td>Service URL(s)</td><td><code>dlp.gliner.remote.endpoints</code></td><td>One or more base URLs, one per line, e.g. <code>https://gpu-node:8001</code>. The pool MindRouter load-balances across.</td></tr>
+                        <tr><td>Service URL(s)</td><td><code>dlp.gliner.remote.endpoints</code></td><td><strong>Leave blank to auto-discover</strong> every registered <code>engine=dlp</code> backend that is currently healthy (recommended &mdash; nodes are added/removed with the fleet, no edits here). Or list one or more base URLs, one per line, e.g. <code>https://gpu-node:8001</code>, to pin a fixed set. The pool MindRouter load-balances across, with automatic failover.</td></tr>
                         <tr><td>Worker key</td><td><code>dlp.gliner.remote.key</code></td><td>Shared secret sent as <code>X-Worker-Key</code>; must match the service's key.</td></tr>
                         <tr><td>Timeout</td><td><code>dlp.gliner.remote.timeout</code></td><td>Per-request timeout in seconds (1&ndash;120, default 10).</td></tr>
                         <tr><td>On failure</td><td><code>dlp.gliner.remote.fallback</code></td><td><code>local</code> = fall back to on-host GLiNER (default); <code>skip</code> = surface a degraded scan and do not run on-host.</td></tr>

@@ -18,6 +18,7 @@
 """Background DLP worker: async queue consumer for post-hoc scanning."""
 
 import asyncio
+import re
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -553,29 +554,57 @@ def _email_allowed(severity: str) -> tuple:
     return True, suppressed
 
 
-async def _maybe_send_email(db, alert, scan_result) -> None:
-    """Send an IMMEDIATE email for this alert, if its severity is set to
-    immediate delivery.
+async def _alert_recipients(db, severity: str, alert) -> list:
+    """Resolve the email recipients for a severity's alert.
 
-    Delivery mode is per-severity (Admin -> DLP): "immediate" mails now to the
-    severity's recipients; "digest" defers to the periodic report
-    (dlp_digest_loop); "off" logs the alert without emailing.  Default is
-    "immediate" so existing configs keep working.
+    The configured recipient list (comma/newline separated) plus — when the
+    severity's notify-user flag is on — the requesting user's own address.
+    Order-preserving de-duplication.
+    """
+    from backend.app.db import crud
+
+    raw = await crud.get_config_json(db, f"dlp.email.{severity}_recipients", "")
+    recips = [r.strip() for r in re.split(r"[,\n\r]+", str(raw)) if r.strip()]
+
+    if await crud.get_config_json(db, f"dlp.email.{severity}.notify_user", False):
+        uid = getattr(alert, "user_id", None)
+        if uid:
+            user = await crud.get_user_by_id(db, uid)
+            email = getattr(user, "email", None) if user else None
+            if email:
+                recips.append(email)
+
+    seen: set = set()
+    ordered = []
+    for r in recips:
+        if r not in seen:
+            seen.add(r)
+            ordered.append(r)
+    return ordered
+
+
+async def _maybe_send_email(db, alert, scan_result) -> None:
+    """Send an IMMEDIATE email for this alert, per its severity's action config.
+
+    Two gates: the severity's Alert action must be ON (Admin -> DLP -> Detection
+    Action), and its delivery mode must be "immediate" ("digest" defers to
+    dlp_digest_loop). Recipients are the configured list plus, optionally, the
+    requesting user. Defaults preserve prior behavior (alert on, immediate).
     """
     from backend.app.db import crud
 
     severity = scan_result.severity
+
+    # Action model: no email at all unless this severity's Alert action is on.
+    if not await crud.get_config_json(db, f"dlp.action.{severity}.alert", True):
+        return
+
     mode = await crud.get_config_json(db, f"dlp.email.{severity}.mode", "immediate")
     if mode != "immediate":
-        # "digest" is picked up by dlp_digest_loop; "off" is log-only.
+        # "digest" is picked up by dlp_digest_loop.
         return
 
-    key = f"dlp.email.{severity}_recipients"
-    recipients_str = await crud.get_config_json(db, key, "")
-    if not recipients_str:
-        return
-
-    recipients = [r.strip() for r in str(recipients_str).split(",") if r.strip()]
+    recipients = await _alert_recipients(db, severity, alert)
     if not recipients:
         return
 
@@ -663,7 +692,8 @@ async def _maybe_send_digest() -> None:
 
         digest_sevs = [
             s for s in _SEVERITIES
-            if await crud.get_config_json(db, f"dlp.email.{s}.mode", "immediate") == "digest"
+            if await crud.get_config_json(db, f"dlp.action.{s}.alert", True)
+            and await crud.get_config_json(db, f"dlp.email.{s}.mode", "immediate") == "digest"
         ]
         if not digest_sevs:
             return  # no severity routes to the digest

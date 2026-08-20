@@ -144,6 +144,17 @@ async def admin_dlp_page(
         "email_major_mode": await crud.get_config_json(db, "dlp.email.major.mode", "immediate"),
         "digest_frequency": await crud.get_config_json(db, "dlp.digest.frequency", "daily"),
         "digest_recipients": await crud.get_config_json(db, "dlp.digest.recipients", ""),
+        # Per-severity Detection Action (block and/or alert) + block scope.
+        "block_scope": await crud.get_config_json(db, "dlp.block.scope", "prompt"),
+        "block_minor": await crud.get_config_json(db, "dlp.action.minor.block", False),
+        "block_moderate": await crud.get_config_json(db, "dlp.action.moderate.block", False),
+        "block_major": await crud.get_config_json(db, "dlp.action.major.block", False),
+        "alert_minor": await crud.get_config_json(db, "dlp.action.minor.alert", True),
+        "alert_moderate": await crud.get_config_json(db, "dlp.action.moderate.alert", True),
+        "alert_major": await crud.get_config_json(db, "dlp.action.major.alert", True),
+        "notify_user_minor": await crud.get_config_json(db, "dlp.email.minor.notify_user", False),
+        "notify_user_moderate": await crud.get_config_json(db, "dlp.email.moderate.notify_user", False),
+        "notify_user_major": await crud.get_config_json(db, "dlp.email.major.notify_user", False),
     }
 
     # Load alerts with pagination
@@ -218,6 +229,18 @@ async def save_dlp_config(
         if m not in ("immediate", "digest", "off"):
             return _err(f"Invalid delivery mode for {sev} alerts")
         email_modes[sev] = m
+
+    # Detection Action per severity: block and/or alert, plus notify-the-user.
+    block_scope = (form.get("block_scope") or "prompt").strip()
+    if block_scope not in ("prompt", "response", "both"):
+        return _err("Block scope must be prompt, response, or both")
+    actions = {}
+    for sev in ("minor", "moderate", "major"):
+        actions[sev] = {
+            "block": form.get(f"block_{sev}") == "on",
+            "alert": form.get(f"alert_{sev}") == "on",
+            "notify_user": form.get(f"notify_user_{sev}") == "on",
+        }
 
     digest_frequency = (form.get("digest_frequency") or "daily").strip()
     if digest_frequency not in ("hourly", "6h", "12h", "daily"):
@@ -382,8 +405,8 @@ async def save_dlp_config(
     # Email recipients, per severity
     recipients = {}
     for field, label in (("email_minor", "minor"), ("email_moderate", "moderate"), ("email_major", "major")):
-        raw = (form.get(field) or "").replace("\r", " ").replace("\n", " ")
-        addrs = [a.strip() for a in raw.split(",") if a.strip()]
+        raw = form.get(field) or ""
+        addrs = [a.strip() for a in re.split(r"[,\r\n]+", raw) if a.strip()]
         if len(addrs) > MAX_RECIPIENTS:
             return _err(f"Too many {label} recipients (max {MAX_RECIPIENTS})")
         for a in addrs:
@@ -429,6 +452,11 @@ async def save_dlp_config(
         await crud.set_config(db, "dlp.email.major.mode", email_modes["major"])
         await crud.set_config(db, "dlp.digest.frequency", digest_frequency)
         await crud.set_config(db, "dlp.digest.recipients", digest_recipients)
+        await crud.set_config(db, "dlp.block.scope", block_scope)
+        for sev in ("minor", "moderate", "major"):
+            await crud.set_config(db, f"dlp.action.{sev}.block", actions[sev]["block"])
+            await crud.set_config(db, f"dlp.action.{sev}.alert", actions[sev]["alert"])
+            await crud.set_config(db, f"dlp.email.{sev}.notify_user", actions[sev]["notify_user"])
 
         await crud.log_admin_action(
             db, user.id, "update", "dlp_config",
@@ -440,6 +468,15 @@ async def save_dlp_config(
         await db.rollback()
         logger.exception("dlp_config_save_failed", user_id=user.id)
         return _err("Could not save the DLP configuration — see the server log")
+
+    # Drop the cached block gate so a Block toggle takes effect immediately
+    # rather than after the enforcement TTL. Best-effort: never fail a saved
+    # config over cache invalidation.
+    try:
+        from backend.app.services.dlp_enforcement import invalidate_gate_cache
+        invalidate_gate_cache()
+    except Exception:
+        logger.warning("dlp_gate_cache_invalidate_skipped")
 
     return RedirectResponse("/admin/dlp?success=DLP+configuration+saved", status_code=302)
 

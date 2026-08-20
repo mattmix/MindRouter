@@ -423,6 +423,121 @@ class InferenceService:
             capped=request.max_tokens,
         )
 
+    @staticmethod
+    def _dlp_scan_text(request: Any) -> Optional[str]:
+        """Assemble the scannable prompt text from a canonical request.
+
+        Uses the LIVE request (not stored audit content), so inline blocking
+        works even when prompt capture is disabled.
+        """
+        from backend.app.services.dlp_scanner import extract_scannable_text
+
+        messages = None
+        raw = getattr(request, "messages", None)
+        if raw:
+            try:
+                messages = [m.model_dump() if hasattr(m, "model_dump") else m for m in raw]
+            except Exception:
+                messages = None
+        prompt = getattr(request, "prompt", None)
+        if prompt is not None and not isinstance(prompt, str):
+            prompt = str(prompt)
+        return extract_scannable_text(messages=messages, prompt=prompt)
+
+    async def enforce_prompt_dlp(
+        self,
+        request: Any,
+        user: User,
+        api_key: ApiKey,
+        http_request: Request,
+        endpoint: str,
+        extra_parameters: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Inline DLP prompt gate — raises DlpBlockedError (→ 422) when blocked.
+
+        Called by the API handlers BEFORE the stream/non-stream branch so a
+        block returns a clean 4xx rather than a broken SSE stream. Returns
+        immediately (no scan, no text extraction) unless prompt blocking is
+        active, so alert-only deployments keep zero added latency.
+
+        On a block, the request is still recorded (marked failed) and enqueued
+        for the async worker, so it appears in the audit log and fires an email
+        alert if that severity's Alert action is also on.
+        """
+        from backend.app.services.dlp_enforcement import (
+            prompt_blocking_active,
+            evaluate_prompt_block,
+        )
+
+        if not await prompt_blocking_active(self.db):
+            return
+
+        text = self._dlp_scan_text(request)
+        blocked = await evaluate_prompt_block(self.db, text)
+        if blocked is None:
+            return
+
+        # Record the blocked attempt for audit + async alert/email.
+        db_request = await self._create_request_record(
+            request, user, api_key, http_request, endpoint,
+            extra_parameters=extra_parameters,
+        )
+        try:
+            await crud.update_request_failed(
+                self.db, db_request.id,
+                error_message=(
+                    f"Blocked by DLP policy ({blocked.severity}): "
+                    f"{', '.join(blocked.categories)}"
+                ),
+            )
+            await self.db.commit()
+            from backend.app.services.dlp_worker import enqueue_for_dlp
+            await enqueue_for_dlp(db_request.id)
+        except Exception:
+            logger.warning("dlp_block_audit_failed", request_id=getattr(db_request, "id", None))
+        raise blocked
+
+    @staticmethod
+    def _response_scan_text(response: Any) -> Optional[str]:
+        """Assemble scannable text from a completion response (any dialect).
+
+        Covers OpenAI chat (choices[].message.content), OpenAI/text completion
+        (choices[].text), Ollama chat (message.content) and Ollama generate
+        (response). Returns None when there's nothing textual to scan.
+        """
+        if not isinstance(response, dict):
+            return None
+        parts: List[str] = []
+        for ch in response.get("choices", []) or []:
+            if not isinstance(ch, dict):
+                continue
+            msg = ch.get("message") or {}
+            if isinstance(msg, dict) and isinstance(msg.get("content"), str):
+                parts.append(msg["content"])
+            if isinstance(ch.get("text"), str):
+                parts.append(ch["text"])
+        msg = response.get("message") or {}
+        if isinstance(msg, dict) and isinstance(msg.get("content"), str):
+            parts.append(msg["content"])
+        if isinstance(response.get("response"), str):
+            parts.append(response["response"])
+        combined = "\n".join(p for p in parts if p)
+        return combined or None
+
+    async def _response_block_decision(self, response: Any):
+        """Return a DlpBlockedError if the response must be blocked, else None.
+
+        Fast no-op unless response blocking is active (cached gate).
+        """
+        from backend.app.services.dlp_enforcement import (
+            response_blocking_active,
+            evaluate_response_block,
+        )
+
+        if not await response_blocking_active(self.db):
+            return None
+        return await evaluate_response_block(self.db, self._response_scan_text(response))
+
     async def chat_completion(
         self,
         request: CanonicalChatRequest,
@@ -2388,6 +2503,36 @@ class InferenceService:
         modality: Modality = Modality.CHAT,
     ) -> None:
         """Complete a request with response data."""
+        # Inline DLP response gate — NON-STREAMING only: a streamed response is
+        # already on the wire and cannot be recalled, so it is left to the async
+        # alert path. No-op unless response blocking is active. On a block, the
+        # generation already finished, so release the slot as completed (no
+        # capacity leak), record the block for audit + alert, and raise a
+        # DlpBlockedError which the handler turns into a 422.
+        if not getattr(db_request, "is_streaming", False):
+            blocked = await self._response_block_decision(response)
+            if blocked is not None:
+                usage = response.get("usage", {}) or {}
+                total = (usage.get("prompt_tokens", 0) or 0) + (usage.get("completion_tokens", 0) or 0)
+                await self._scheduler.on_job_completed(job, backend_id, total)
+                try:
+                    await crud.update_request_failed(
+                        self.db, db_request.id,
+                        error_message=(
+                            f"Response blocked by DLP policy ({blocked.severity}): "
+                            f"{', '.join(blocked.categories)}"
+                        ),
+                    )
+                    await self.db.commit()
+                    from backend.app.services.dlp_worker import enqueue_for_dlp
+                    await enqueue_for_dlp(db_request.id)
+                except Exception:
+                    logger.warning(
+                        "dlp_response_block_audit_failed",
+                        request_id=getattr(db_request, "id", None),
+                    )
+                raise blocked
+
         # Extract token counts
         usage = response.get("usage", {})
         prompt_tokens = usage.get("prompt_tokens", 0)
