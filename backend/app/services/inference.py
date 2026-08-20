@@ -219,6 +219,10 @@ class InferenceService:
         self._registry = get_registry()
         self._latency_tracker = self._registry.latency_tracker
         self._http_client: Optional[httpx.AsyncClient] = None
+        # Prompt redactions decided by the inline DLP gate, applied to the
+        # outbound request by _create_request_record after the ORIGINAL is
+        # stored (so the audit trail + async alert path see the real text).
+        self._pending_prompt_redactions: list = []
 
     async def _get_http_client(self) -> httpx.AsyncClient:
         """Get or create HTTP client with per-attempt timeout."""
@@ -453,30 +457,40 @@ class InferenceService:
         endpoint: str,
         extra_parameters: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """Inline DLP prompt gate — raises DlpBlockedError (→ 422) when blocked.
+        """Inline DLP prompt gate — block and/or redact, per policy.
 
         Called by the API handlers BEFORE the stream/non-stream branch so a
         block returns a clean 4xx rather than a broken SSE stream. Returns
-        immediately (no scan, no text extraction) unless prompt blocking is
-        active, so alert-only deployments keep zero added latency.
+        immediately (no scan, no text extraction) unless an inline prompt action
+        is active, so alert-only deployments keep zero added latency.
 
-        On a block, the request is still recorded (marked failed) and enqueued
-        for the async worker, so it appears in the audit log and fires an email
-        alert if that severity's Alert action is also on.
+        Block: the request is recorded (marked failed) and enqueued for the
+        async worker (audit + email alert if that severity's Alert is on), then
+        DlpBlockedError is raised (→ 422). Redact: the offending values are
+        stashed and applied to the OUTBOUND request by _create_request_record,
+        after the original text is stored — so the audit trail and the async
+        alert path still see the real content.
         """
         from backend.app.services.dlp_enforcement import (
-            prompt_blocking_active,
-            evaluate_prompt_block,
+            prompt_inline_active,
+            evaluate_prompt_inline,
         )
 
-        if not await prompt_blocking_active(self.db):
+        self._pending_prompt_redactions = []
+        if not await prompt_inline_active(self.db):
             return
 
         text = self._dlp_scan_text(request)
-        blocked = await evaluate_prompt_block(self.db, text)
-        if blocked is None:
+        action = await evaluate_prompt_inline(self.db, text)
+        if action is None:
             return
 
+        if action.redactions:
+            # Applied downstream, after the original is stored for audit.
+            self._pending_prompt_redactions = action.redactions
+            return
+
+        blocked = action.block
         # Record the blocked attempt for audit + async alert/email.
         db_request = await self._create_request_record(
             request, user, api_key, http_request, endpoint,
@@ -496,6 +510,54 @@ class InferenceService:
         except Exception:
             logger.warning("dlp_block_audit_failed", request_id=getattr(db_request, "id", None))
         raise blocked
+
+    @staticmethod
+    def _apply_prompt_redactions(request: Any, redactions: list) -> None:
+        """Redact offending values in the OUTBOUND canonical request in place.
+
+        Walks message contents (str or multimodal text parts) and the raw
+        prompt. The audit record is built from the original before this runs, so
+        only what is dispatched to the backend is altered.
+        """
+        from backend.app.services.dlp_enforcement import redact_text
+
+        for msg in getattr(request, "messages", None) or []:
+            content = getattr(msg, "content", None)
+            if isinstance(content, str):
+                msg.content = redact_text(content, redactions)
+            elif isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and isinstance(part.get("text"), str):
+                        part["text"] = redact_text(part["text"], redactions)
+                    elif getattr(part, "text", None) and isinstance(part.text, str):
+                        part.text = redact_text(part.text, redactions)
+        if isinstance(getattr(request, "prompt", None), str):
+            request.prompt = redact_text(request.prompt, redactions)
+
+    @staticmethod
+    def _apply_response_redactions(response: Any, redactions: list) -> None:
+        """Redact offending values in the OUTBOUND response dict in place.
+
+        Mirrors _response_scan_text's shape coverage. Applied AFTER the original
+        response is persisted, so only what the caller receives is altered.
+        """
+        from backend.app.services.dlp_enforcement import redact_text
+
+        if not isinstance(response, dict):
+            return
+        for ch in response.get("choices", []) or []:
+            if not isinstance(ch, dict):
+                continue
+            msg = ch.get("message")
+            if isinstance(msg, dict) and isinstance(msg.get("content"), str):
+                msg["content"] = redact_text(msg["content"], redactions)
+            if isinstance(ch.get("text"), str):
+                ch["text"] = redact_text(ch["text"], redactions)
+        msg = response.get("message")
+        if isinstance(msg, dict) and isinstance(msg.get("content"), str):
+            msg["content"] = redact_text(msg["content"], redactions)
+        if isinstance(response.get("response"), str):
+            response["response"] = redact_text(response["response"], redactions)
 
     @staticmethod
     def _response_scan_text(response: Any) -> Optional[str]:
@@ -524,19 +586,19 @@ class InferenceService:
         combined = "\n".join(p for p in parts if p)
         return combined or None
 
-    async def _response_block_decision(self, response: Any):
-        """Return a DlpBlockedError if the response must be blocked, else None.
+    async def _response_inline_plan(self, response: Any):
+        """Return the InlineAction for a response (block or redactions), else None.
 
-        Fast no-op unless response blocking is active (cached gate).
+        Fast no-op unless an inline response action is active (cached gate).
         """
         from backend.app.services.dlp_enforcement import (
-            response_blocking_active,
-            evaluate_response_block,
+            response_inline_active,
+            evaluate_response_inline,
         )
 
-        if not await response_blocking_active(self.db):
+        if not await response_inline_active(self.db):
             return None
-        return await evaluate_response_block(self.db, self._response_scan_text(response))
+        return await evaluate_response_inline(self.db, self._response_scan_text(response))
 
     async def chat_completion(
         self,
@@ -1302,6 +1364,19 @@ class InferenceService:
         # so no row locks are held during the long-running inference phase.
         # expire_on_commit=False ensures db_request.id remains accessible.
         await self.db.commit()
+
+        # DLP prompt redaction: the audit row above captured the ORIGINAL text;
+        # now strip the offending values from the request that is dispatched to
+        # the backend, so the model never sees them. The async worker still
+        # scans the stored original, so alerting is unaffected.
+        if self._pending_prompt_redactions:
+            try:
+                self._apply_prompt_redactions(request, self._pending_prompt_redactions)
+            except Exception:
+                logger.warning("dlp_prompt_redaction_failed",
+                               request_id=getattr(db_request, "id", None))
+            finally:
+                self._pending_prompt_redactions = []
 
         return db_request
 
@@ -2505,13 +2580,16 @@ class InferenceService:
         """Complete a request with response data."""
         # Inline DLP response gate — NON-STREAMING only: a streamed response is
         # already on the wire and cannot be recalled, so it is left to the async
-        # alert path. No-op unless response blocking is active. On a block, the
-        # generation already finished, so release the slot as completed (no
+        # alert path. No-op unless an inline response action is active. Block:
+        # the generation already finished, so release the slot as completed (no
         # capacity leak), record the block for audit + alert, and raise a
-        # DlpBlockedError which the handler turns into a 422.
+        # DlpBlockedError (→ 422). Redact: strip the offending values from the
+        # returned response AFTER the original is persisted below.
+        response_redactions: list = []
         if not getattr(db_request, "is_streaming", False):
-            blocked = await self._response_block_decision(response)
-            if blocked is not None:
+            plan = await self._response_inline_plan(response)
+            if plan is not None and plan.block is not None:
+                blocked = plan.block
                 usage = response.get("usage", {}) or {}
                 total = (usage.get("prompt_tokens", 0) or 0) + (usage.get("completion_tokens", 0) or 0)
                 await self._scheduler.on_job_completed(job, backend_id, total)
@@ -2532,6 +2610,8 @@ class InferenceService:
                         request_id=getattr(db_request, "id", None),
                     )
                 raise blocked
+            if plan is not None and plan.redactions:
+                response_redactions = plan.redactions
 
         # Extract token counts
         usage = response.get("usage", {})
@@ -2569,11 +2649,21 @@ class InferenceService:
 
         # DB bookkeeping — shielded from task cancellation so the commit
         # can't be interrupted mid-flush (which corrupts the session and
-        # leaks the connection from the pool).
+        # leaks the connection from the pool). Stores the ORIGINAL response.
         await asyncio.shield(self._do_complete_db(
             db_request, backend_id, response, prompt_tokens,
             completion_tokens, tokens_estimated, total_tokens,
         ))
+
+        # DLP response redaction: original is now persisted (and will be scanned
+        # by the async worker for alerting), so strip the offending values from
+        # the response object the caller receives.
+        if response_redactions:
+            try:
+                self._apply_response_redactions(response, response_redactions)
+            except Exception:
+                logger.warning("dlp_response_redaction_failed",
+                               request_id=getattr(db_request, "id", None))
 
     # Attempts for the completion DB transaction. Hot-row deadlocks (quotas /
     # api_keys under concurrent same-user traffic, MariaDB error 1213) are

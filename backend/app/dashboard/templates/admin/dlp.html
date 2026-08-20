@@ -394,16 +394,16 @@
                         <div class="card mb-4">
                             <div class="card-header"><h5 class="mb-0">Detection Action</h5></div>
                             <div class="card-body">
-                                <p class="text-muted small">For each severity, choose what happens when DLP detects sensitive data: <strong>Block</strong> the request (the caller receives a <code>422</code> with a clear explanation) and/or <strong>Alert</strong> by email. The two are independent &mdash; enable either, both, or neither. Alerting is asynchronous and adds <strong>no latency</strong>; blocking runs an inline scan and only adds latency when at least one Block is on.</p>
+                                <p class="text-muted small">For each severity, choose what happens when DLP detects sensitive data: <strong>Block</strong> the request (the caller receives a <code>422</code> with a clear explanation), <strong>Redact</strong> the offending text (e.g. an SSN is replaced with <code>[REDACTED]</code> before the model or the user sees it), and/or <strong>Alert</strong> by email. All three are independent &mdash; enable any combination. Alerting is asynchronous and adds <strong>no latency</strong>; Block and Redact run an inline scan and only add latency when at least one is on. Block takes precedence over Redact (a rejected request has nothing to redact).</p>
 
                                 <div class="mb-3">
-                                    <label class="form-label fw-bold" for="block_scope">Block scope</label>
+                                    <label class="form-label fw-bold" for="block_scope">Inline action scope <span class="fw-normal text-muted">(Block &amp; Redact)</span></label>
                                     <select class="form-select form-select-sm" style="max-width: 30rem;" name="block_scope" id="block_scope">
-                                        <option value="prompt" {% if config.block_scope == 'prompt' %}selected{% endif %}>Prompt only &mdash; reject the request before the model runs</option>
-                                        <option value="response" {% if config.block_scope == 'response' %}selected{% endif %}>Response only &mdash; withhold the model's output</option>
+                                        <option value="prompt" {% if config.block_scope == 'prompt' %}selected{% endif %}>Prompt only &mdash; inspect the request before the model runs</option>
+                                        <option value="response" {% if config.block_scope == 'response' %}selected{% endif %}>Response only &mdash; inspect the model's output</option>
                                         <option value="both" {% if config.block_scope == 'both' %}selected{% endif %}>Both prompt and response</option>
                                     </select>
-                                    <div class="form-text">What a <strong>Block</strong> action inspects. <strong>Prompt only</strong> (default) rejects before generation and does not affect streaming. Response/both buffer the output (no token streaming) for scanned requests. If the scanners are unavailable, blocking <strong>fails open</strong> &mdash; the request is allowed and the gap is logged &mdash; so a DLP outage cannot take down the gateway. The inline scan uses regex + GLiNER on the off-host pool.</div>
+                                    <div class="form-text">What the inline <strong>Block</strong> and <strong>Redact</strong> actions inspect. <strong>Prompt only</strong> (default) acts before generation and does not affect streaming. On the <strong>response</strong> side, block/redact apply to non-streaming replies (a streamed reply is already on the wire, so it is alert-only). Redaction keeps the <em>original</em> in the audit log and alert &mdash; only the text sent onward is masked. If the scanners are unavailable, inline actions <strong>fail open</strong> &mdash; the request proceeds and the gap is logged &mdash; so a DLP outage cannot take down the gateway. The inline scan uses regex + GLiNER on the off-host pool.</div>
                                 </div>
 
                                 <div class="table-responsive">
@@ -411,6 +411,7 @@
                                     <thead><tr>
                                         <th>Severity</th>
                                         <th class="text-center">Block<br><small class="text-muted fw-normal">422</small></th>
+                                        <th class="text-center">Redact<br><small class="text-muted fw-normal">mask</small></th>
                                         <th class="text-center">Alert<br><small class="text-muted fw-normal">email</small></th>
                                         <th>Delivery</th>
                                         <th>Recipients</th>
@@ -426,6 +427,7 @@
                                     <tr>
                                         <td><span class="badge {{ row.badge }}">{{ row.label }}</span></td>
                                         <td class="text-center"><input class="form-check-input" type="checkbox" name="block_{{ row.key }}" id="block_{{ row.key }}" {% if config['block_' ~ row.key] %}checked{% endif %}></td>
+                                        <td class="text-center"><input class="form-check-input" type="checkbox" name="redact_{{ row.key }}" id="redact_{{ row.key }}" {% if config['redact_' ~ row.key] %}checked{% endif %}></td>
                                         <td class="text-center"><input class="form-check-input" type="checkbox" name="alert_{{ row.key }}" id="alert_{{ row.key }}" {% if config['alert_' ~ row.key] %}checked{% endif %}></td>
                                         <td>
                                             <select class="form-select form-select-sm" style="max-width: 9rem;" name="email_{{ row.key }}_mode" id="email_{{ row.key }}_mode">

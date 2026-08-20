@@ -152,6 +152,9 @@ async def admin_dlp_page(
         "alert_minor": await crud.get_config_json(db, "dlp.action.minor.alert", True),
         "alert_moderate": await crud.get_config_json(db, "dlp.action.moderate.alert", True),
         "alert_major": await crud.get_config_json(db, "dlp.action.major.alert", True),
+        "redact_minor": await crud.get_config_json(db, "dlp.action.minor.redact", False),
+        "redact_moderate": await crud.get_config_json(db, "dlp.action.moderate.redact", False),
+        "redact_major": await crud.get_config_json(db, "dlp.action.major.redact", False),
         "notify_user_minor": await crud.get_config_json(db, "dlp.email.minor.notify_user", False),
         "notify_user_moderate": await crud.get_config_json(db, "dlp.email.moderate.notify_user", False),
         "notify_user_major": await crud.get_config_json(db, "dlp.email.major.notify_user", False),
@@ -238,6 +241,7 @@ async def save_dlp_config(
     for sev in ("minor", "moderate", "major"):
         actions[sev] = {
             "block": form.get(f"block_{sev}") == "on",
+            "redact": form.get(f"redact_{sev}") == "on",
             "alert": form.get(f"alert_{sev}") == "on",
             "notify_user": form.get(f"notify_user_{sev}") == "on",
         }
@@ -455,6 +459,7 @@ async def save_dlp_config(
         await crud.set_config(db, "dlp.block.scope", block_scope)
         for sev in ("minor", "moderate", "major"):
             await crud.set_config(db, f"dlp.action.{sev}.block", actions[sev]["block"])
+            await crud.set_config(db, f"dlp.action.{sev}.redact", actions[sev]["redact"])
             await crud.set_config(db, f"dlp.action.{sev}.alert", actions[sev]["alert"])
             await crud.set_config(db, f"dlp.email.{sev}.notify_user", actions[sev]["notify_user"])
 

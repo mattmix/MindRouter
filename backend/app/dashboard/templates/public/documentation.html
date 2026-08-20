@@ -3684,11 +3684,12 @@ WHERE ENCRYPTION_SCHEME = 1;</code></pre>
                    is delivered</strong>, so there is zero impact on inference latency, and nothing is blocked,
                    delayed, or modified.</p>
                 <p>Each severity can additionally be given a <strong>Detection Action</strong> &mdash;
-                   <strong>Alert</strong> (email) and/or <strong>Block</strong>. Alerting stays asynchronous
-                   (still zero latency). Blocking is opt-in and turns DLP into an active control for that
-                   severity: an <em>inline</em> scan runs before the content is released, and a match returns a
-                   <code>422</code> to the caller. Blocking only runs its inline scan when at least one severity
-                   has Block enabled, so an alert-only deployment keeps the original zero-latency behavior. See
+                   <strong>Alert</strong> (email), <strong>Block</strong> (reject with a <code>422</code>), and/or
+                   <strong>Redact</strong> (mask the offending text before the model or user sees it). Alerting
+                   stays asynchronous (still zero latency). Block and Redact are opt-in and turn DLP into an active
+                   control for that severity: an <em>inline</em> scan runs before the content is released. The
+                   inline scan runs only when at least one severity has Block or Redact enabled, so an alert-only
+                   deployment keeps the original zero-latency behavior. See
                    <a href="#dlp-actions">Detection Actions &amp; Blocking</a>.</p>
 
                 <h3>Architecture</h3>
@@ -3794,10 +3795,18 @@ WHERE ENCRYPTION_SCHEME = 1;</code></pre>
                         <em>digest</em>.</li>
                     <li><strong>Block</strong> &mdash; reject the content with an HTTP <code>422</code>. This
                         requires an <em>inline</em>, synchronous scan, so it is opt-in and only runs when at
-                        least one severity has Block enabled. With blocking off, the request path is untouched
-                        and latency is unchanged.</li>
+                        least one severity has Block or Redact enabled. With both off, the request path is
+                        untouched and latency is unchanged.</li>
+                    <li><strong>Redact</strong> &mdash; replace each offending span with a
+                        <code>[REDACTED: category]</code> placeholder in the text sent onward, and let the request
+                        proceed. The prompt is masked before it reaches the model and/or the completion before it
+                        reaches the user (per scope). Crucially, the <em>original</em> text is still stored in the
+                        audit log and scanned by the async worker, so the alert record and the auditor trail are
+                        complete &mdash; only what leaves the gateway is masked. Uses the same inline scan as Block;
+                        <strong>Block takes precedence</strong> over Redact for the same finding.</li>
                 </ul>
-                <p><strong>Block scope</strong> (a single global setting) chooses what a Block inspects:</p>
+                <p>The <strong>inline action scope</strong> (a single global setting) chooses what Block and Redact
+                   inspect:</p>
                 <ul>
                     <li><strong>Prompt only</strong> (default) &mdash; the prompt is scanned <em>before</em> the
                         model runs; a match returns <code>422</code> and nothing is generated. Streaming is
