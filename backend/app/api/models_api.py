@@ -23,7 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from backend.app.api.auth import authenticate_request
 from backend.app.core.canonical_schemas import CanonicalModelInfo, CanonicalModelList
 from backend.app.core.telemetry.registry import get_registry
-from backend.app.db.models import ApiKey, Modality, User
+from backend.app.db.models import ApiKey, BackendEngine, Modality, User
 from backend.app.db.session import get_async_db
 
 # Modalities published in the general model catalogs (/v1/models, /api/tags,
@@ -100,6 +100,10 @@ async def list_models(
     model_data: dict = {}
 
     for backend in backends:
+        # Model-less engines (DLP) serve no inference and never belong in the
+        # catalog, even if a stale model row lingered from an engine change.
+        if backend.engine == BackendEngine.DLP:
+            continue
         backend_models = await registry.get_backend_models(backend.id)
 
         for model in backend_models:

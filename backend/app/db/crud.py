@@ -1433,6 +1433,33 @@ async def get_all_backends(db: AsyncSession) -> List[Backend]:
     return list(result.scalars().all())
 
 
+async def get_backends_by_engine(
+    db: AsyncSession,
+    engine,
+    healthy_only: bool = False,
+) -> List[Backend]:
+    """Get all backends for a given engine type, ordered by id.
+
+    Accepts either a BackendEngine member or its raw string value (e.g. the
+    BackendEngine.DLP enum or the literal "dlp"). When healthy_only is True,
+    restricts to backends whose status is HEALTHY.
+    """
+    # Normalise a raw string value ("dlp") to the BackendEngine member so the
+    # comparison is unambiguous regardless of how the caller expressed it.
+    if not isinstance(engine, BackendEngine):
+        engine = BackendEngine(engine)
+
+    query = select(Backend).where(Backend.engine == engine)
+    if healthy_only:
+        query = query.where(Backend.status == BackendStatus.HEALTHY)
+    query = query.order_by(Backend.id)
+
+    result = await db.execute(
+        query.options(selectinload(Backend.models), selectinload(Backend.node))
+    )
+    return list(result.scalars().all())
+
+
 async def create_backend(
     db: AsyncSession,
     name: str,
@@ -1519,6 +1546,12 @@ async def update_backend(
     if url is not None:
         backend.url = url
     if engine is not None:
+        if engine != backend.engine:
+            # Engine changed. Drop the old model rows so the backend
+            # re-discovers from a clean slate — otherwise converting an
+            # inference backend to a model-less engine (DLP) would leave stale
+            # Model rows that keep it routable / catalog-visible.
+            await db.execute(delete(Model).where(Model.backend_id == backend_id))
         backend.engine = engine
     if max_concurrent is not None:
         backend.max_concurrent = max_concurrent
@@ -1700,6 +1733,9 @@ async def get_backends_with_model(
             and_(
                 Model.name == model_name,
                 Backend.status == BackendStatus.HEALTHY,
+                # Model-less engines (DLP) serve no inference and must never be
+                # routable, even if a stale Model row survives an engine change.
+                Backend.engine != BackendEngine.DLP,
             )
         )
     )

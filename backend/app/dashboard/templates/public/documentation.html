@@ -3883,6 +3883,21 @@ WHERE ENCRYPTION_SCHEME = 1;</code></pre>
                    <code>DLP_MAX_BATCH</code>, &hellip;), and the recommended TLS front (the node's HTTPS proxy).
                    Prerequisite unchanged: content capture must be on for DLP to have text to scan
                    (<code>AUDIT_LOG_ENABLED</code> + prompt/response capture).</small></p>
+
+                <h4>Registering a DLP node</h4>
+                <p>A GPU scanning node can also be registered as a <strong>first-class fleet backend</strong> with
+                   <code>engine=dlp</code> (<strong>Admin &rarr; Backends &rarr; Register</strong>, or
+                   <code>POST /api/admin/backends/register</code> with <code>engine=dlp</code>, <code>url</code>,
+                   <code>node_id</code>, and <code>gpu_indices</code>). Registered this way it joins the fleet with
+                   full GPU and power telemetry via the node sidecar and is health-checked on its
+                   <code>/healthz</code> endpoint &mdash; but it serves <strong>no inference models</strong>: it
+                   never appears in <code>/v1/models</code> and is never scheduled for chat, embedding, or image
+                   requests. When the off-host scanner is enabled and the <strong>Service URL(s)</strong> list is
+                   left empty, MindRouter <strong>auto-discovers</strong> the healthy <code>engine=dlp</code>
+                   backends and uses them as the GLiNER pool (authoritative health &mdash; an unhealthy node is
+                   dropped from the pool automatically, and rejoins when it recovers). An explicit Service URL list
+                   always <strong>overrides</strong> discovery. Because engine and GPUs are per-backend, one node can
+                   run a vLLM backend on one GPU and a DLP backend on another.</p>
             </section>
 
             <hr>

@@ -56,6 +56,7 @@
                                 <select class="form-select" id="reg_engine" name="engine" required>
                                     <option value="ollama">Ollama</option>
                                     <option value="vllm">vLLM</option>
+                                    <option value="dlp">DLP (GLiNER)</option>
                                 </select>
                             </div>
                         </div>
@@ -187,6 +188,7 @@
                                         <select class="form-select" name="engine" required>
                                             <option value="ollama" {% if item.backend.engine.value == 'ollama' %}selected{% endif %}>Ollama</option>
                                             <option value="vllm" {% if item.backend.engine.value == 'vllm' %}selected{% endif %}>vLLM</option>
+                                            <option value="dlp" {% if item.backend.engine.value == 'dlp' %}selected{% endif %}>DLP (GLiNER)</option>
                                         </select>
                                     </div>
                                 </div>

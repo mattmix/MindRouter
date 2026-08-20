@@ -378,6 +378,32 @@ async def _load_dlp_config(db) -> dict:
     config["gliner.remote.fallback"] = await crud.get_config_json(db, "dlp.gliner.remote.fallback", "local")
     config["gliner.remote.verify_tls"] = await crud.get_config_json(db, "dlp.gliner.remote.verify_tls", True)
 
+    # Authoritative auto-discovery of the off-host GLiNER pool.
+    #
+    # When the off-host scanner is enabled but the endpoint list is empty,
+    # treat healthy engine=dlp backends in the fleet registry as the pool.
+    # AUTHORITATIVE health: only backends the fleet currently reports HEALTHY
+    # are used, so a downed DLP node drops out on the next config load and a
+    # recovered one rejoins — no manual edit. A hand-entered endpoint list
+    # ALWAYS wins and bypasses discovery entirely (explicit operator override).
+    # This block NEVER raises: on any error the configured endpoints are left
+    # exactly as loaded so DLP scanning keeps working. Reuses the caller's db
+    # session — no new connection is opened.
+    try:
+        from backend.app.services.dlp_scanner import parse_remote_endpoints
+        manual = parse_remote_endpoints(
+            config["gliner.remote.endpoints"], legacy_url=config["gliner.remote.url"]
+        )
+        if config["gliner.remote.enabled"] and not manual:
+            from backend.app.db.models import BackendEngine
+            backends = await crud.get_backends_by_engine(
+                db, BackendEngine.DLP, healthy_only=True
+            )
+            config["gliner.remote.endpoints"] = [b.url for b in backends]
+            logger.info("dlp_remote_autodiscovered", count=len(backends))
+    except Exception:
+        logger.exception("dlp_remote_autodiscovery_failed")
+
     config["llm.enabled"] = await crud.get_config_json(db, "dlp.llm.enabled", False)
     config["llm.model"] = await crud.get_config_json(db, "dlp.llm.model", "")
     config["llm.system_prompt"] = await crud.get_config_json(db, "dlp.llm.system_prompt", "")

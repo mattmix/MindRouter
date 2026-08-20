@@ -33,7 +33,7 @@ from sqlalchemy import and_, func, select
 from backend.app.core import redis_client
 from backend.app.core.scheduler.policy import get_scheduler
 from backend.app.core.telemetry.registry import get_registry
-from backend.app.db.models import Request as DBRequest, RequestStatus
+from backend.app.db.models import BackendEngine, Request as DBRequest, RequestStatus
 from backend.app.db.session import AsyncSessionLocal
 from backend.app.settings import get_settings
 
@@ -196,6 +196,10 @@ async def cluster_status() -> Dict[str, Any]:
 
     models = set()
     for backend in healthy_backends:
+        # Model-less engines (DLP) are fleet members for telemetry but serve no
+        # inference models — keep them out of the public model catalog.
+        if backend.engine == BackendEngine.DLP:
+            continue
         try:
             backend_models = await registry.get_backend_models(backend.id)
             for m in backend_models:

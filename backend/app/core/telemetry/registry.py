@@ -21,6 +21,7 @@ from typing import Dict, List, Optional
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from backend.app.core.telemetry.adapters.dlp import DlpAdapter
 from backend.app.core.telemetry.adapters.ollama import OllamaAdapter
 from backend.app.core.telemetry.adapters.sidecar_client import SidecarClient
 from backend.app.core.telemetry.adapters.vllm import VLLMAdapter
@@ -872,12 +873,17 @@ class BackendRegistry:
                     throughput_score=throughput,
                 )
 
-    def _create_adapter(self, backend: Backend) -> OllamaAdapter | VLLMAdapter:
+    def _create_adapter(self, backend: Backend) -> OllamaAdapter | VLLMAdapter | DlpAdapter:
         """Create the appropriate adapter for a backend."""
         timeout = self._settings.backend_health_timeout
 
         if backend.engine == BackendEngine.OLLAMA:
             return OllamaAdapter(backend.url, timeout=timeout)
+        elif backend.engine == BackendEngine.DLP:
+            # The DLP (GLiNER) scan service probes /healthz (not /health) and
+            # deliberately discovers ZERO models, so it stays out of routing
+            # and the model catalog while remaining a fleet member for status.
+            return DlpAdapter(backend.url, timeout=timeout)
         else:
             # Both vLLM and diffusion backends expose OpenAI-compatible
             # /v1/models and /health endpoints, so VLLMAdapter works for both.

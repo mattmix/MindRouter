@@ -71,6 +71,11 @@ class BackendEngine(str, PyEnum):
     # discovery exactly as `diffusion` does.
     TTS = "tts"
     STT = "stt"
+    # DLP / GLiNER scan service (migration 077). A fleet member for status +
+    # GPU/power telemetry (via the per-node sidecar) that serves NO models:
+    # its adapter discovers zero models, so it is never eligible for inference
+    # routing and never appears in the model catalog. Health path is /healthz.
+    DLP = "dlp"
 
 
 class BackendStatus(str, PyEnum):
