@@ -3695,11 +3695,14 @@ WHERE ENCRYPTION_SCHEME = 1;</code></pre>
               +----------+----------+
               |          |          |
          Regex/KW    GLiNER      LLM Scanner
-         (~0.1ms)    (~10ms)   (~500ms, direct to backend)
+         (~0.1ms)  (CPU or GPU)  (~500ms, direct to backend)
               |          |          |
               +----------+----------+
                          |
                   Merge findings &rarr; Classify severity &rarr; Write alert &rarr; Email</code></pre>
+                <p>The worker is not a single task &mdash; it runs a pool of concurrent scan consumers
+                   (tunable via <code>dlp.worker.concurrency</code>, default 3) so several scans proceed in
+                   parallel and a burst of GLiNER work does not serialize behind one item.</p>
 
                 <h3>Scanning Tiers</h3>
                 <table class="table table-bordered table-sm">
@@ -3712,13 +3715,13 @@ WHERE ENCRYPTION_SCHEME = 1;</code></pre>
                             <td>Built-in regex patterns + custom patterns + keyword list</td>
                             <td>~0.1ms</td>
                             <td>SSNs, credit cards, emails, phone numbers, custom patterns</td>
-                            <td>Known formats with fixed structure. High precision, no false positives.</td>
+                            <td>Known formats with fixed structure. High precision &mdash; credit-card matches are <strong>Luhn-validated</strong>, so barcodes, order numbers and other long digit runs are not mistaken for cards.</td>
                         </tr>
                         <tr>
                             <td><strong>GLiNER NER</strong></td>
-                            <td>Neural entity recognition (<code>urchade/gliner_multi_pii-v1</code>, CPU)</td>
-                            <td>~10ms</td>
-                            <td>Names, dates of birth, passport/license numbers, medical records, student IDs</td>
+                            <td>Neural entity recognition (<code>urchade/gliner_multi_pii-v1</code>). Runs on the host CPU by default, or <a href="#dlp-offhost">off-host on a dedicated GPU node</a>.</td>
+                            <td>CPU ~0.1&ndash;3s (rises under concurrency); GPU ~0.1&ndash;0.3s</td>
+                            <td>Dates of birth, passport/license numbers, bank accounts, medical records, student IDs</td>
                             <td>Entities in natural language that don't match fixed patterns. Zero-shot &mdash; can detect custom entity types by name.</td>
                         </tr>
                         <tr>
@@ -3750,12 +3753,13 @@ WHERE ENCRYPTION_SCHEME = 1;</code></pre>
                         <tr>
                             <td><span class="badge bg-info">Minor</span></td>
                             <td>Low-risk, informational</td>
-                            <td>Person name, email address, phone number</td>
+                            <td>Email address, phone number</td>
                             <td>Logged for audit. Email sent to minor recipients (if configured).</td>
                         </tr>
                     </tbody>
                 </table>
                 <p>The highest severity among all findings in a single scan determines the alert level. Categories not mapped in severity rules default to <strong>Moderate</strong>.</p>
+                <p class="text-muted"><small>Note: <code>person</code> (names) is mapped to Minor but is <strong>not detected by default</strong> &mdash; it was removed from the GLiNER default category set because free-form name detection had low precision (it flagged section headings and greetings). Re-enable it under Admin &rarr; DLP &rarr; GLiNER categories if you need it.</small></p>
 
                 <h3>Admin Configuration</h3>
                 <p>Configure DLP in the admin dashboard at <strong>Admin &rarr; DLP</strong>. Each section has a
@@ -3797,12 +3801,88 @@ WHERE ENCRYPTION_SCHEME = 1;</code></pre>
                 <h3>Performance &amp; Reliability</h3>
                 <ul>
                     <li><strong>Zero latency impact</strong> &mdash; The only code in the request path is <code>queue.put_nowait(request_id)</code> (~100ns) wrapped in try/except. It cannot slow down or break inference.</li>
-                    <li><strong>Bounded queue</strong> &mdash; The queue holds up to 10,000 items. If full (e.g. during a traffic spike), new items are silently dropped with a log warning. Best-effort scanning.</li>
-                    <li><strong>Crash isolation</strong> &mdash; The DLP worker runs as an independent asyncio task with its own DB session. Any crash is caught, logged, and the worker continues processing the next item.</li>
-                    <li><strong>GLiNER lazy loading</strong> &mdash; The ~200MB model loads on first scan (~2-3s), then stays in memory. Subsequent scans take ~10ms on CPU.</li>
-                    <li><strong>Text truncation</strong> &mdash; The LLM scanner truncates input to 8,000 characters to limit token usage and cost.</li>
+                    <li><strong>Concurrent worker pool</strong> &mdash; The queue is drained by a pool of scan consumers (<code>dlp.worker.concurrency</code>, default 3, hot-tunable) rather than a single task, so concurrent scans run in parallel. Each consumer has its own DB session; any crash is caught and logged and the pool continues.</li>
+                    <li><strong>Bounded queue with metrics</strong> &mdash; The queue holds up to 10,000 items. If it fills during a spike, new items are dropped (best-effort scanning) and counted. Queue depth and total drops are exported to Prometheus as <code>mindrouter_dlp_queue_size</code> and <code>mindrouter_dlp_queue_dropped</code> on <code>/metrics</code>, so coverage loss under load is observable.</li>
+                    <li><strong>GLiNER lazy loading</strong> &mdash; The GLiNER model (~1&nbsp;GB) loads on first scan, then stays resident. On the host CPU, scans cost ~0.1&ndash;3&nbsp;s depending on load; on a <a href="#dlp-offhost">dedicated GPU node</a> they are far faster and off the gateway entirely.</li>
+                    <li><strong>Text truncation</strong> &mdash; GLiNER input is capped (default 10,000 chars, admin-tunable) and the LLM scanner truncates to 8,000 chars to bound cost.</li>
                     <li><strong>Image content skipped</strong> &mdash; Multimodal image inputs are automatically excluded from scanning. Only text content (messages, prompts, responses) is scanned.</li>
                 </ul>
+
+                <h3 id="dlp-offhost">Off-host GPU Scanning</h3>
+                <p>The GLiNER scanner is CPU-bound and, on a busy shared gateway, a burst of scans can contend
+                   for CPU and slow alerting. To remove that cost entirely, GLiNER can run <strong>off-host on
+                   one or more dedicated GPU nodes</strong>. MindRouter calls the node(s) over the network; the
+                   built-in on-host scanner remains as an automatic fallback. This is opt-in and off by default
+                   &mdash; nothing changes unless you enable it.</p>
+<pre><code>MindRouter DLP worker
+      |
+      |  POST /scan  (TLS + shared key)
+      v
+ +----------------------- endpoint pool -----------------------+
+ |  GPU node A            GPU node B            ...             |   round-robin
+ |  (GLiNER on GPU,       (GLiNER on GPU,                       |   + failover
+ |   dynamic batching)     dynamic batching)                   |
+ +-------------------------------------------------------------+
+      |
+      |  whole pool unreachable / oversubscribed?
+      v
+ on-host CPU GLiNER  (fallback)  ── OR ──  skip + surface a degraded scan</code></pre>
+                <p>How the pool behaves:</p>
+                <ul>
+                    <li><strong>Load-balanced with failover</strong> &mdash; Scans are spread across the configured
+                        endpoints round-robin. If one endpoint errors or reports that it is oversubscribed, the
+                        request fails over to the next; a failing endpoint is briefly skipped while it recovers.</li>
+                    <li><strong>Fallback, not failure</strong> &mdash; Only when the <em>whole</em> pool is
+                        unreachable does the fallback fire. With fallback set to <strong>on-host</strong>, the scan
+                        runs on the gateway CPU as it does today (logged, non-fatal). With fallback set to
+                        <strong>skip</strong>, the scan is marked degraded and surfaced to admins instead of
+                        silently using the slower path. Either way, a downed GPU node never drops a scan or affects
+                        users. This behaviour is verified against a live service, including stopping the node
+                        mid-operation.</li>
+                    <li><strong>Scale-out</strong> &mdash; Add capacity by listing more endpoints; MindRouter uses
+                        them immediately. On a single GPU, throughput comes from dynamic batching (concurrent scans
+                        are coalesced into one GPU pass), not from running more copies.</li>
+                </ul>
+
+                <h4>The GPU service</h4>
+                <p>Each GPU node runs a small, standalone scanning service (shipped in the repository under
+                   <code>dlp_service/</code>, with a <code>README</code> and a systemd installer). It is designed to
+                   be safe to place on a separate node:</p>
+                <ul>
+                    <li><strong>Stateless &mdash; no data at rest.</strong> The service holds no database and never
+                        logs or persists request or response text. It receives text, returns findings, and keeps
+                        only counts and latencies.</li>
+                    <li><strong>Authenticated &amp; encrypted.</strong> Every request carries a shared worker key
+                        (<code>X-Worker-Key</code>); traffic is TLS. The service exposes only <code>/scan</code>,
+                        <code>/healthz</code>, and <code>/stats</code>.</li>
+                    <li><strong>Dynamic batching.</strong> Concurrent scans are collected over a few milliseconds and
+                        run as a single batched GPU pass, which is what turns a GPU into throughput. On a mid-range
+                        GPU this scales to well over 100 scans/second while keeping per-scan latency low.</li>
+                    <li><strong>Self-healing.</strong> It runs under systemd (restart-on-failure, reboot-persistent)
+                        and reports readiness via <code>/healthz</code>.</li>
+                </ul>
+
+                <h4>Admin Configuration</h4>
+                <p>Configure the off-host scanner under <strong>Admin &rarr; DLP &rarr; GLiNER &rarr; Off-host GLiNER
+                   service</strong>. The settings are stored in the DLP configuration (<code>app_config</code>) and
+                   take effect immediately &mdash; no restart.</p>
+                <table class="table table-bordered table-sm">
+                    <thead class="table-light"><tr><th>Setting</th><th>Config key</th><th>Meaning</th></tr></thead>
+                    <tbody>
+                        <tr><td>Enable off-host</td><td><code>dlp.gliner.remote.enabled</code></td><td>Route GLiNER scans to the endpoint pool. Off by default (on-host scanning).</td></tr>
+                        <tr><td>Service URL(s)</td><td><code>dlp.gliner.remote.endpoints</code></td><td>One or more base URLs, one per line, e.g. <code>https://gpu-node:8001</code>. The pool MindRouter load-balances across.</td></tr>
+                        <tr><td>Worker key</td><td><code>dlp.gliner.remote.key</code></td><td>Shared secret sent as <code>X-Worker-Key</code>; must match the service's key.</td></tr>
+                        <tr><td>Timeout</td><td><code>dlp.gliner.remote.timeout</code></td><td>Per-request timeout in seconds (1&ndash;120, default 10).</td></tr>
+                        <tr><td>On failure</td><td><code>dlp.gliner.remote.fallback</code></td><td><code>local</code> = fall back to on-host GLiNER (default); <code>skip</code> = surface a degraded scan and do not run on-host.</td></tr>
+                        <tr><td>Verify TLS</td><td><code>dlp.gliner.remote.verify_tls</code></td><td>Validate the service's certificate (default on). Turn off only for a self-signed cert on a trusted network.</td></tr>
+                    </tbody>
+                </table>
+                <p class="text-muted"><small>Deploying a GPU node: see <code>dlp_service/README.md</code> in the
+                   repository for the installer (a standard <code>python3.11</code> venv + systemd unit), the
+                   environment variables (<code>DLP_SERVICE_KEY</code>, <code>DLP_REPLICAS</code>,
+                   <code>DLP_MAX_BATCH</code>, &hellip;), and the recommended TLS front (the node's HTTPS proxy).
+                   Prerequisite unchanged: content capture must be on for DLP to have text to scan
+                   (<code>AUDIT_LOG_ENABLED</code> + prompt/response capture).</small></p>
             </section>
 
             <hr>
