@@ -1157,6 +1157,9 @@ async def renew_api_key(
             raise ValueError("limit")
         api_key.expires_at = datetime.now(timezone.utc) + timedelta(days=days)
         api_key.status = ApiKeyStatus.ACTIVE
+        # Re-arm expiry reminders: the new period gets its own early/urgent emails.
+        api_key.reminder_early_sent_at = None
+        api_key.reminder_urgent_sent_at = None
         await db.flush()
     return api_key
 

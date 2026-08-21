@@ -1550,7 +1550,23 @@ class BackendRegistry:
                 deleted_unreferenced=deleted,
                 grace_days=grace,
             )
-        return {"marked_expired": expired, "deleted_unreferenced": deleted, "grace_days": grace}
+
+        # Expiry reminder emails (opt-in; no-op unless enabled + SMTP set).
+        # Own session so an SMTP hiccup can't roll back the status/prune above.
+        reminders = {}
+        try:
+            from backend.app.services.api_key_reminders import send_expiry_reminders
+            async with get_async_db_context() as rdb:
+                reminders = await send_expiry_reminders(rdb)
+        except Exception as e:
+            logger.error("api_key_reminder_error", error=str(e))
+
+        return {
+            "marked_expired": expired,
+            "deleted_unreferenced": deleted,
+            "grace_days": grace,
+            "reminders": reminders,
+        }
 
     async def _telemetry_cleanup_loop(self) -> None:
         """Periodically purge old telemetry data."""

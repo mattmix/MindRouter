@@ -337,6 +337,10 @@ class ApiKey(Base, TimestampMixin):
     promoted_by: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("users.id"), nullable=True)
     revocation_requested_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     revocation_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # Expiry-reminder watermarks: set when the early/urgent email is sent,
+    # cleared on renewal so a renewed key is reminded again next cycle.
+    reminder_early_sent_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    reminder_urgent_sent_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
     # Archived token offsets — retention rolls up per-key totals here
     # before deleting old requests, so lifetime counters stay accurate.

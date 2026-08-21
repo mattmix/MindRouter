@@ -3992,6 +3992,8 @@ async def _api_key_maintenance_context(db: AsyncSession) -> dict:
             ApiKey.expires_at < now,
         )
     )
+    from backend.app.services.api_key_reminders import load_reminder_config
+    rcfg = await load_reminder_config(db)
     return {
         "km_interval_seconds": interval,
         "km_prune_grace_days": grace,
@@ -4001,6 +4003,10 @@ async def _api_key_maintenance_context(db: AsyncSession) -> dict:
         "km_count_expired": counts.get("expired", 0),
         "km_count_revoked": counts.get("revoked", 0),
         "km_overdue_unswept": overdue_result.scalar() or 0,
+        "rem_enabled": rcfg["enabled"],
+        "rem_early_days": rcfg["early_days"],
+        "rem_urgent_days": rcfg["urgent_days"],
+        "rem_test_recipient": rcfg["test_recipient"],
     }
 
 
@@ -4028,11 +4034,59 @@ async def admin_api_key_maintenance(
         except Exception:
             logger.exception("api_key_maintenance_run_now_failed")
             return RedirectResponse(url="/admin/api-keys?error=Maintenance+run+failed", status_code=302)
+        rem = summary.get("reminders") or {}
+        rem_txt = ""
+        if rem.get("early_users") or rem.get("urgent_users"):
+            rem_txt = (
+                f"; reminders: {rem.get('urgent_users', 0)} urgent + "
+                f"{rem.get('early_users', 0)} early emails"
+            )
         msg = (
             f"Maintenance ran: {summary['marked_expired']} marked expired, "
-            f"{summary['deleted_unreferenced']} unreferenced keys pruned"
+            f"{summary['deleted_unreferenced']} unreferenced keys pruned{rem_txt}"
         )
         return RedirectResponse(url=f"/admin/api-keys?success={quote_plus(msg)}", status_code=302)
+
+    if action == "save_reminders":
+        rem_enabled = form.get("reminders_enabled") == "on"
+        try:
+            early = int(form.get("early_days", 10))
+            urgent = int(form.get("urgent_days", 2))
+        except (TypeError, ValueError):
+            return RedirectResponse(url="/admin/api-keys?error=Reminder+days+must+be+whole+numbers", status_code=302)
+        if not (1 <= early <= 365):
+            return RedirectResponse(url="/admin/api-keys?error=Early+warning+must+be+1-365+days", status_code=302)
+        if not (0 <= urgent < early):
+            return RedirectResponse(url="/admin/api-keys?error=Urgent+warning+must+be+0+and+below+the+early+value", status_code=302)
+        test_to = (form.get("test_recipient") or "").strip()
+        if test_to and ("\n" in test_to or "\r" in test_to or "@" not in test_to):
+            return RedirectResponse(url="/admin/api-keys?error=Test+recipient+is+not+a+valid+email", status_code=302)
+        await crud.set_config(db, "apikey.reminders.enabled", rem_enabled)
+        await crud.set_config(db, "apikey.reminders.early_days", early)
+        await crud.set_config(db, "apikey.reminders.urgent_days", urgent)
+        await crud.set_config(db, "apikey.reminders.test_recipient", test_to)
+        await crud.log_admin_action(
+            db, user_id=user_id, action="apikey.reminders_config",
+            entity_type="config",
+            after_value={"enabled": rem_enabled, "early_days": early, "urgent_days": urgent},
+            ip_address=get_client_ip(request),
+        )
+        await db.commit()
+        return RedirectResponse(url="/admin/api-keys?success=Reminder+settings+saved", status_code=302)
+
+    if action in ("test_early", "test_urgent"):
+        from backend.app.services.api_key_reminders import send_test_reminder
+        test_to = (form.get("test_recipient") or "").strip()
+        if not test_to:
+            test_to = await crud.get_config_json(db, "apikey.reminders.test_recipient", "")
+        tier = "urgent" if action == "test_urgent" else "early"
+        err = await send_test_reminder(db, test_to, tier=tier)
+        if err:
+            return RedirectResponse(url=f"/admin/api-keys?error={quote_plus(err)}", status_code=302)
+        return RedirectResponse(
+            url=f"/admin/api-keys?success={quote_plus(f'Test {tier} reminder sent to {test_to}')}",
+            status_code=302,
+        )
 
     try:
         interval = int(form.get("interval_seconds", BackendRegistry.API_KEY_MAINT_DEFAULT_INTERVAL))

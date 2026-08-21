@@ -66,6 +66,53 @@
                 </div>
             </div>
 
+            <!-- Expiry reminder emails -->
+            <div class="card mb-4">
+                <div class="card-header bg-secondary bg-opacity-10 d-flex justify-content-between align-items-center">
+                    <h5 class="mb-0"><i class="bi bi-envelope-paper me-1"></i>Expiry reminder emails</h5>
+                    {% if rem_enabled %}
+                    <span class="badge bg-success">On</span>
+                    {% else %}
+                    <span class="badge bg-secondary">Off</span>
+                    {% endif %}
+                </div>
+                <div class="card-body">
+                    <p class="text-muted small mb-3">Email users before their personal API keys expire so they can renew. Each user gets <strong>one email per stage</strong> listing all of their keys in that window (never one email per key), with a link to their dashboard to Renew or Revoke. Renewing re-arms both reminders. Service keys never expire and are never included.</p>
+                    <form method="POST" action="/admin/api-keys/maintenance" class="row g-3 align-items-end">
+                        <input type="hidden" name="action" value="save_reminders">
+                        <div class="col-sm-6 col-md-3">
+                            <div class="form-check form-switch mt-2">
+                                <input class="form-check-input" type="checkbox" role="switch" id="rem_enabled" name="reminders_enabled" {% if rem_enabled %}checked{% endif %}>
+                                <label class="form-check-label" for="rem_enabled">Send reminders</label>
+                            </div>
+                        </div>
+                        <div class="col-sm-6 col-md-3">
+                            <label for="rem_early" class="form-label">Early warning <small class="text-muted">(days before)</small></label>
+                            <input type="number" class="form-control form-control-sm" id="rem_early" name="early_days" value="{{ rem_early_days }}" min="1" max="365" step="1">
+                            <div class="form-text">First heads-up this many days out. Default 10.</div>
+                        </div>
+                        <div class="col-sm-6 col-md-3">
+                            <label for="rem_urgent" class="form-label">Urgent warning <small class="text-muted">(days before)</small></label>
+                            <input type="number" class="form-control form-control-sm" id="rem_urgent" name="urgent_days" value="{{ rem_urgent_days }}" min="0" max="364" step="1">
+                            <div class="form-text">Final reminder this close to expiry. Must be below the early value. Default 2.</div>
+                        </div>
+                        <div class="col-sm-6 col-md-3">
+                            <button type="submit" class="btn btn-primary btn-sm"><i class="bi bi-save me-1"></i>Save reminder settings</button>
+                        </div>
+                        <div class="col-12"><hr class="my-1"></div>
+                        <div class="col-sm-6 col-md-5">
+                            <label for="rem_test" class="form-label">Test recipient</label>
+                            <input type="email" class="form-control form-control-sm" id="rem_test" name="test_recipient" value="{{ rem_test_recipient }}" placeholder="you@uidaho.edu">
+                            <div class="form-text">Where the Test buttons send a sample reminder (fabricated keys). Also saved with the settings.</div>
+                        </div>
+                        <div class="col-sm-6 col-md-7 d-flex gap-2">
+                            <button type="submit" name="action" value="test_early" formnovalidate class="btn btn-outline-secondary btn-sm"><i class="bi bi-send me-1"></i>Send test (early)</button>
+                            <button type="submit" name="action" value="test_urgent" formnovalidate class="btn btn-outline-secondary btn-sm"><i class="bi bi-send-exclamation me-1"></i>Send test (urgent)</button>
+                        </div>
+                    </form>
+                </div>
+            </div>
+
             <!-- Search and Filter -->
             <div class="card mb-4">
                 <div class="card-body">

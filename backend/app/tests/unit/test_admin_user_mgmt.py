@@ -562,3 +562,60 @@ class TestKeyMaintenanceConfig:
         assert 'name="prune_grace_days"' in html
         assert 'value="run_now"' in html
         assert "0 = never delete" in html
+
+
+# ===================================================================
+# 2.9.51 — API key expiry reminder emails (admin config + wiring)
+# ===================================================================
+
+class TestKeyReminderAdmin:
+    def test_route_saves_reminder_settings_and_validates(self):
+        fn = _extract_function(ROUTES_SRC, "admin_api_key_maintenance")
+        assert 'action == "save_reminders"' in fn
+        assert 'set_config(db, "apikey.reminders.enabled"' in fn
+        assert 'set_config(db, "apikey.reminders.early_days"' in fn
+        assert 'set_config(db, "apikey.reminders.urgent_days"' in fn
+        assert "0 <= urgent < early" in fn
+        assert 'action="apikey.reminders_config"' in fn
+
+    def test_route_has_test_reminder_actions(self):
+        fn = _extract_function(ROUTES_SRC, "admin_api_key_maintenance")
+        assert 'action in ("test_early", "test_urgent")' in fn
+        assert "send_test_reminder(db, test_to, tier=tier)" in fn
+
+    def test_context_exposes_reminder_settings(self):
+        fn = _extract_function(ROUTES_SRC, "_api_key_maintenance_context")
+        for key in ("rem_enabled", "rem_early_days", "rem_urgent_days", "rem_test_recipient"):
+            assert f'"{key}"' in fn, key
+
+    def test_registry_runs_reminders_in_maintenance(self):
+        fn = _extract_method(REGISTRY_SRC, "run_api_key_maintenance")
+        assert "send_expiry_reminders(rdb)" in fn
+        # own session so an SMTP failure can't roll back the status/prune work
+        assert 'logger.error("api_key_reminder_error"' in fn
+
+    def test_renew_re_arms_reminder_watermarks(self):
+        fn = _extract_function(CRUD_SRC, "renew_api_key")
+        assert "api_key.reminder_early_sent_at = None" in fn
+        assert "api_key.reminder_urgent_sent_at = None" in fn
+
+    def test_template_has_reminder_card_with_one_email_note(self):
+        html = API_KEYS_HTML
+        assert 'value="save_reminders"' in html
+        assert 'name="reminders_enabled"' in html
+        assert 'name="early_days"' in html and 'name="urgent_days"' in html
+        assert 'value="test_early"' in html and 'value="test_urgent"' in html
+        assert 'name="test_recipient"' in html
+        assert "one email per stage" in html  # the explicit "not one per key" promise
+
+    def test_model_has_reminder_watermark_columns(self, models):
+        cols = models.ApiKey.__table__.columns
+        assert "reminder_early_sent_at" in cols
+        assert "reminder_urgent_sent_at" in cols
+
+    def test_migration_080_adds_columns_and_seeds_config(self):
+        mig = (_MIGRATIONS_DIR / "20260821_000000_080_apikey_expiry_reminders.py").read_text()
+        assert 'down_revision = "079"' in mig
+        assert 'add_column' in mig and 'reminder_early_sent_at' in mig and 'reminder_urgent_sent_at' in mig
+        assert 'apikey.reminders.enabled' in mig
+        assert 'drop_column' in mig  # downgrade present
