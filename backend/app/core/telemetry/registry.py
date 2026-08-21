@@ -68,6 +68,7 @@ class BackendRegistry:
         self._poll_task: Optional[asyncio.Task] = None
         self._persist_task: Optional[asyncio.Task] = None
         self._cleanup_task: Optional[asyncio.Task] = None
+        self._api_key_maint_task: Optional[asyncio.Task] = None
         self._enrich_task: Optional[asyncio.Task] = None
         self._force_offline: bool = False
 
@@ -144,6 +145,7 @@ class BackendRegistry:
         self._poll_task = asyncio.create_task(self._poll_loop())
         self._persist_task = asyncio.create_task(self._persist_latency_loop())
         self._cleanup_task = asyncio.create_task(self._telemetry_cleanup_loop())
+        self._api_key_maint_task = asyncio.create_task(self._api_key_maintenance_loop())
         self._enrich_task = asyncio.create_task(self._enrich_loop())
         logger.info("Backend registry started")
 
@@ -167,6 +169,13 @@ class BackendRegistry:
             self._cleanup_task.cancel()
             try:
                 await self._cleanup_task
+            except asyncio.CancelledError:
+                pass
+
+        if self._api_key_maint_task:
+            self._api_key_maint_task.cancel()
+            try:
+                await self._api_key_maint_task
             except asyncio.CancelledError:
                 pass
 
@@ -1468,6 +1477,81 @@ class BackendRegistry:
     # Telemetry data retention cleanup
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # API key expiry maintenance (admin-configurable — Admin -> API Keys)
+    # ------------------------------------------------------------------
+
+    # Bounds on the admin-set interval so a typo can't spin the loop or park
+    # it for a year.  5 min floor, 24 h ceiling.
+    API_KEY_MAINT_MIN_INTERVAL = 300
+    API_KEY_MAINT_MAX_INTERVAL = 86400
+    API_KEY_MAINT_DEFAULT_INTERVAL = 3600
+    API_KEY_MAINT_DEFAULT_GRACE_DAYS = 15
+
+    async def _api_key_maintenance_loop(self) -> None:
+        """Periodically mark overdue keys expired and prune unreferenced ones.
+
+        Interval and grace come from app_config (apikey.maintenance.* ), read
+        fresh each cycle so an admin change takes effect on the next tick.
+        """
+        logger.info("api_key_maintenance_loop_started")
+        while True:
+            interval = self.API_KEY_MAINT_DEFAULT_INTERVAL
+            try:
+                interval = await self._api_key_maintenance_interval()
+                await asyncio.sleep(interval)
+                await self.run_api_key_maintenance()
+            except asyncio.CancelledError:
+                logger.info("api_key_maintenance_loop_cancelled")
+                break
+            except Exception as e:
+                logger.error("api_key_maintenance_loop_error", error=str(e))
+                await asyncio.sleep(interval)
+
+    async def _api_key_maintenance_interval(self) -> int:
+        async with get_async_db_context() as db:
+            raw = await crud.get_config_json(
+                db, "apikey.maintenance.interval_seconds",
+                self.API_KEY_MAINT_DEFAULT_INTERVAL,
+            )
+        try:
+            val = int(raw)
+        except (TypeError, ValueError):
+            return self.API_KEY_MAINT_DEFAULT_INTERVAL
+        return max(self.API_KEY_MAINT_MIN_INTERVAL,
+                   min(self.API_KEY_MAINT_MAX_INTERVAL, val))
+
+    async def run_api_key_maintenance(self) -> dict:
+        """One maintenance pass: flip overdue keys to expired, then prune
+        unreferenced expired keys past the grace period.  Grace 0 = never
+        prune (status flip still runs).  Returns a small summary; also used by
+        the admin "Run now" button.
+        """
+        async with get_async_db_context() as db:
+            grace = await crud.get_config_json(
+                db, "apikey.maintenance.prune_grace_days",
+                self.API_KEY_MAINT_DEFAULT_GRACE_DAYS,
+            )
+            try:
+                grace = int(grace)
+            except (TypeError, ValueError):
+                grace = self.API_KEY_MAINT_DEFAULT_GRACE_DAYS
+
+            expired = await crud.expire_overdue_api_keys(db)
+            # grace <= 0 means "never hard-delete" — keep every row, just flip.
+            deleted = (
+                await crud.delete_expired_api_keys(db, grace_days=grace)
+                if grace > 0 else 0
+            )
+        if expired or deleted:
+            logger.info(
+                "api_key_expiry_maintenance",
+                marked_expired=expired,
+                deleted_unreferenced=deleted,
+                grace_days=grace,
+            )
+        return {"marked_expired": expired, "deleted_unreferenced": deleted, "grace_days": grace}
+
     async def _telemetry_cleanup_loop(self) -> None:
         """Periodically purge old telemetry data."""
         while True:
@@ -1480,13 +1564,12 @@ class BackendRegistry:
                 logger.error("telemetry_cleanup_error", error=str(e))
 
     async def _cleanup_old_telemetry(self) -> None:
-        """Delete telemetry data older than retention period, then run API key
-        expiry maintenance.
+        """Delete telemetry data older than the retention period.
 
-        Two sessions on purpose: the key prune used to share the telemetry
-        session and failed every hour on an FK (requests.api_key_id), which
-        rolled the telemetry deletes back with it.  A failure in either half
-        is now logged and contained to that half.
+        API key expiry maintenance is a SEPARATE loop
+        (_api_key_maintenance_loop) with its own admin-configurable interval,
+        so a slow or failing key prune can never delay or roll back telemetry
+        pruning (the coupling that made the old shared job fail every hour).
         """
         cutoff = datetime.now(timezone.utc) - timedelta(
             days=self._settings.telemetry_retention_days
@@ -1496,23 +1579,6 @@ class BackendRegistry:
             deleted_bt = await crud.delete_old_telemetry(db, older_than=cutoff)
             deleted_gdt = await crud.delete_old_gpu_telemetry(db, older_than=cutoff)
             deleted_nt = await crud.delete_old_node_telemetry(db, older_than=cutoff)
-
-        try:
-            async with get_async_db_context() as db:
-                # 1. Truth first: any active key past expires_at becomes
-                #    status=expired (the owner can Renew it from the dashboard).
-                expired = await crud.expire_overdue_api_keys(db)
-                # 2. Prune expired keys past the grace period that nothing
-                #    references; keys with history are kept for the audit trail.
-                deleted_keys = await crud.delete_expired_api_keys(db, grace_days=15)
-            if expired or deleted_keys:
-                logger.info(
-                    "api_key_expiry_maintenance",
-                    marked_expired=expired,
-                    deleted_unreferenced=deleted_keys,
-                )
-        except Exception as e:
-            logger.error("api_key_expiry_maintenance_error", error=str(e))
 
         if deleted_bt or deleted_gdt:
             logger.info(

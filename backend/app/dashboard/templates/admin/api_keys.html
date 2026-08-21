@@ -27,6 +27,45 @@
             </div>
             {% endif %}
 
+            <!-- Expiry maintenance settings -->
+            <div class="card mb-4">
+                <div class="card-header bg-secondary bg-opacity-10 d-flex justify-content-between align-items-center">
+                    <h5 class="mb-0"><i class="bi bi-hourglass-split me-1"></i>Key expiry maintenance</h5>
+                    <div class="small text-muted">
+                        <span class="badge bg-success">{{ km_count_active }} active</span>
+                        <span class="badge bg-warning text-dark">{{ km_count_expired }} expired</span>
+                        <span class="badge bg-secondary">{{ km_count_revoked }} revoked</span>
+                        {% if km_overdue_unswept %}
+                        <span class="badge bg-danger" title="Active keys already past expiry, awaiting the next sweep">{{ km_overdue_unswept }} overdue, not yet swept</span>
+                        {% endif %}
+                    </div>
+                </div>
+                <div class="card-body">
+                    <p class="text-muted small mb-3">A background job marks overdue keys <strong>expired</strong> and prunes long-expired keys that nothing references. Service keys never expire and are never touched. Per-user key lifetime (used when a key is created or renewed) is set per group under <a href="/admin/groups">Groups</a>.</p>
+                    <form method="POST" action="/admin/api-keys/maintenance" class="row g-3 align-items-end">
+                        <div class="col-sm-4 col-md-3">
+                            <label for="km_interval" class="form-label">Sweep interval <small class="text-muted">(seconds)</small></label>
+                            <input type="number" class="form-control form-control-sm" id="km_interval" name="interval_seconds"
+                                   value="{{ km_interval_seconds }}" min="{{ km_interval_min }}" max="{{ km_interval_max }}" step="60">
+                            <div class="form-text">How often the job runs. {{ km_interval_min }}&ndash;{{ km_interval_max }}s. Default 3600 (hourly).</div>
+                        </div>
+                        <div class="col-sm-4 col-md-3">
+                            <label for="km_grace" class="form-label">Prune grace <small class="text-muted">(days)</small></label>
+                            <input type="number" class="form-control form-control-sm" id="km_grace" name="prune_grace_days"
+                                   value="{{ km_prune_grace_days }}" min="0" max="3650" step="1">
+                            <div class="form-text">Delete a key this many days after it expires &mdash; but only if nothing (requests, conversations, &hellip;) references it. <strong>0 = never delete</strong> (keep every row; still mark expired).</div>
+                        </div>
+                        <div class="col-sm-4 col-md-6 d-flex gap-2">
+                            <button type="submit" class="btn btn-primary btn-sm"><i class="bi bi-save me-1"></i>Save settings</button>
+                            <button type="submit" name="action" value="run_now" class="btn btn-outline-secondary btn-sm"
+                                    formnovalidate onclick="return confirm('Run key expiry maintenance now?')">
+                                <i class="bi bi-play-fill me-1"></i>Run now
+                            </button>
+                        </div>
+                    </form>
+                </div>
+            </div>
+
             <!-- Search and Filter -->
             <div class="card mb-4">
                 <div class="card-body">

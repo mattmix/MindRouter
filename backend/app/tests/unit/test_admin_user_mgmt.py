@@ -471,15 +471,12 @@ class TestKeyExpiryLifecycle:
         for model in ("Request.", "VideoJob.", "VideoAsset.", "Telemetry."):
             assert model not in prune, model
 
-    def test_registry_runs_key_maintenance_in_its_own_session(self):
-        fn = _extract_method(REGISTRY_SRC, "_cleanup_old_telemetry")
-        # telemetry context closes before the key context opens
-        tel = fn.index("delete_old_node_telemetry")
-        keys = fn.index("expire_overdue_api_keys")
-        assert tel < keys
-        assert fn.count("async with get_async_db_context() as db:") == 2
-        assert "delete_expired_api_keys(db, grace_days=15)" in fn
-        assert '"api_key_expiry_maintenance_error"' in fn
+    def test_registry_runs_key_maintenance_in_its_own_loop(self):
+        # As of 2.9.50 key maintenance is a dedicated loop, not part of the
+        # telemetry cleanup — see TestKeyMaintenanceConfig for the details.
+        run = _extract_method(REGISTRY_SRC, "run_api_key_maintenance")
+        assert "expire_overdue_api_keys(db)" in run
+        assert "delete_expired_api_keys(db, grace_days=grace)" in run
 
     def test_web_pickers_use_first_live_key_not_index_zero(self):
         for name in ("chat.py", "images.py", "video.py"):
@@ -502,3 +499,66 @@ class TestKeyExpiryLifecycle:
         """The dashboard must list an expired key so its owner can Renew it."""
         fn = _extract_function(CRUD_SRC, "get_user_api_keys")
         assert "ApiKey.status.in_([ApiKeyStatus.ACTIVE, ApiKeyStatus.EXPIRED])" in fn
+
+
+# ===================================================================
+# 2.9.50 — admin-configurable API key expiry maintenance
+# ===================================================================
+
+API_KEYS_HTML = (_TEMPLATES_DIR / "admin" / "api_keys.html").read_text()
+
+
+class TestKeyMaintenanceConfig:
+    """Sweep interval + prune grace are admin settings on Admin -> API Keys;
+    a dedicated background loop reads them; grace 0 = never hard-delete."""
+
+    def test_dedicated_loop_separate_from_telemetry(self):
+        # key work is NO LONGER inside _cleanup_old_telemetry
+        tel = _extract_method(REGISTRY_SRC, "_cleanup_old_telemetry")
+        assert "expire_overdue_api_keys" not in tel
+        assert "delete_expired_api_keys" not in tel
+        # it lives in its own loop, started and cancelled like the others
+        assert "async def _api_key_maintenance_loop" in REGISTRY_SRC
+        assert "self._api_key_maint_task = asyncio.create_task(self._api_key_maintenance_loop())" in REGISTRY_SRC
+        assert "self._api_key_maint_task.cancel()" in REGISTRY_SRC
+
+    def test_loop_reads_interval_from_config_and_clamps(self):
+        fn = _extract_method(REGISTRY_SRC, "_api_key_maintenance_interval")
+        assert '"apikey.maintenance.interval_seconds"' in fn
+        assert "API_KEY_MAINT_MIN_INTERVAL" in fn and "API_KEY_MAINT_MAX_INTERVAL" in fn
+
+    def test_run_maintenance_reads_grace_and_zero_means_never_delete(self):
+        fn = _extract_method(REGISTRY_SRC, "run_api_key_maintenance")
+        assert '"apikey.maintenance.prune_grace_days"' in fn
+        assert "expire_overdue_api_keys(db)" in fn
+        assert "delete_expired_api_keys(db, grace_days=grace)" in fn
+        assert "if grace > 0 else 0" in fn, "grace 0 must skip the delete"
+
+    def test_route_saves_settings_and_runs_now_admin_gated(self):
+        fn = _extract_function(ROUTES_SRC, "admin_api_key_maintenance")
+        assert "not user.group or not user.group.is_admin" in fn
+        assert 'set_config(db, "apikey.maintenance.interval_seconds", interval)' in fn
+        assert 'set_config(db, "apikey.maintenance.prune_grace_days", grace)' in fn
+        assert 'action == "run_now"' in fn
+        assert "run_api_key_maintenance()" in fn
+        assert 'action="apikey.maintenance_config"' in fn
+        assert '@dashboard_router.post("/admin/api-keys/maintenance")' in ROUTES_SRC
+
+    def test_route_validates_bounds(self):
+        fn = _extract_function(ROUTES_SRC, "admin_api_key_maintenance")
+        assert "API_KEY_MAINT_MIN_INTERVAL <= interval <= " in fn
+        assert "grace < 0 or grace > 3650" in fn
+
+    def test_context_exposes_settings_and_live_counts(self):
+        fn = _extract_function(ROUTES_SRC, "_api_key_maintenance_context")
+        for key in ("km_interval_seconds", "km_prune_grace_days", "km_count_active",
+                    "km_count_expired", "km_overdue_unswept"):
+            assert f'"{key}"' in fn, key
+
+    def test_template_has_the_maintenance_card(self):
+        html = API_KEYS_HTML
+        assert 'action="/admin/api-keys/maintenance"' in html
+        assert 'name="interval_seconds"' in html
+        assert 'name="prune_grace_days"' in html
+        assert 'value="run_now"' in html
+        assert "0 = never delete" in html

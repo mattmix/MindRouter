@@ -3960,8 +3960,107 @@ async def admin_api_keys(
             "now_utc": datetime.now(timezone.utc),
             "success": success,
             "error": error,
+            **(await _api_key_maintenance_context(db)),
         },
     )
+
+
+async def _api_key_maintenance_context(db: AsyncSession) -> dict:
+    """Values for the API key maintenance settings card + a live status count."""
+    from backend.app.core.telemetry.registry import BackendRegistry
+    from backend.app.db.models import ApiKey, ApiKeyStatus
+    from sqlalchemy import func, select
+
+    interval = await crud.get_config_json(
+        db, "apikey.maintenance.interval_seconds",
+        BackendRegistry.API_KEY_MAINT_DEFAULT_INTERVAL,
+    )
+    grace = await crud.get_config_json(
+        db, "apikey.maintenance.prune_grace_days",
+        BackendRegistry.API_KEY_MAINT_DEFAULT_GRACE_DAYS,
+    )
+    now = datetime.now(timezone.utc)
+    counts_result = await db.execute(
+        select(ApiKey.status, func.count(ApiKey.id)).group_by(ApiKey.status)
+    )
+    counts = {status.value: n for status, n in counts_result.all()}
+    overdue_result = await db.execute(
+        select(func.count(ApiKey.id)).where(
+            ApiKey.is_service.is_(False),
+            ApiKey.status == ApiKeyStatus.ACTIVE,
+            ApiKey.expires_at.isnot(None),
+            ApiKey.expires_at < now,
+        )
+    )
+    return {
+        "km_interval_seconds": interval,
+        "km_prune_grace_days": grace,
+        "km_interval_min": BackendRegistry.API_KEY_MAINT_MIN_INTERVAL,
+        "km_interval_max": BackendRegistry.API_KEY_MAINT_MAX_INTERVAL,
+        "km_count_active": counts.get("active", 0),
+        "km_count_expired": counts.get("expired", 0),
+        "km_count_revoked": counts.get("revoked", 0),
+        "km_overdue_unswept": overdue_result.scalar() or 0,
+    }
+
+
+@dashboard_router.post("/admin/api-keys/maintenance")
+async def admin_api_key_maintenance(
+    request: Request,
+    db: AsyncSession = Depends(get_async_db),
+):
+    """Save API key maintenance settings, or run a maintenance pass now."""
+    user_id = get_session_user_id(request)
+    if not user_id:
+        return RedirectResponse(url="/login", status_code=302)
+    user = await crud.get_user_by_id(db, user_id)
+    if not user or (not user.group or not user.group.is_admin):
+        return RedirectResponse(url="/dashboard", status_code=302)
+
+    from backend.app.core.telemetry.registry import BackendRegistry, get_registry
+
+    form = await request.form()
+    action = form.get("action")
+
+    if action == "run_now":
+        try:
+            summary = await get_registry().run_api_key_maintenance()
+        except Exception:
+            logger.exception("api_key_maintenance_run_now_failed")
+            return RedirectResponse(url="/admin/api-keys?error=Maintenance+run+failed", status_code=302)
+        msg = (
+            f"Maintenance ran: {summary['marked_expired']} marked expired, "
+            f"{summary['deleted_unreferenced']} unreferenced keys pruned"
+        )
+        return RedirectResponse(url=f"/admin/api-keys?success={quote_plus(msg)}", status_code=302)
+
+    try:
+        interval = int(form.get("interval_seconds", BackendRegistry.API_KEY_MAINT_DEFAULT_INTERVAL))
+    except (TypeError, ValueError):
+        return RedirectResponse(url="/admin/api-keys?error=Interval+must+be+a+whole+number", status_code=302)
+    if not (BackendRegistry.API_KEY_MAINT_MIN_INTERVAL <= interval <= BackendRegistry.API_KEY_MAINT_MAX_INTERVAL):
+        return RedirectResponse(
+            url=f"/admin/api-keys?error=Interval+must+be+{BackendRegistry.API_KEY_MAINT_MIN_INTERVAL}"
+                f"-{BackendRegistry.API_KEY_MAINT_MAX_INTERVAL}+seconds",
+            status_code=302,
+        )
+    try:
+        grace = int(form.get("prune_grace_days", BackendRegistry.API_KEY_MAINT_DEFAULT_GRACE_DAYS))
+    except (TypeError, ValueError):
+        return RedirectResponse(url="/admin/api-keys?error=Grace+must+be+a+whole+number", status_code=302)
+    if grace < 0 or grace > 3650:
+        return RedirectResponse(url="/admin/api-keys?error=Grace+must+be+0+(never+delete)+to+3650+days", status_code=302)
+
+    await crud.set_config(db, "apikey.maintenance.interval_seconds", interval)
+    await crud.set_config(db, "apikey.maintenance.prune_grace_days", grace)
+    await crud.log_admin_action(
+        db, user_id=user_id, action="apikey.maintenance_config",
+        entity_type="config",
+        after_value={"interval_seconds": interval, "prune_grace_days": grace},
+        ip_address=get_client_ip(request),
+    )
+    await db.commit()
+    return RedirectResponse(url="/admin/api-keys?success=Maintenance+settings+saved", status_code=302)
 
 
 # ---------------------------------------------------------------------------
