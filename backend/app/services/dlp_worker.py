@@ -409,6 +409,11 @@ async def _load_dlp_config(db) -> dict:
     config["llm.model"] = await crud.get_config_json(db, "dlp.llm.model", "")
     config["llm.system_prompt"] = await crud.get_config_json(db, "dlp.llm.system_prompt", "")
     config["severity_rules"] = await crud.get_config_json(db, "dlp.severity_rules", {})
+    # True once the admin page has saved the rule list: dlp.regex.patterns then
+    # holds the built-ins too (possibly edited/removed) and is authoritative.
+    config["regex.builtins_in_list"] = await crud.get_config_json(
+        db, "dlp.regex.builtins_in_list", False
+    )
 
     # Alert de-duplication (admin -> DLP panel toggle).
     config["dedup.enabled"] = await crud.get_config_json(db, "dlp.dedup.enabled", True)

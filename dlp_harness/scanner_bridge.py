@@ -143,6 +143,7 @@ def scan_documents(
     regex_patterns: Optional[List[Dict[str, str]]] = None,
     regex_keywords: Optional[List[str]] = None,
     apply_global_cap: bool = True,
+    include_builtins: bool = True,
 ) -> Dict[str, Dict[str, Any]]:
     """Scan a batch of documents with the production scanner code.
 
@@ -176,7 +177,9 @@ def scan_documents(
     if "regex" in selected:
         for doc_id, t in texts.items():
             t0 = time.perf_counter()
-            found = mod.scan_regex(t, regex_patterns, regex_keywords)
+            # include_builtins=False mirrors a prod config whose saved rule
+            # list already contains the built-ins (dlp.regex.builtins_in_list).
+            found = mod.scan_regex(t, regex_patterns, regex_keywords, include_builtins)
             results[doc_id]["latency_ms"]["regex"] = (time.perf_counter() - t0) * 1000.0
             results[doc_id]["findings"].extend(_finding_to_dict(f) for f in found)
 

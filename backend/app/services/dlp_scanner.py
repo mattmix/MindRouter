@@ -137,18 +137,48 @@ _BUILTIN_PATTERNS = [
 # Regex / keyword scanner
 # ---------------------------------------------------------------------------
 
+def builtin_patterns() -> List[Dict[str, str]]:
+    """Copies of the built-in pattern definitions (name/pattern/category/validator).
+
+    The admin page materialises these into the editable rule list so every
+    active pattern is visible in one place; a deep-ish copy keeps callers from
+    mutating the module constant.
+    """
+    return [dict(p) for p in _BUILTIN_PATTERNS]
+
+
+def builtin_validator_for(name: str) -> Optional[str]:
+    """Validator name a built-in pattern carries (e.g. "luhn" for Credit Card).
+
+    Used when the admin saves the rule list: a line that keeps a built-in's
+    name keeps its post-match validator, so editing the card regex does not
+    silently drop the Luhn check that removes ~90% of its false positives.
+    """
+    key = (name or "").strip().lower()
+    for p in _BUILTIN_PATTERNS:
+        if p["name"].lower() == key and p.get("validator"):
+            return p["validator"]
+    return None
+
+
 def scan_regex(
     text: str,
     custom_patterns: Optional[List[Dict[str, str]]] = None,
     keywords: Optional[List[str]] = None,
+    include_builtins: bool = True,
 ) -> List[ScanFinding]:
     """Scan text with regex patterns and keyword matching.
+
+    ``include_builtins=True`` (legacy) prepends the built-in patterns to
+    ``custom_patterns``.  Once the admin has saved the rule list from the
+    dashboard the stored list is authoritative — it already contains the
+    built-ins (possibly edited or removed) — and the caller passes ``False``.
 
     Returns a list of ScanFinding objects for each match.
     """
     findings: List[ScanFinding] = []
 
-    all_patterns = list(_BUILTIN_PATTERNS)
+    all_patterns = list(_BUILTIN_PATTERNS) if include_builtins else []
     if custom_patterns:
         # Admin-supplied patterns are validated at save time, but a row written
         # before that validation existed (or by a direct DB edit) can still be
@@ -157,7 +187,7 @@ def scan_regex(
         all_patterns.extend(p for p in custom_patterns if isinstance(p, dict) and p.get("pattern"))
 
     for pat in all_patterns:
-        validate = _VALIDATORS.get(pat.get("validator", ""))
+        validate = _VALIDATORS.get(pat.get("validator") or "")
         try:
             compiled = re.compile(pat["pattern"], re.IGNORECASE)
             pos = 0
@@ -655,6 +685,28 @@ def mask_snippet(text: str, keep: int = 2) -> str:
 
 _SEVERITY_ORDER = {"minor": 0, "moderate": 1, "major": 2}
 
+# A category mapped to this level is dropped from every scan result: no alert
+# row, no email, no inline block/redact, no audit trail.  It is a rule level,
+# never an alert severity — an alert is only ever minor/moderate/major.
+IGNORE_SEVERITY = "ignore"
+
+
+def is_ignored_category(category: str, severity_rules: Optional[Dict[str, str]]) -> bool:
+    """True when the admin's severity rules map ``category`` to Ignore."""
+    if not severity_rules:
+        return False
+    return severity_rules.get(category) == IGNORE_SEVERITY
+
+
+def drop_ignored_findings(
+    findings: List[ScanFinding],
+    severity_rules: Optional[Dict[str, str]],
+) -> List[ScanFinding]:
+    """Remove findings whose category is mapped to Ignore."""
+    if not severity_rules or not findings:
+        return list(findings)
+    return [f for f in findings if not is_ignored_category(f.category, severity_rules)]
+
 
 def classify_severity(
     findings: List[ScanFinding],
@@ -664,6 +716,8 @@ def classify_severity(
 
     Uses severity_rules mapping (category → severity). The highest severity
     among all findings wins. Unknown categories default to "moderate".
+    Categories mapped to Ignore contribute nothing (callers normally drop
+    them first via drop_ignored_findings; this is the belt to that brace).
     """
     if not findings:
         return "minor"
@@ -674,6 +728,8 @@ def classify_severity(
     highest = "minor"
     for f in findings:
         cat_severity = severity_rules.get(f.category, "moderate")
+        if cat_severity == IGNORE_SEVERITY:
+            continue
         if _SEVERITY_ORDER.get(cat_severity, 1) > _SEVERITY_ORDER.get(highest, 0):
             highest = cat_severity
 
@@ -768,6 +824,7 @@ async def run_dlp_scan(
             text,
             config.get("regex.patterns"),
             config.get("regex.keywords"),
+            not config.get("regex.builtins_in_list", False),
         )
         all_findings.extend(regex_findings)
         if regex_findings:
@@ -777,8 +834,20 @@ async def run_dlp_scan(
     # A scanner that raises DlpScannerError is recorded and the OTHER scanners
     # still run: one broken scanner must not blind the others, and it must not
     # be silently swallowed (the fail-open the audit flagged).
-    if config.get("gliner.enabled", False):
-        gliner_categories = config.get("gliner.categories")
+    severity_rules = config.get("severity_rules") or {}
+    gliner_categories = config.get("gliner.categories")
+    # Don't spend GPU/CPU extracting entities the admin has told us to ignore;
+    # the findings would be dropped below anyway.  An explicit empty list (every
+    # configured category ignored) skips GLiNER outright rather than being
+    # passed through — `[]` is not `None`, so it would not fall back to the
+    # service defaults, but it is clearer not to call at all.
+    gliner_all_ignored = False
+    if gliner_categories and severity_rules:
+        gliner_categories = [
+            c for c in gliner_categories if not is_ignored_category(c, severity_rules)
+        ]
+        gliner_all_ignored = not gliner_categories
+    if config.get("gliner.enabled", False) and not gliner_all_ignored:
         gliner_threshold = config.get("gliner.threshold", 0.5)
         gliner_max_chars = config.get("gliner.max_scan_chars")
         try:
@@ -856,13 +925,30 @@ async def run_dlp_scan(
 
     elapsed_ms = int((time.monotonic() - t0) * 1000)
 
+    # Ignored categories vanish here, before anything downstream can see them:
+    # no alert, no email, no inline action.  A scan whose only findings were
+    # ignored is indistinguishable from a clean one.
+    if severity_rules and all_findings:
+        kept = drop_ignored_findings(all_findings, severity_rules)
+        if len(kept) != len(all_findings):
+            logger.debug(
+                "dlp_findings_ignored",
+                dropped=len(all_findings) - len(kept),
+                categories=sorted({f.category for f in all_findings if f not in kept}),
+            )
+            all_findings = kept
+            scanners_used = [
+                s for s in ("regex", "gliner", "llm")
+                if any(f.scanner == s for f in all_findings)
+            ]
+
     # Genuinely clean only when a scan ran AND found nothing AND nothing errored.
     if not all_findings and not scanner_errors:
         return None
 
     severity = classify_severity(
         all_findings,
-        severity_rules=config.get("severity_rules"),
+        severity_rules=severity_rules,
     )
 
     # Build detail summary

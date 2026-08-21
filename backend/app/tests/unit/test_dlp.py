@@ -176,6 +176,129 @@ class TestSeverityClassification:
 # Text Extraction Tests
 # ===================================================================
 
+class TestIgnoreSeverity:
+    """A category mapped to "ignore" vanishes: it never raises the alert
+    level, and run_dlp_scan drops the findings before anything downstream
+    (worker, email, inline block/redact) can see them."""
+
+    def test_ignored_category_does_not_raise_severity(self):
+        findings = [
+            ScanFinding("regex", "email", "a@b.com", 1.0, 0, 7),
+            ScanFinding("regex", "social security number", "123-45-6789", 1.0, 0, 11),
+        ]
+        rules = {"social security number": "ignore", "email": "minor"}
+        assert classify_severity(findings, rules) == "minor"
+
+    def test_ignore_is_not_treated_as_unknown_moderate(self):
+        # _SEVERITY_ORDER lacks "ignore"; the old .get(x, 1) default would have
+        # silently promoted an ignored category to moderate.
+        findings = [ScanFinding("regex", "email", "a@b.com", 1.0, 0, 7)]
+        assert classify_severity(findings, {"email": "ignore"}) == "minor"
+
+    def test_drop_ignored_findings(self):
+        findings = [
+            ScanFinding("regex", "email", "a@b.com", 1.0, 0, 7),
+            ScanFinding("gliner", "person", "Bob", 0.9, 0, 3),
+        ]
+        kept = _scanner_mod.drop_ignored_findings(findings, {"person": "ignore"})
+        assert [f.category for f in kept] == ["email"]
+        # no rules -> untouched copy
+        assert _scanner_mod.drop_ignored_findings(findings, {}) == findings
+
+    @pytest.mark.asyncio
+    async def test_run_dlp_scan_treats_all_ignored_as_clean(self):
+        result = await _scanner_mod.run_dlp_scan(
+            "mail me at a@b.com",
+            {"regex.enabled": True, "gliner.enabled": False, "llm.enabled": False,
+             "severity_rules": {"email": "ignore"}},
+        )
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_run_dlp_scan_keeps_non_ignored_findings(self):
+        result = await _scanner_mod.run_dlp_scan(
+            "a@b.com and 123-45-6789",
+            {"regex.enabled": True, "gliner.enabled": False, "llm.enabled": False,
+             "severity_rules": {"email": "ignore", "social security number": "major"}},
+        )
+        assert result is not None
+        assert {f.category for f in result.findings} == {"social security number"}
+        assert result.severity == "major"
+        assert "email" not in result.detail
+
+    @pytest.mark.asyncio
+    async def test_gliner_not_asked_for_ignored_categories(self, monkeypatch):
+        seen = {}
+
+        async def fake_gliner(text, categories=None, threshold=0.5, max_chars=None):
+            seen["categories"] = categories
+            return []
+
+        monkeypatch.setattr(_scanner_mod, "scan_gliner", fake_gliner)
+        await _scanner_mod.run_dlp_scan(
+            "hello",
+            {"regex.enabled": False, "gliner.enabled": True, "llm.enabled": False,
+             "gliner.categories": ["person", "social security number"],
+             "severity_rules": {"person": "ignore"}},
+        )
+        assert seen["categories"] == ["social security number"]
+
+    @pytest.mark.asyncio
+    async def test_gliner_skipped_when_every_category_ignored(self, monkeypatch):
+        called = []
+
+        async def fake_gliner(*a, **k):
+            called.append(1)
+            return []
+
+        monkeypatch.setattr(_scanner_mod, "scan_gliner", fake_gliner)
+        result = await _scanner_mod.run_dlp_scan(
+            "hello",
+            {"regex.enabled": False, "gliner.enabled": True, "llm.enabled": False,
+             "gliner.categories": ["person"], "severity_rules": {"person": "ignore"}},
+        )
+        assert called == [] and result is None
+
+
+class TestAuthoritativePatternList:
+    """Once the admin saves the rule list, the stored patterns ARE the
+    scanner's set — built-ins are no longer implicitly prepended."""
+
+    def test_builtins_prepended_by_default(self):
+        assert any(f.category == "social security number" for f in scan_regex("SSN 123-45-6789"))
+
+    def test_include_builtins_false_runs_only_the_given_list(self):
+        findings = scan_regex("SSN 123-45-6789 id V00123456", custom_patterns=[
+            {"name": "Vandal ID", "pattern": r"\bV\d{8}\b", "category": "student id"},
+        ], include_builtins=False)
+        assert [f.category for f in findings] == ["student id"]
+
+    @pytest.mark.asyncio
+    async def test_run_dlp_scan_honours_builtins_in_list_flag(self):
+        cfg = {"regex.enabled": True, "gliner.enabled": False, "llm.enabled": False,
+               "regex.patterns": [], "regex.builtins_in_list": True}
+        assert await _scanner_mod.run_dlp_scan("SSN 123-45-6789", cfg) is None
+        cfg["regex.builtins_in_list"] = False
+        assert await _scanner_mod.run_dlp_scan("SSN 123-45-6789", cfg) is not None
+
+    def test_stored_validator_key_is_applied(self):
+        card = {"name": "Credit Card", "pattern": r"\b(?:\d[ -]*?){13,19}\b",
+                "category": "credit card number", "validator": "luhn"}
+        ok = scan_regex("4111 1111 1111 1111", custom_patterns=[card], include_builtins=False)
+        bad = scan_regex("4111 1111 1111 1112", custom_patterns=[card], include_builtins=False)
+        assert len(ok) == 1 and bad == []
+
+    def test_builtin_helpers(self):
+        names = [p["name"] for p in _scanner_mod.builtin_patterns()]
+        assert names == ["SSN", "Credit Card", "Email Address", "Phone (US)", "Date of Birth"]
+        assert _scanner_mod.builtin_validator_for("credit card") == "luhn"
+        assert _scanner_mod.builtin_validator_for("SSN") is None
+        assert _scanner_mod.builtin_validator_for("Vandal ID") is None
+        # copies — mutating the result must not touch the module constant
+        _scanner_mod.builtin_patterns()[0]["pattern"] = "x"
+        assert _scanner_mod.builtin_patterns()[0]["pattern"] != "x"
+
+
 class TestTextExtraction:
     """Tests for extracting scannable text from request/response data."""
 

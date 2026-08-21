@@ -95,7 +95,6 @@
                    run, the server must LEAVE the stored rules and patterns alone rather
                    than overwrite them with the empty defaults. #}
                 <input type="hidden" name="severity_rules" id="severity_rules_json" value="{}">
-                <input type="hidden" name="regex_patterns" id="regex_patterns_json" value="[]">
                 <input type="hidden" name="_json_ready" id="dlpJsonReady" value="0">
 
                 <!-- Master Toggle -->
@@ -162,47 +161,14 @@
                                 </button>
                             </div>
                             <div class="card-body">
-                                <p class="text-muted small">Built-in patterns detect SSNs, credit cards, emails, phone numbers. Add custom patterns and keywords below.</p>
-
-                                <!-- Custom Patterns Builder -->
-                                <label class="form-label fw-bold">Custom Patterns</label>
-                                <div id="patternsContainer">
-                                    {% for pat in config.regex_patterns %}
-                                    <div class="pattern-row border rounded p-2 mb-2 bg-light">
-                                        <div class="row g-2 align-items-center">
-                                            <div class="col-md-3">
-                                                <input type="text" class="form-control form-control-sm pat-name" placeholder="Name" value="{{ pat.name }}">
-                                            </div>
-                                            <div class="col-md-4">
-                                                <input type="text" class="form-control form-control-sm font-monospace pat-pattern" placeholder="Regex pattern" value="{{ pat.pattern }}">
-                                            </div>
-                                            <div class="col-md-2">
-                                                <input type="text" class="form-control form-control-sm pat-category" placeholder="Category" value="{{ pat.category }}">
-                                            </div>
-                                            <div class="col-md-2">
-                                                <select class="form-select form-select-sm pat-severity">
-                                                    <option value="minor" {% if pat.severity == 'minor' %}selected{% endif %}>Minor</option>
-                                                    <option value="moderate" {% if pat.severity == 'moderate' %}selected{% endif %}>Moderate</option>
-                                                    <option value="major" {% if pat.severity == 'major' %}selected{% endif %}>Major</option>
-                                                </select>
-                                            </div>
-                                            <div class="col-md-1">
-                                                <button type="button" class="btn btn-sm btn-outline-danger" onclick="this.closest('.pattern-row').remove()" title="Remove"><i class="bi bi-x-lg"></i></button>
-                                            </div>
-                                        </div>
-                                    </div>
-                                    {% endfor %}
+                                <p class="text-muted small">Every pattern the scanner runs, built-ins included, in one editable list &mdash; one rule per line. A pattern line is <code>Name | category | regex</code> (the regex is the last field and may itself contain <code>|</code>); a line with no <code>|</code> is a <strong>keyword</strong> matched literally, case-insensitively. Edit or delete any line, including the built-ins; what you save is exactly what runs.</p>
+                                <div class="d-flex justify-content-between align-items-center mb-1">
+                                    <label class="form-label fw-bold mb-0" for="regex_rules">Patterns &amp; Keywords <small class="text-muted fw-normal">(one per line)</small></label>
+                                    <button type="button" class="btn btn-sm btn-outline-secondary" onclick="restoreBuiltinRules()" title="Re-add any built-in pattern that is missing from the list"><i class="bi bi-arrow-counterclockwise"></i> Restore built-ins</button>
                                 </div>
-                                <button type="button" class="btn btn-sm btn-outline-primary mb-3" onclick="addPatternRow()">
-                                    <i class="bi bi-plus-lg"></i> Add Pattern
-                                </button>
-
-                                <!-- Keywords -->
-                                <div class="mb-0">
-                                    <label class="form-label fw-bold" for="regex_keywords">Keywords <small class="text-muted">(one per line)</small></label>
-                                    <textarea class="form-control" id="regex_keywords" name="regex_keywords" rows="3"
-                                              placeholder="confidential&#10;classified&#10;top secret">{% for kw in config.regex_keywords %}{{ kw }}{% if not loop.last %}&#10;{% endif %}{% endfor %}</textarea>
-                                </div>
+                                <textarea class="form-control font-monospace small" id="regex_rules" name="regex_rules" rows="8" wrap="off" spellcheck="false" autocomplete="off"
+                                          placeholder="SSN | social security number | \b\d{3}-\d{2}-\d{4}\b&#10;Vandal ID | student id | \bV\d{8}\b&#10;confidential">{{ config.regex_rules_text }}</textarea>
+                                <div class="form-text">Category names feed the Severity Rules below (lowercase, e.g. <code>social security number</code>). A pattern that keeps the built-in name <em>Credit Card</em> keeps its Luhn check.</div>
                             </div>
                         </div>
 
@@ -358,7 +324,7 @@
                                 </button>
                             </div>
                             <div class="card-body">
-                                <p class="text-muted small">Map each entity category to a severity level. When a finding matches a category, the mapped severity is used. The highest severity among all findings determines the alert level.</p>
+                                <p class="text-muted small">Map each entity category to a severity level. When a finding matches a category, the mapped severity is used. The highest severity among all findings determines the alert level. <strong>Ignore</strong> drops the category entirely &mdash; findings in it are not logged, not alerted, and never block or redact.</p>
                                 <div id="severityRulesContainer">
                                     {% for cat, sev in config.severity_rules.items() %}
                                     <div class="severity-rule-row d-flex align-items-center gap-2 mb-2">
@@ -373,6 +339,9 @@
                                             <option value="major" {% if sev == 'major' %}selected{% endif %}>
                                                 Major
                                             </option>
+                                            <option value="ignore" {% if sev == 'ignore' %}selected{% endif %}>
+                                                Ignore
+                                            </option>
                                         </select>
                                         <button type="button" class="btn btn-sm btn-outline-danger" onclick="this.closest('.severity-rule-row').remove()" title="Remove"><i class="bi bi-x-lg"></i></button>
                                     </div>
@@ -384,6 +353,7 @@
                                         <option value="minor">Minor</option>
                                         <option value="moderate" selected>Moderate</option>
                                         <option value="major">Major</option>
+                                        <option value="ignore">Ignore</option>
                                     </select>
                                     <button type="button" class="btn btn-outline-primary" onclick="addSeverityRule()"><i class="bi bi-plus-lg"></i> Add</button>
                                 </div>
@@ -639,42 +609,44 @@
             </div>
             <div class="modal-body">
                 <h6>How it works</h6>
-                <p>The regex scanner is the fastest tier (~0.1ms). It runs a set of <strong>built-in patterns</strong> plus any custom patterns you define against the full text of every request and response.</p>
+                <p>The regex scanner is the fastest tier (~0.1ms). It runs every rule in the <strong>Patterns &amp; Keywords</strong> list against the full text of each request and response. The list ships pre-filled with the built-in patterns; they are ordinary lines you can edit or delete, and <strong>Restore built-ins</strong> re-adds any that are missing.</p>
 
-                <h6>Built-in patterns (always active)</h6>
+                <h6>Line format</h6>
                 <table class="table table-sm table-bordered">
-                    <thead class="table-light"><tr><th>Name</th><th>Detects</th><th>Example Match</th></tr></thead>
+                    <thead class="table-light"><tr><th>Line</th><th>Meaning</th></tr></thead>
                     <tbody>
-                        <tr><td>SSN</td><td>Social Security Numbers</td><td><code>123-45-6789</code></td></tr>
-                        <tr><td>Credit Card</td><td>13-19 digit card numbers</td><td><code>4111 1111 1111 1111</code></td></tr>
-                        <tr><td>Email</td><td>Email addresses</td><td><code>user@example.com</code></td></tr>
-                        <tr><td>Phone (US)</td><td>US phone numbers</td><td><code>(208) 885-6111</code></td></tr>
-                        <tr><td>Date of Birth</td><td>DOB mentions with dates</td><td><code>DOB: 01/15/1990</code></td></tr>
+                        <tr><td><code>Name | category | regex</code></td><td>A <strong>pattern</strong>. Name is a label for you; category is the entity category used by the Severity Rules (lowercase, spaces allowed); regex is a Python-compatible regular expression, matched case-insensitively. The regex is the <em>last</em> field, so it may contain <code>|</code> alternation.</td></tr>
+                        <tr><td><code>confidential</code></td><td>A <strong>keyword</strong> &mdash; any line with no <code>|</code>. Matched literally and case-insensitively; findings use the category <code>keyword</code>.</td></tr>
+                        <tr><td><code># note</code></td><td>A comment; ignored.</td></tr>
                     </tbody>
                 </table>
 
-                <h6>Adding custom patterns</h6>
-                <p>Click <strong>Add Pattern</strong> and fill in:</p>
-                <ul>
-                    <li><strong>Name</strong> &mdash; A human-readable label (e.g. "Vandal ID")</li>
-                    <li><strong>Regex</strong> &mdash; A Python-compatible regular expression. Use <code>\b</code> for word boundaries. The match is case-insensitive.</li>
-                    <li><strong>Category</strong> &mdash; The entity category name (used in severity rules). Use lowercase with spaces (e.g. "vandal id").</li>
-                    <li><strong>Severity</strong> &mdash; Default severity if no severity rule is defined for this category.</li>
-                </ul>
+                <h6>Built-in patterns</h6>
+                <table class="table table-sm table-bordered">
+                    <thead class="table-light"><tr><th>Name</th><th>Category</th><th>Example Match</th></tr></thead>
+                    <tbody>
+                        <tr><td>SSN</td><td>social security number</td><td><code>123-45-6789</code></td></tr>
+                        <tr><td>Credit Card</td><td>credit card number</td><td><code>4111 1111 1111 1111</code> (Luhn-validated while the line keeps the name <em>Credit Card</em>)</td></tr>
+                        <tr><td>Email Address</td><td>email</td><td><code>user@example.com</code></td></tr>
+                        <tr><td>Phone (US)</td><td>phone number</td><td><code>(208) 885-6111</code></td></tr>
+                        <tr><td>Date of Birth</td><td>date of birth</td><td><code>DOB: 01/15/1990</code></td></tr>
+                    </tbody>
+                </table>
 
                 <h6>Examples of custom patterns</h6>
                 <table class="table table-sm table-bordered">
-                    <thead class="table-light"><tr><th>Name</th><th>Regex</th><th>Category</th><th>What it catches</th></tr></thead>
+                    <thead class="table-light"><tr><th>Line</th><th>What it catches</th></tr></thead>
                     <tbody>
-                        <tr><td>Vandal ID</td><td><code>\bV\d{8}\b</code></td><td>vandal id</td><td>V00123456</td></tr>
-                        <tr><td>AWS Key</td><td><code>\bAKIA[0-9A-Z]{16}\b</code></td><td>aws access key</td><td>AKIAIOSFODNN7EXAMPLE</td></tr>
-                        <tr><td>IP Address</td><td><code>\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b</code></td><td>ip address</td><td>192.168.1.1</td></tr>
-                        <tr><td>IBAN</td><td><code>\b[A-Z]{2}\d{2}[A-Z0-9]{4}\d{7}([A-Z0-9]?){0,16}\b</code></td><td>iban</td><td>DE89370400440532013000</td></tr>
+                        <tr><td><code>Vandal ID | vandal id | \bV\d{8}\b</code></td><td>V00123456</td></tr>
+                        <tr><td><code>AWS Key | aws access key | \bAKIA[0-9A-Z]{16}\b</code></td><td>AKIAIOSFODNN7EXAMPLE</td></tr>
+                        <tr><td><code>IP Address | ip address | \b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b</code></td><td>192.168.1.1</td></tr>
+                        <tr><td><code>IBAN | iban | \b[A-Z]{2}\d{2}[A-Z0-9]{4}\d{7}([A-Z0-9]?){0,16}\b</code></td><td>DE89370400440532013000</td></tr>
+                        <tr><td><code>FERPA</code></td><td>the keyword "FERPA" anywhere in the text</td></tr>
                     </tbody>
                 </table>
 
-                <h6>Keywords</h6>
-                <p>Keywords are simple case-insensitive text matches. Enter one keyword per line. Good for catching phrases like "confidential", "classified", "FERPA", "HIPAA", or project-specific terms.</p>
+                <h6>Saving</h6>
+                <p>Every line is validated when you save: a regex that does not compile, a pattern line with a missing field, or a one-character keyword is rejected with the line number and nothing is written.</p>
             </div>
         </div>
     </div>
@@ -764,12 +736,13 @@
                         <tr><td><span class="badge bg-danger">Major</span></td><td>Immediate attention required. High-risk data exposure.</td><td>SSN, credit card, bank account, passport, medical record</td></tr>
                         <tr><td><span class="badge bg-warning text-dark">Moderate</span></td><td>Review recommended. Potential compliance issue.</td><td>Driver license, date of birth, student ID, vandal ID</td></tr>
                         <tr><td><span class="badge bg-info">Minor</span></td><td>Informational. Low-risk but worth logging.</td><td>Person name, email address, phone number</td></tr>
+                        <tr><td><span class="badge bg-secondary">Ignore</span></td><td>Dropped entirely. Findings in this category are discarded before anything downstream sees them: no alert row, no email, no block or redact, and no trace in the DLP log. GLiNER is not even asked for an ignored category.</td><td>A category that only produces noise in your traffic</td></tr>
                     </tbody>
                 </table>
 
                 <h6>Adding rules</h6>
                 <p>Type the category name (must match exactly what the scanner reports) and select a severity level. Categories from the GLiNER scanner match the checkbox labels in lowercase (e.g. "person", "social security number"). Custom regex pattern categories match the category field you defined.</p>
-                <p>If a detected category has no rule, it defaults to <strong>Moderate</strong>.</p>
+                <p>If a detected category has no rule, it defaults to <strong>Moderate</strong>. A scan whose only findings are in ignored categories is treated as clean.</p>
             </div>
         </div>
     </div>
@@ -805,34 +778,25 @@ async function ackAlert(alertId) {
     }
 }
 
-// --- Custom Pattern Builder ---
-function addPatternRow(name, pattern, category, severity) {
-    const container = document.getElementById('patternsContainer');
-    const div = document.createElement('div');
-    div.className = 'pattern-row border rounded p-2 mb-2 bg-light';
-    div.innerHTML = `
-        <div class="row g-2 align-items-center">
-            <div class="col-md-3">
-                <input type="text" class="form-control form-control-sm pat-name" placeholder="Name" value="${name || ''}">
-            </div>
-            <div class="col-md-4">
-                <input type="text" class="form-control form-control-sm font-monospace pat-pattern" placeholder="Regex (e.g. \\bV\\d{8}\\b)" value="${pattern || ''}">
-            </div>
-            <div class="col-md-2">
-                <input type="text" class="form-control form-control-sm pat-category" placeholder="Category" value="${category || ''}">
-            </div>
-            <div class="col-md-2">
-                <select class="form-select form-select-sm pat-severity">
-                    <option value="minor" ${severity === 'minor' ? 'selected' : ''}>Minor</option>
-                    <option value="moderate" ${(!severity || severity === 'moderate') ? 'selected' : ''}>Moderate</option>
-                    <option value="major" ${severity === 'major' ? 'selected' : ''}>Major</option>
-                </select>
-            </div>
-            <div class="col-md-1">
-                <button type="button" class="btn btn-sm btn-outline-danger" onclick="this.closest('.pattern-row').remove()" title="Remove"><i class="bi bi-x-lg"></i></button>
-            </div>
-        </div>`;
-    container.appendChild(div);
+// --- Regex rule list ---
+// Built-in pattern lines, rendered server-side from the scanner's definitions
+// so this page can never drift from what the code ships.
+const BUILTIN_RULE_LINES = {{ config.builtin_rule_lines | tojson }};
+
+function restoreBuiltinRules() {
+    const ta = document.getElementById('regex_rules');
+    if (!ta) return;
+    const present = new Set(
+        ta.value.split('\n').map(l => l.trim()).filter(Boolean)
+            .map(l => l.split('|', 1)[0].trim().toLowerCase())
+    );
+    const missing = BUILTIN_RULE_LINES.filter(
+        line => !present.has(line.split('|', 1)[0].trim().toLowerCase())
+    );
+    if (!missing.length) return;
+    const body = ta.value.replace(/\s+$/, '');
+    ta.value = (body ? body + '\n' : '') + missing.join('\n') + '\n';
+    ta.scrollTop = ta.scrollHeight;
 }
 
 // --- Severity Rules Builder ---
@@ -860,6 +824,7 @@ function addSeverityRule() {
             <option value="minor" ${levSelect.value === 'minor' ? 'selected' : ''}>Minor</option>
             <option value="moderate" ${levSelect.value === 'moderate' ? 'selected' : ''}>Moderate</option>
             <option value="major" ${levSelect.value === 'major' ? 'selected' : ''}>Major</option>
+            <option value="ignore" ${levSelect.value === 'ignore' ? 'selected' : ''}>Ignore</option>
         </select>
         <button type="button" class="btn btn-sm btn-outline-danger" onclick="this.closest('.severity-rule-row').remove()" title="Remove"><i class="bi bi-x-lg"></i></button>`;
     container.appendChild(div);
@@ -908,21 +873,9 @@ document.getElementById('dlpForm')?.addEventListener('submit', function() {
     });
     document.getElementById('severity_rules_json').value = JSON.stringify(rules);
 
-    // Custom patterns
-    const patterns = [];
-    document.querySelectorAll('#patternsContainer .pattern-row').forEach(row => {
-        const name = row.querySelector('.pat-name')?.value?.trim();
-        const pattern = row.querySelector('.pat-pattern')?.value?.trim();
-        const category = row.querySelector('.pat-category')?.value?.trim();
-        const severity = row.querySelector('.pat-severity')?.value;
-        if (name && pattern) {
-            patterns.push({name, pattern, category: category || name.toLowerCase(), severity: severity || 'moderate'});
-        }
-    });
-    document.getElementById('regex_patterns_json').value = JSON.stringify(patterns);
 
-    // Tell the server these two fields are authoritative.  Without this the
-    // route preserves the stored values instead of writing the empty defaults.
+    // Tell the server the severity-rules field is authoritative.  Without this
+    // the route preserves the stored value instead of writing the empty default.
     document.getElementById('dlpJsonReady').value = '1';
 });
 </script>

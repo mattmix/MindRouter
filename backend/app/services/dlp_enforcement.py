@@ -184,13 +184,17 @@ async def _evaluate(db, text: Optional[str], side: str) -> Optional[InlineAction
         return None
 
     rules = config.get("severity_rules", {}) or {}
-    from backend.app.services.dlp_scanner import _SEVERITY_ORDER
+    from backend.app.services.dlp_scanner import _SEVERITY_ORDER, IGNORE_SEVERITY
 
     block_triggers: dict = {}  # severity -> set(category names)
     redactions: List[Tuple[str, str]] = []
     seen_values: Set[str] = set()
     for f in result.findings:
         sev = rules.get(f.category, "moderate")
+        if sev == IGNORE_SEVERITY:
+            # run_dlp_scan already drops these; never let an ignored category
+            # block or redact even if a stale result slips through.
+            continue
         if sev in gate["block_severities"]:
             block_triggers.setdefault(sev, set()).add(f.category)
         elif sev in gate["redact_severities"]:

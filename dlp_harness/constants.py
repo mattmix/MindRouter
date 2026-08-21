@@ -201,6 +201,7 @@ DLP_CONFIG_KEYS = [
     "dlp.regex.enabled",
     "dlp.regex.patterns",
     "dlp.regex.keywords",
+    "dlp.regex.builtins_in_list",
     "dlp.gliner.enabled",
     "dlp.gliner.threshold",
     "dlp.gliner.categories",

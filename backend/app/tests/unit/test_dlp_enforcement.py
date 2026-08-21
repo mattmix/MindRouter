@@ -69,6 +69,7 @@ def _fake_modules(config, scan_result=None, scan_raises=False):
 
     scanner = types.ModuleType("backend.app.services.dlp_scanner")
     scanner._SEVERITY_ORDER = {"minor": 0, "moderate": 1, "major": 2}
+    scanner.IGNORE_SEVERITY = "ignore"
 
     async def run_dlp_scan(text, cfg):
         if scan_raises:
@@ -201,6 +202,19 @@ class TestEvaluateInline:
         assert action.block.severity == "major"
         assert action.block.categories == ["social security number"]
         assert action.redactions == []
+
+    async def test_ignored_category_never_blocks_or_redacts(self):
+        """An Ignore rule must win even if a finding for that category reaches
+        the enforcement layer (run_dlp_scan normally drops it first)."""
+        _reset_gate()
+        cfg = {
+            "dlp.enabled": True, "dlp.block.scope": "prompt",
+            "dlp.action.major.block": True, "dlp.action.moderate.redact": True,
+            "__severity_rules__": {"social security number": "ignore"},
+        }
+        result = _ScanResult([_Finding("social security number", "123-45-6789")])
+        with patch.dict(sys.modules, _fake_modules(cfg, result)):
+            assert await enforce.evaluate_prompt_inline(None, "SSN 123-45-6789") is None
 
     async def test_redacts_when_severity_configured(self):
         _reset_gate()

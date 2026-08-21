@@ -33,6 +33,10 @@ logger = get_logger(__name__)
 dlp_router = APIRouter(tags=["dlp"])
 
 VALID_SEVERITIES = ("minor", "moderate", "major")
+# Rule levels an admin may assign to a category.  "ignore" is a rule level
+# only: findings in an ignored category are dropped before any alert exists,
+# so no alert row ever carries it and the alert filter keeps VALID_SEVERITIES.
+VALID_RULE_LEVELS = VALID_SEVERITIES + ("ignore",)
 VALID_SCANNERS = ("regex", "gliner", "llm")
 
 # Caps on admin-supplied config.  Every one of these bounds work the DLP worker
@@ -80,6 +84,101 @@ async def _require_admin(request: Request, db: AsyncSession):
         return None, RedirectResponse("/dashboard", status_code=302)
     return user, None
 
+
+
+# ---------------------------------------------------------------------------
+# Regex rule list (textarea) <-> stored config
+# ---------------------------------------------------------------------------
+
+RULE_SEP = " | "
+
+
+def _scanner():
+    """The scanner module, resolved at call time.
+
+    importlib (not ``from ... import``) so a test that spec-loads dlp_scanner
+    and registers it in sys.modules gets that instance; the dashboard package
+    import chain stays untouched at module load.
+    """
+    import importlib
+    return importlib.import_module("backend.app.services.dlp_scanner")
+
+
+def builtin_patterns():
+    return _scanner().builtin_patterns()
+
+
+def builtin_validator_for(name: str):
+    return _scanner().builtin_validator_for(name)
+
+
+def format_regex_rule(p: dict) -> str:
+    """One pattern dict -> one textarea line: ``Name | category | regex``."""
+    return f"{p.get('name', '')}{RULE_SEP}{p.get('category', '')}{RULE_SEP}{p.get('pattern', '')}"
+
+
+def render_regex_rules(patterns, keywords, *, builtins_in_list: bool) -> str:
+    """Build the textarea contents.
+
+    Until the admin saves from the new page the stored list holds only custom
+    patterns and the built-ins are implicit, so they are shown first; after
+    that the stored list is the whole truth.  Keywords follow as bare lines.
+    """
+    rows = []
+    if not builtins_in_list:
+        rows.extend(builtin_patterns())
+    rows.extend(p for p in (patterns or []) if isinstance(p, dict) and p.get("pattern"))
+    lines = [format_regex_rule(p) for p in rows]
+    lines.extend(str(k) for k in (keywords or []) if str(k).strip())
+    return "\n".join(lines)
+
+
+def parse_regex_rules(text: str):
+    """Textarea contents -> (patterns, keywords).  Raises ValueError with an
+    admin-readable message on the first bad line; nothing is written then."""
+    patterns, keywords = [], []
+    for lineno, raw in enumerate((text or "").replace("\r", "").split("\n"), start=1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "|" not in line:
+            # keyword — single characters match on nearly every request
+            if len(line) < 2:
+                raise ValueError(f"Line {lineno}: keyword '{line}' is too short — use at least 2 characters")
+            keywords.append(line[:200])
+            continue
+        parts = line.split("|", 2)
+        if len(parts) != 3:
+            raise ValueError(
+                f"Line {lineno}: a pattern line is 'Name | category | regex' "
+                f"(a keyword line must not contain '|')"
+            )
+        name = parts[0].strip()[:100]
+        category = parts[1].strip().lower()[:100]
+        pattern = parts[2].strip()
+        if not name or not pattern:
+            raise ValueError(f"Line {lineno}: a pattern line needs both a name and a regex")
+        if not category:
+            category = name.lower()
+        if len(pattern) > MAX_PATTERN_CHARS:
+            raise ValueError(f"Line {lineno}: pattern '{name}' is too long (max {MAX_PATTERN_CHARS} characters)")
+        try:
+            re.compile(pattern)
+        except (re.error, OverflowError, RecursionError, ValueError):
+            # re.compile raises OverflowError on an oversized repeat count
+            # (\d{9999999999}) and RecursionError on deep nesting — neither is
+            # an re.error, and either would escape as a bare 500.
+            raise ValueError(f"Line {lineno}: pattern '{name}' is not a valid regular expression")
+        entry = {"name": name, "pattern": pattern, "category": category}
+        validator = builtin_validator_for(name)
+        if validator:
+            entry["validator"] = validator
+        patterns.append(entry)
+    if len(patterns) > MAX_PATTERNS:
+        raise ValueError(f"Too many patterns (max {MAX_PATTERNS})")
+    if len(keywords) > MAX_KEYWORDS:
+        raise ValueError(f"Too many keywords (max {MAX_KEYWORDS})")
+    return patterns, keywords
 
 @dlp_router.get("/admin/dlp", response_class=HTMLResponse)
 async def admin_dlp_page(
@@ -134,6 +233,16 @@ async def admin_dlp_page(
         "llm_model": await crud.get_config_json(db, "dlp.llm.model", ""),
         "llm_system_prompt": await crud.get_config_json(db, "dlp.llm.system_prompt", ""),
         "severity_rules": await crud.get_config_json(db, "dlp.severity_rules", {}),
+        "regex_rules_text": render_regex_rules(
+            await crud.get_config_json(db, "dlp.regex.patterns", []),
+            await crud.get_config_json(db, "dlp.regex.keywords", []),
+            builtins_in_list=bool(
+                await crud.get_config_json(db, "dlp.regex.builtins_in_list", False)
+            ),
+        ),
+        "builtin_rule_lines": [
+            format_regex_rule(p) for p in builtin_patterns()
+        ],
         "email_minor": await crud.get_config_json(db, "dlp.email.minor_recipients", ""),
         "email_moderate": await crud.get_config_json(db, "dlp.email.moderate_recipients", ""),
         "email_major": await crud.get_config_json(db, "dlp.email.major_recipients", ""),
@@ -335,10 +444,11 @@ async def save_dlp_config(
     if llm_enabled and not llm_prompt:
         return _err("The LLM scanner needs a system prompt telling the model what to return")
 
-    # severity_rules and regex_patterns are serialized by page JavaScript from
-    # the rendered rows.  If that script did not run, the browser posts the
-    # empty defaults — writing those would silently wipe the admin's rules and
-    # patterns while reporting success, so treat them as absent instead.
+    # severity_rules is serialized by page JavaScript from the rendered rows.
+    # If that script did not run, the browser posts the empty default —
+    # writing it would silently wipe the admin's rules while reporting
+    # success, so treat it as absent instead.  (The regex rule list is a plain
+    # textarea and needs no script.)
     json_fields_authoritative = form.get("_json_ready") == "1"
 
     # Severity rules — must be a flat {category: level} map
@@ -354,57 +464,20 @@ async def save_dlp_config(
     for cat, level in severity_rules.items():
         if not isinstance(cat, str) or not isinstance(level, str):
             return _err("Severity rules must map category names to level names")
-        if level not in VALID_SEVERITIES:
-            return _err(f"Unknown severity level '{level[:20]}' — use minor, moderate, or major")
+        if level not in VALID_RULE_LEVELS:
+            return _err(f"Unknown severity level '{level[:20]}' — use minor, moderate, major, or ignore")
         clean_rules[cat.strip().lower()[:100]] = level
 
-    # Custom regex patterns — compile every one now, so a broken pattern is
-    # rejected here instead of silently never matching at scan time.
+    # Regex rule list — ONE textarea, one rule per line, built-ins included:
+    #   Name | category | regex     -> pattern (regex is the LAST field, so it
+    #                                  may itself contain "|")
+    #   bare text (no " | ")        -> keyword (literal, case-insensitive)
+    # The saved list is authoritative: whatever the admin left in the box is
+    # exactly what the scanner runs, so a built-in can be edited or removed.
     try:
-        regex_patterns = json.loads(form.get("regex_patterns") or "[]")
-    except (ValueError, TypeError, RecursionError):
-        return _err("Custom patterns were not valid JSON — check the form and retry")
-    if not isinstance(regex_patterns, list):
-        return _err("Custom patterns must be a list")
-    if len(regex_patterns) > MAX_PATTERNS:
-        return _err(f"Too many custom patterns (max {MAX_PATTERNS})")
-    clean_patterns = []
-    for entry in regex_patterns:
-        if not isinstance(entry, dict):
-            return _err("Each custom pattern must have a name and a pattern")
-        name = str(entry.get("name") or "").strip()[:100]
-        pattern = str(entry.get("pattern") or "").strip()
-        if not name or not pattern:
-            return _err("Each custom pattern needs both a name and a pattern")
-        if len(pattern) > MAX_PATTERN_CHARS:
-            return _err(f"Pattern '{name}' is too long (max {MAX_PATTERN_CHARS} characters)")
-        try:
-            re.compile(pattern)
-        except (re.error, OverflowError, RecursionError, ValueError):
-            # re.compile raises OverflowError on an oversized repeat count
-            # (\d{9999999999}) and RecursionError on deep nesting — neither is
-            # an re.error, and either would escape as a bare 500.
-            return _err(f"Pattern '{name}' is not a valid regular expression")
-        level = entry.get("severity")
-        clean_patterns.append({
-            "name": name,
-            "pattern": pattern,
-            "category": str(entry.get("category") or name).strip().lower()[:100],
-            "severity": level if level in VALID_SEVERITIES else "moderate",
-        })
-
-    # Keywords — one per line.  Single characters match on nearly every request
-    # and would bury real findings, so require two.
-    keywords = []
-    for raw in (form.get("regex_keywords") or "").split("\n"):
-        kw = raw.strip()
-        if not kw:
-            continue
-        if len(kw) < 2:
-            return _err(f"Keyword '{kw}' is too short — use at least 2 characters")
-        keywords.append(kw[:200])
-    if len(keywords) > MAX_KEYWORDS:
-        return _err(f"Too many keywords (max {MAX_KEYWORDS})")
+        clean_patterns, keywords = parse_regex_rules(form.get("regex_rules") or "")
+    except ValueError as e:
+        return _err(str(e))
 
     # Email recipients, per severity
     recipients = {}
@@ -440,14 +513,15 @@ async def save_dlp_config(
         await crud.set_config(db, "dlp.llm.system_prompt", llm_prompt)
         if json_fields_authoritative:
             await crud.set_config(db, "dlp.severity_rules", clean_rules)
-            await crud.set_config(db, "dlp.regex.patterns", clean_patterns)
         else:
             logger.warning(
                 "dlp_config_json_fields_skipped",
                 user_id=user.id,
-                reason="page script did not serialize severity_rules/regex_patterns",
+                reason="page script did not serialize severity_rules",
             )
+        await crud.set_config(db, "dlp.regex.patterns", clean_patterns)
         await crud.set_config(db, "dlp.regex.keywords", keywords)
+        await crud.set_config(db, "dlp.regex.builtins_in_list", True)
         await crud.set_config(db, "dlp.email.minor_recipients", recipients["minor"])
         await crud.set_config(db, "dlp.email.moderate_recipients", recipients["moderate"])
         await crud.set_config(db, "dlp.email.major_recipients", recipients["major"])

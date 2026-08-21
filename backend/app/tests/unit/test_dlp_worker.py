@@ -457,12 +457,19 @@ def routes():
     saved = {k: sys.modules.get(k) for k in (
         "backend", "backend.app", "backend.app.db", "backend.app.db.crud",
         "backend.app.db.session", "backend.app.dashboard", "backend.app.dashboard.routes",
-        "backend.app.logging_config",
+        "backend.app.logging_config", "backend.app.services",
+        "backend.app.services.dlp_scanner",
     )}
     sys.modules.setdefault("backend", MagicMock())
     sys.modules.setdefault("backend.app", MagicMock())
     sys.modules.setdefault("backend.app.db", MagicMock())
     sys.modules.setdefault("backend.app.dashboard", MagicMock())
+    # The route parses the regex rule list with the REAL scanner helpers
+    # (built-in definitions, Luhn validator lookup), resolved via importlib.
+    sys.modules.setdefault("backend.app.services", MagicMock())
+    sys.modules["backend.app.services.dlp_scanner"] = _spec_load(
+        "dlp_scanner_for_routes", _SERVICES_DIR / "dlp_scanner.py"
+    )
     sys.modules["backend.app.db.crud"] = MagicMock()
     sys.modules["backend.app.db.session"] = MagicMock(get_async_db=MagicMock())
     sys.modules["backend.app.dashboard.routes"] = MagicMock(
@@ -550,8 +557,9 @@ _VALID = {
     "llm_model": "qwen/qwen3.5-4b",
     "llm_system_prompt": "Return a JSON array of findings.",
     "severity_rules": '{"email": "minor"}',
-    "regex_patterns": '[{"name": "Vandal ID", "pattern": "V\\\\d{8}", "category": "student id"}]',
-    "regex_keywords": "confidential\nproprietary",
+    # One textarea: pattern lines are "Name | category | regex", bare lines
+    # are keywords.  Built-ins are ordinary lines the admin may edit/remove.
+    "regex_rules": "Vandal ID | student id | V\\d{8}\nconfidential\nproprietary",
     "email_minor": "",
     "email_moderate": "",
     "email_major": "ops@example.edu",
@@ -574,18 +582,61 @@ class TestConfigValidation:
 
     @pytest.mark.asyncio
     async def test_invalid_regex_is_rejected_with_no_writes(self, routes):
-        form = dict(_VALID, regex_patterns='[{"name": "Bad", "pattern": "([unclosed"}]')
+        form = dict(_VALID, regex_rules="Bad | bad | ([unclosed")
         resp, written = await _save(routes, form)
         assert "error" in resp.headers["location"]
+        assert "Line" in resp.headers["location"]
         assert written == {}, "nothing may be written when validation fails"
 
     @pytest.mark.asyncio
-    async def test_wrong_shaped_patterns_rejected(self, routes):
-        """A list of strings is valid JSON but used to reach the scanner and
-        raise TypeError, silently killing ALL alerting for every request."""
-        resp, written = await _save(routes, dict(_VALID, regex_patterns='["not-a-dict"]'))
+    async def test_pattern_line_with_missing_field_rejected(self, routes):
+        """'Name | regex' is ambiguous — require all three fields so a keyword
+        containing a stray pipe can't silently become a half-formed pattern."""
+        resp, written = await _save(routes, dict(_VALID, regex_rules="Only Two | \\d+"))
         assert "error" in resp.headers["location"]
         assert written == {}
+
+    @pytest.mark.asyncio
+    async def test_regex_may_contain_pipes(self, routes):
+        """The regex is the LAST field, so alternation survives the split."""
+        resp, written = await _save(routes, dict(_VALID, regex_rules="Secret | secret | \\b(foo|bar|baz)\\b"))
+        assert "success" in resp.headers["location"]
+        assert written["dlp.regex.patterns"] == [
+            {"name": "Secret", "pattern": "\\b(foo|bar|baz)\\b", "category": "secret"}
+        ]
+
+    @pytest.mark.asyncio
+    async def test_saved_list_is_authoritative_and_flagged(self, routes):
+        """After a save the stored list IS the scanner's pattern set — the
+        worker must stop prepending the implicit built-ins."""
+        resp, written = await _save(routes, dict(_VALID))
+        assert "success" in resp.headers["location"]
+        assert written["dlp.regex.builtins_in_list"] is True
+        assert [p["name"] for p in written["dlp.regex.patterns"]] == ["Vandal ID"]
+        assert written["dlp.regex.keywords"] == ["confidential", "proprietary"]
+
+    @pytest.mark.asyncio
+    async def test_builtin_name_keeps_its_validator(self, routes):
+        """Editing the card regex must not silently drop the Luhn check."""
+        rules = "Credit Card | credit card number | \\b\\d{16}\\b\nSSN | social security number | \\b\\d{3}-\\d{2}-\\d{4}\\b"
+        resp, written = await _save(routes, dict(_VALID, regex_rules=rules))
+        assert "success" in resp.headers["location"]
+        by_name = {p["name"]: p for p in written["dlp.regex.patterns"]}
+        assert by_name["Credit Card"]["validator"] == "luhn"
+        assert "validator" not in by_name["SSN"]
+
+    @pytest.mark.asyncio
+    async def test_comment_and_blank_lines_skipped(self, routes):
+        resp, written = await _save(routes, dict(_VALID, regex_rules="# built-ins removed on purpose\n\nFERPA\n"))
+        assert "success" in resp.headers["location"]
+        assert written["dlp.regex.patterns"] == []
+        assert written["dlp.regex.keywords"] == ["FERPA"]
+
+    @pytest.mark.asyncio
+    async def test_ignore_is_a_valid_rule_level(self, routes):
+        resp, written = await _save(routes, dict(_VALID, severity_rules='{"email": "ignore", "person": "minor"}'))
+        assert "success" in resp.headers["location"]
+        assert written["dlp.severity_rules"] == {"email": "ignore", "person": "minor"}
 
     @pytest.mark.asyncio
     async def test_severity_rules_must_be_a_mapping(self, routes):
@@ -630,7 +681,7 @@ class TestConfigValidation:
     async def test_single_char_keyword_rejected(self, routes):
         """A 1-char keyword matches on nearly every request and buries real
         findings under thousands of entities."""
-        resp, _ = await _save(routes, dict(_VALID, regex_keywords="a"))
+        resp, _ = await _save(routes, dict(_VALID, regex_rules="a"))
         assert "error" in resp.headers["location"]
 
     @pytest.mark.asyncio
@@ -675,12 +726,14 @@ class TestConfigValidation:
         JavaScript.  If that script does not run the browser posts the empty
         defaults — writing them would wipe the admin's rules while reporting
         success, which is exactly what a dead {% block %} caused."""
-        form = dict(_VALID, severity_rules="{}", regex_patterns="[]")
+        form = dict(_VALID, severity_rules="{}")
         form.pop("_json_ready", None)
         resp, written = await _save(routes, form)
         assert "success" in resp.headers["location"]
         assert "dlp.severity_rules" not in written
-        assert "dlp.regex.patterns" not in written
+        # The regex rule list is a plain textarea — no script involved — so it
+        # is always authoritative and still saves.
+        assert written["dlp.regex.patterns"][0]["name"] == "Vandal ID"
         # everything else still saves
         assert written["dlp.enabled"] is True
 
@@ -808,7 +861,9 @@ class TestTemplateFixes:
     def test_hidden_json_inputs_have_parseable_defaults(self):
         html = (_DASHBOARD_DIR / "templates" / "admin" / "dlp.html").read_text()
         assert 'id="severity_rules_json" value="{}"' in html
-        assert 'id="regex_patterns_json" value="[]"' in html
+        # The regex list is a real textarea now, not a script-filled hidden input.
+        assert 'regex_patterns_json' not in html
+        assert 'name="regex_rules"' in html and 'rows="8"' in html
 
     def test_masked_snippets_are_surfaced(self):
         html = (_DASHBOARD_DIR / "templates" / "admin" / "dlp.html").read_text()
