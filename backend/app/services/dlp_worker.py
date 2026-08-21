@@ -18,8 +18,10 @@
 """Background DLP worker: async queue consumer for post-hoc scanning."""
 
 import asyncio
+import random
 import re
 import time
+import zoneinfo
 from datetime import datetime, timedelta, timezone
 
 from backend.app.logging_config import get_logger
@@ -86,6 +88,12 @@ DIGEST_FREQUENCIES = {
 }
 # How often the digest loop wakes to check whether a report is due.
 DIGEST_CHECK_INTERVAL = 300.0
+# Per-wake random extra sleep.  Every uvicorn worker runs its own digest loop
+# and they all start within milliseconds of each other on a restart; without
+# jitter they tick in lockstep forever and race on "is a report due?".  The
+# compare-and-set claim below is what makes a duplicate impossible — jitter
+# just keeps the workers from contending every tick.
+DIGEST_CHECK_JITTER = 60.0
 # Cap alerts enumerated in one digest email so a busy window can't produce a
 # multi-megabyte message; the count line still reports the true total.
 DIGEST_MAX_ROWS = 500
@@ -674,14 +682,14 @@ async def dlp_digest_loop() -> None:
     logger.info("dlp_digest_loop_started")
     while True:
         try:
-            await asyncio.sleep(DIGEST_CHECK_INTERVAL)
+            await asyncio.sleep(DIGEST_CHECK_INTERVAL + random.uniform(0, DIGEST_CHECK_JITTER))
             await _maybe_send_digest()
         except asyncio.CancelledError:
             logger.info("dlp_digest_loop_cancelled")
             break
         except Exception:
             logger.exception("dlp_digest_loop_error")
-            await asyncio.sleep(DIGEST_CHECK_INTERVAL)
+            await asyncio.sleep(DIGEST_CHECK_INTERVAL + random.uniform(0, DIGEST_CHECK_JITTER))
 
 
 async def _maybe_send_digest() -> None:
@@ -717,20 +725,60 @@ async def _maybe_send_digest() -> None:
         if (now - last_sent).total_seconds() < interval:
             return  # not due yet
 
+        # Claim the window BEFORE sending.  Every worker process runs this
+        # loop; a read-then-send-then-write sequence let several of them see
+        # the same stale watermark and each email the same report (4 identical
+        # digests after the 2.9.46 restart).  The claim is a single
+        # compare-and-set UPDATE, so exactly one worker's statement matches the
+        # old value; the rest see rowcount 0 and stand down.
+        if not await _claim_digest_window(db, last_sent_raw, now.isoformat()):
+            logger.info("dlp_digest_claimed_elsewhere")
+            return
+
         # Gather digest-mode alerts scanned since the last report.
         alerts = await _digest_alerts_since(db, last_sent, digest_sevs)
         if alerts:
             try:
                 await _send_digest_email(db, recipients, alerts, since=last_sent, until=now)
             except Exception:
-                # Do NOT advance the watermark on send failure, so the next
-                # cycle retries the same window instead of dropping alerts.
+                # Do NOT keep the advanced watermark on send failure: restore
+                # the previous one so the next cycle retries the same window
+                # instead of dropping alerts.  (Restore, not "never advance",
+                # because the claim above already moved it.)
                 logger.exception("dlp_digest_send_failed")
+                try:
+                    await crud.set_config(db, "dlp.digest.last_sent_at", last_sent_raw)
+                    await db.commit()
+                except Exception:
+                    logger.exception("dlp_digest_watermark_restore_failed")
                 return
 
-        await crud.set_config(db, "dlp.digest.last_sent_at", now.isoformat())
-        await db.commit()
         logger.info("dlp_digest_sent", alerts=len(alerts), recipients=len(recipients), frequency=freq)
+
+
+async def _claim_digest_window(db, previous_raw, now_iso: str) -> bool:
+    """Atomically advance the digest watermark from ``previous_raw`` to ``now_iso``.
+
+    A compare-and-set on the app_config row: the UPDATE only matches while the
+    stored value still equals the one this worker read, so among N workers
+    that all saw the same stale watermark exactly one gets rowcount 1.  Values
+    are compared in their stored JSON encoding (set_config json.dumps them).
+    Returns True only for the worker that owns this digest window.
+    """
+    import json as _json
+    from sqlalchemy import update
+    from backend.app.db.models import AppConfig
+
+    result = await db.execute(
+        update(AppConfig)
+        .where(
+            AppConfig.key == "dlp.digest.last_sent_at",
+            AppConfig.value == _json.dumps(previous_raw),
+        )
+        .values(value=_json.dumps(now_iso))
+    )
+    await db.commit()
+    return (getattr(result, "rowcount", 0) or 0) == 1
 
 
 def _parse_iso(value):
@@ -758,8 +806,48 @@ async def _digest_alerts_since(db, since, severities):
     return list(result.scalars().all())
 
 
+DEFAULT_DISPLAY_TZ = "America/Los_Angeles"
+
+
+async def _display_tz(db) -> zoneinfo.ZoneInfo:
+    """The admin-configured display timezone (app.timezone), same one the
+    dashboard's ``localtime`` filter uses, so an email and the console agree.
+    Falls back to U.S. Pacific on a missing or unknown name."""
+    from backend.app.db import crud
+
+    name = DEFAULT_DISPLAY_TZ
+    try:
+        name = await crud.get_config_json(db, "app.timezone", DEFAULT_DISPLAY_TZ) or DEFAULT_DISPLAY_TZ
+        return zoneinfo.ZoneInfo(str(name))
+    except Exception:
+        logger.warning("dlp_digest_bad_timezone", timezone=str(name)[:60])
+        return zoneinfo.ZoneInfo(DEFAULT_DISPLAY_TZ)
+
+
+def _fmt_local(dt, tz: zoneinfo.ZoneInfo, fmt: str = "%Y-%m-%d %H:%M") -> str:
+    """Format a datetime in ``tz``.  Alert timestamps come back from MariaDB
+    naive; they were written in UTC (server_default now() on a UTC host), so
+    a naive value is UTC — never the local wall clock."""
+    if dt is None:
+        return ""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(tz).strftime(fmt)
+
+
+def _tz_label(tz: zoneinfo.ZoneInfo, at: datetime) -> str:
+    """Abbreviation in force at ``at`` (PDT vs PST), falling back to the key."""
+    if at.tzinfo is None:
+        at = at.replace(tzinfo=timezone.utc)
+    return at.astimezone(tz).tzname() or getattr(tz, "key", "local")
+
+
 async def _send_digest_email(db, recipients, alerts, since, until) -> None:
-    """Build and send the digest report. Matched values stay masked/absent."""
+    """Build and send the digest report. Matched values stay masked/absent.
+
+    Times are rendered in the configured display timezone (Admin → Settings →
+    Timezone; U.S. Pacific by default) with the zone abbreviation, not UTC.
+    """
     from backend.app.services import email_service
 
     smtp_config = await email_service.get_smtp_config(db)
@@ -768,6 +856,8 @@ async def _send_digest_email(db, recipients, alerts, since, until) -> None:
         raise RuntimeError("SMTP not configured")
 
     base_url = await email_service.get_base_url(db)
+    tz = await _display_tz(db)
+    tz_label = _tz_label(tz, until)
     truncated = len(alerts) > DIGEST_MAX_ROWS
     shown = alerts[:DIGEST_MAX_ROWS]
 
@@ -787,7 +877,7 @@ async def _send_digest_email(db, recipients, alerts, since, until) -> None:
 
     rows = []
     for a in shown:
-        when = a.scanned_at.strftime("%Y-%m-%d %H:%M") if a.scanned_at else ""
+        when = _fmt_local(a.scanned_at, tz)
         cat = _esc(", ".join(a.categories or []) or "unknown")
         rows.append(
             f"<tr><td>{when}</td><td>{_esc(a.severity)}</td><td>{_esc(a.scanner)}</td>"
@@ -800,12 +890,12 @@ async def _send_digest_email(db, recipients, alerts, since, until) -> None:
 
     body_html = (
         f"<p><strong>MindRouter DLP digest</strong></p>"
-        f"<p>Window: {since.strftime('%Y-%m-%d %H:%M')} &rarr; {until.strftime('%Y-%m-%d %H:%M')} UTC<br>"
+        f"<p>Window: {_fmt_local(since, tz)} &rarr; {_fmt_local(until, tz)} {_esc(tz_label)}<br>"
         f"Alerts: {len(shown)}{'+' if truncated else ''}<br>"
         f"By severity: {summary}<br>"
         f"Top categories: {cats}</p>"
         f'<table border="1" cellpadding="4" cellspacing="0">'
-        f"<tr><th>Time (UTC)</th><th>Severity</th><th>Scanner</th><th>Categories</th><th>Request</th></tr>"
+        f"<tr><th>Time ({_esc(tz_label)})</th><th>Severity</th><th>Scanner</th><th>Categories</th><th>Request</th></tr>"
         f"{''.join(rows)}</table>"
         f"{trunc_note}"
         f'<p><a href="{base_url}/admin/dlp">Review in Admin &rarr; DLP</a></p>'

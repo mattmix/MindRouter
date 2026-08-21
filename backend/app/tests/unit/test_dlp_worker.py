@@ -40,7 +40,7 @@ import asyncio
 import importlib.util
 import sys
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -1027,9 +1027,120 @@ class TestDigest:
         # Only digest-mode severities are rolled up.
         assert '"immediate") == "digest"' in WORKER_SRC
 
+    # --- 2.9.47: one digest per window across N worker processes ---------
+
+    def test_window_is_claimed_before_sending(self):
+        """Four identical digests went out after the 2.9.46 restart: every
+        uvicorn worker's loop woke on the same tick, read the same stale
+        watermark, and each sent before any had written it.  The claim must be
+        a compare-and-set that happens BEFORE the send."""
+        body = WORKER_SRC[WORKER_SRC.index("async def _maybe_send_digest"):WORKER_SRC.index("async def _claim_digest_window")]
+        assert body.index("_claim_digest_window(") < body.index("_send_digest_email(")
+        claim = WORKER_SRC[WORKER_SRC.index("async def _claim_digest_window"):]
+        assert "update(AppConfig)" in claim
+        assert 'AppConfig.value == _json.dumps(previous_raw)' in claim, "CAS must compare the stored JSON encoding"
+        assert "rowcount" in claim
+
+    @pytest.mark.asyncio
+    async def test_claim_returns_true_for_exactly_the_matching_update(self, worker):
+        """The statement compares key AND the previously-read value; rowcount 1
+        means this worker owns the window, 0 means another one already moved it."""
+        import json as _json
+        from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+        from sqlalchemy import String, Text
+
+        class _Base(DeclarativeBase):
+            pass
+
+        class AppConfig(_Base):
+            __tablename__ = "app_config"
+            key: Mapped[str] = mapped_column(String(100), primary_key=True)
+            value: Mapped[str] = mapped_column(Text)
+
+        captured = {}
+
+        class _Result:
+            def __init__(self, rc):
+                self.rowcount = rc
+
+        def _db(rowcount):
+            db = MagicMock()
+
+            async def execute(stmt):
+                captured["stmt"] = stmt
+                return _Result(rowcount)
+
+            async def commit():
+                captured["committed"] = True
+
+            db.execute = execute
+            db.commit = commit
+            return db
+
+        with patch.dict(sys.modules, {"backend.app.db.models": MagicMock(AppConfig=AppConfig)}):
+            assert await worker._claim_digest_window(_db(1), "2026-08-20T14:02:00+00:00", "2026-08-21T14:06:00+00:00") is True
+            assert captured["committed"] is True
+            sql = str(captured["stmt"].compile(compile_kwargs={"literal_binds": True}))
+            assert "app_config.key = 'dlp.digest.last_sent_at'" in sql
+            assert "app_config.value = '" + _json.dumps("2026-08-20T14:02:00+00:00").replace("'", "''") + "'" in sql
+            assert _json.dumps("2026-08-21T14:06:00+00:00").replace("'", "''") in sql
+            assert await worker._claim_digest_window(_db(0), "x", "y") is False
+            assert await worker._claim_digest_window(_db(2), "x", "y") is False
+
+    def test_loop_jitters_so_workers_do_not_tick_together(self):
+        loop = WORKER_SRC[WORKER_SRC.index("async def dlp_digest_loop"):WORKER_SRC.index("async def _maybe_send_digest")]
+        assert "random.uniform(0, DIGEST_CHECK_JITTER)" in loop
+        assert "DIGEST_CHECK_JITTER = 60.0" in WORKER_SRC
+
+    def test_send_failure_restores_the_previous_watermark(self):
+        """The claim already advanced the watermark, so a failed send must put
+        the OLD value back (not merely skip the write) or the window is lost."""
+        body = WORKER_SRC[WORKER_SRC.index("async def _maybe_send_digest"):WORKER_SRC.index("async def _claim_digest_window")]
+        fail = body[body.index("dlp_digest_send_failed"):]
+        assert 'set_config(db, "dlp.digest.last_sent_at", last_sent_raw)' in fail
+
+    # --- 2.9.47: digest times in the configured display timezone ---------
+
+    def test_digest_renders_in_configured_timezone_with_abbreviation(self, worker):
+        from datetime import datetime, timezone
+        tz = worker.zoneinfo.ZoneInfo("America/Los_Angeles")
+        # naive DB value == UTC, never local wall clock
+        naive = datetime(2026, 8, 20, 17, 19)
+        assert worker._fmt_local(naive, tz) == "2026-08-20 10:19"
+        aware = datetime(2026, 1, 15, 17, 19, tzinfo=timezone.utc)
+        assert worker._fmt_local(aware, tz) == "2026-01-15 09:19"
+        assert worker._tz_label(tz, datetime(2026, 8, 21, 14, 6, tzinfo=timezone.utc)) == "PDT"
+        assert worker._tz_label(tz, datetime(2026, 1, 21, 14, 6, tzinfo=timezone.utc)) == "PST"
+        assert worker._fmt_local(None, tz) == ""
+
+    @pytest.mark.asyncio
+    async def test_display_tz_reads_app_timezone_and_falls_back(self, worker):
+        crud = MagicMock()
+
+        async def cfg(db, key, default=None):
+            return {"app.timezone": "America/New_York"}.get(key, default)
+
+        crud.get_config_json = cfg
+        # the worker does `from backend.app.db import crud` -> patch the parent
+        with patch.dict(sys.modules, {"backend.app.db": MagicMock(crud=crud)}):
+            assert (await worker._display_tz(None)).key == "America/New_York"
+
+        async def bad(db, key, default=None):
+            return "Mars/Olympus_Mons"
+
+        crud.get_config_json = bad
+        with patch.dict(sys.modules, {"backend.app.db": MagicMock(crud=crud)}):
+            assert (await worker._display_tz(None)).key == "America/Los_Angeles"
+
+    def test_digest_email_no_longer_labels_utc(self):
+        body = WORKER_SRC[WORKER_SRC.index("async def _send_digest_email"):]
+        assert "Time (UTC)" not in body
+        assert "Time ({_esc(tz_label)})" in body
+        assert "_fmt_local(since, tz)" in body and "_fmt_local(a.scanned_at, tz)" in body
+
     def test_digest_watermark_not_advanced_on_failure(self):
         # A send failure must not drop alerts: keep the window for the retry.
-        assert "Do NOT advance the watermark on send failure" in WORKER_SRC
+        assert "Do NOT keep the advanced watermark on send failure" in WORKER_SRC
 
     def test_digest_email_never_includes_matched_values(self):
         assert "Matched values are masked" in WORKER_SRC
