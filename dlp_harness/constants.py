@@ -202,6 +202,7 @@ DLP_CONFIG_KEYS = [
     "dlp.regex.patterns",
     "dlp.regex.keywords",
     "dlp.regex.builtins_in_list",
+    "dlp.max_scan_chars",
     "dlp.gliner.enabled",
     "dlp.gliner.threshold",
     "dlp.gliner.categories",

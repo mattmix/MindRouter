@@ -35,9 +35,27 @@ logger = get_logger(__name__)
 # never holds a credential or speaks HTTP itself — see dlp_worker._internal_chat.
 CompleteFn = Callable[[str, List[Dict[str, str]]], Awaitable[str]]
 
-# Upper bound on the text handed to any scanner.  Caps both regex backtracking
-# cost and GLiNER/LLM token use on a pathological request.
+# Default upper bound on the text handed to any scanner.  Caps both regex
+# backtracking cost and GLiNER/LLM token use on a pathological request.
+# Admin-tunable as dlp.max_scan_chars (Admin -> DLP); 0 there means NO limit,
+# so a very long prompt cannot push sensitive content past the scan window
+# and circumvent DLP.  GLiNER additionally keeps its own, smaller cap.
 MAX_SCAN_CHARS = 200_000
+UNLIMITED_SCAN_CHARS = 0
+
+
+def effective_scan_limit(config: Optional[Dict[str, Any]]) -> Optional[int]:
+    """Characters to scan for this run: a positive int, or None for no limit.
+
+    Missing/garbage config -> the MAX_SCAN_CHARS default (never "unlimited by
+    accident"); 0 or negative -> None (scan everything).
+    """
+    raw = (config or {}).get("max_scan_chars", MAX_SCAN_CHARS)
+    try:
+        limit = int(raw)
+    except (TypeError, ValueError):
+        return MAX_SCAN_CHARS
+    return None if limit <= UNLIMITED_SCAN_CHARS else limit
 
 # GLiNER is CPU-bound torch inference whose cost scales with text length, so it
 # gets its OWN, much smaller cap than the cheap regex scanner: a long chat
@@ -807,9 +825,10 @@ async def run_dlp_scan(
     scanners_used: List[str] = []
     scanner_errors: List[str] = []
 
-    if len(text) > MAX_SCAN_CHARS:
-        logger.info("dlp_scan_text_truncated", original_chars=len(text), kept=MAX_SCAN_CHARS)
-        text = text[:MAX_SCAN_CHARS]
+    limit = effective_scan_limit(config)
+    if limit is not None and len(text) > limit:
+        logger.info("dlp_scan_text_truncated", original_chars=len(text), kept=limit)
+        text = text[:limit]
 
     # --- Regex scanner (always fast, run first) ---
     if config.get("regex.enabled", True):

@@ -260,6 +260,47 @@ class TestIgnoreSeverity:
         assert called == [] and result is None
 
 
+class TestScanLimit:
+    """dlp.max_scan_chars (2.9.48): admin-tunable global scan window; 0 means
+    no limit so a long prompt cannot push sensitive text past the window."""
+
+    def test_default_is_the_constant(self):
+        assert _scanner_mod.effective_scan_limit({}) == _scanner_mod.MAX_SCAN_CHARS
+        assert _scanner_mod.effective_scan_limit(None) == _scanner_mod.MAX_SCAN_CHARS
+
+    def test_zero_or_negative_means_unlimited(self):
+        assert _scanner_mod.effective_scan_limit({"max_scan_chars": 0}) is None
+        assert _scanner_mod.effective_scan_limit({"max_scan_chars": "0"}) is None
+        assert _scanner_mod.effective_scan_limit({"max_scan_chars": -5}) is None
+
+    def test_garbage_falls_back_to_default_not_unlimited(self):
+        assert _scanner_mod.effective_scan_limit({"max_scan_chars": "lots"}) == _scanner_mod.MAX_SCAN_CHARS
+        assert _scanner_mod.effective_scan_limit({"max_scan_chars": None}) == _scanner_mod.MAX_SCAN_CHARS
+
+    @pytest.mark.asyncio
+    async def test_ssn_past_the_limit_is_missed_with_a_limit(self):
+        text = "x" * 5000 + " SSN 123-45-6789"
+        cfg = {"regex.enabled": True, "gliner.enabled": False, "llm.enabled": False,
+               "max_scan_chars": 1000}
+        assert await _scanner_mod.run_dlp_scan(text, cfg) is None
+
+    @pytest.mark.asyncio
+    async def test_no_limit_scans_the_entire_document(self):
+        # Well past the old hard ceiling: the SSN sits at ~300k chars.
+        text = "x" * (_scanner_mod.MAX_SCAN_CHARS + 100_000) + " SSN 123-45-6789"
+        cfg = {"regex.enabled": True, "gliner.enabled": False, "llm.enabled": False,
+               "max_scan_chars": 0}
+        result = await _scanner_mod.run_dlp_scan(text, cfg)
+        assert result is not None
+        assert [f.category for f in result.findings] == ["social security number"]
+
+    @pytest.mark.asyncio
+    async def test_unset_keeps_the_old_ceiling(self):
+        text = "x" * (_scanner_mod.MAX_SCAN_CHARS + 10) + " SSN 123-45-6789"
+        cfg = {"regex.enabled": True, "gliner.enabled": False, "llm.enabled": False}
+        assert await _scanner_mod.run_dlp_scan(text, cfg) is None
+
+
 class TestAuthoritativePatternList:
     """Once the admin saves the rule list, the stored patterns ARE the
     scanner's set — built-ins are no longer implicitly prepended."""

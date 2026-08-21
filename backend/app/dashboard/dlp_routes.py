@@ -42,6 +42,9 @@ VALID_SCANNERS = ("regex", "gliner", "llm")
 # Caps on admin-supplied config.  Every one of these bounds work the DLP worker
 # performs per scanned request, so an unbounded value is a self-inflicted DoS.
 MAX_PATTERNS = 100
+# Global scan window (dlp.max_scan_chars): default = scanner constant; 0 = no limit.
+DEFAULT_MAX_SCAN_CHARS = 200_000
+MIN_MAX_SCAN_CHARS = 1_000
 MAX_PATTERN_CHARS = 500
 MAX_KEYWORDS = 500
 MAX_CATEGORIES = 60
@@ -218,6 +221,8 @@ async def admin_dlp_page(
         "gliner_threshold": await crud.get_config_json(db, "dlp.gliner.threshold", 0.5),
         "gliner_categories": await crud.get_config_json(db, "dlp.gliner.categories", []),
         "gliner_max_scan_chars": await crud.get_config_json(db, "dlp.gliner.max_scan_chars", 10000),
+        # Global scan window; 0 = no limit.  Default mirrors the scanner constant.
+        "max_scan_chars": await crud.get_config_json(db, "dlp.max_scan_chars", DEFAULT_MAX_SCAN_CHARS),
         "remote_enabled": await crud.get_config_json(db, "dlp.gliner.remote.enabled", False),
         "remote_endpoints": "\n".join(
             await crud.get_config_json(db, "dlp.gliner.remote.endpoints", [])
@@ -379,6 +384,22 @@ async def save_dlp_config(
     if not (0.1 <= threshold <= 0.95):  # also rejects nan (all comparisons False)
         return _err("GLiNER threshold must be between 0.1 and 0.95")
 
+    # Global scan window.  "No limit" posts the checkbox and we store 0, which
+    # the scanner reads as "scan the entire document" — the defence against a
+    # long prompt pushing sensitive text past the window.  A positive value
+    # must be at least MIN_MAX_SCAN_CHARS so a typo can't blind the scanner.
+    if form.get("max_scan_chars_unlimited") == "on":
+        max_scan_chars = 0
+    else:
+        try:
+            max_scan_chars = int(float(form.get("max_scan_chars", str(DEFAULT_MAX_SCAN_CHARS))))
+        except (TypeError, ValueError):
+            return _err("Max scan characters must be a whole number")
+        if max_scan_chars == 0:
+            pass  # explicit 0 typed in the box also means no limit
+        elif max_scan_chars < MIN_MAX_SCAN_CHARS:
+            return _err(f"Max scan characters must be 0 (no limit) or at least {MIN_MAX_SCAN_CHARS}")
+
     # GLiNER max scan chars — bounds CPU cost (scan time scales with length).
     try:
         gliner_max_chars = int(float(form.get("gliner_max_scan_chars", "10000")))
@@ -501,6 +522,7 @@ async def save_dlp_config(
         await crud.set_config(db, "dlp.llm.enabled", llm_enabled)
         await crud.set_config(db, "dlp.gliner.threshold", threshold)
         await crud.set_config(db, "dlp.gliner.max_scan_chars", gliner_max_chars)
+        await crud.set_config(db, "dlp.max_scan_chars", max_scan_chars)
         await crud.set_config(db, "dlp.gliner.categories", categories)
         await crud.set_config(db, "dlp.gliner.remote.enabled", remote_enabled)
         await crud.set_config(db, "dlp.gliner.remote.endpoints", remote_endpoints)

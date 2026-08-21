@@ -632,6 +632,49 @@ class TestConfigValidation:
         assert written["dlp.regex.patterns"] == []
         assert written["dlp.regex.keywords"] == ["FERPA"]
 
+    # --- 2.9.48: global scan window -----------------------------------
+
+    @pytest.mark.asyncio
+    async def test_max_scan_chars_default_saved(self, routes):
+        resp, written = await _save(routes, dict(_VALID))
+        assert "success" in resp.headers["location"]
+        assert written["dlp.max_scan_chars"] == 200000
+
+    @pytest.mark.asyncio
+    async def test_max_scan_chars_unlimited_checkbox_stores_zero(self, routes):
+        resp, written = await _save(routes, dict(_VALID, max_scan_chars="200000", max_scan_chars_unlimited="on"))
+        assert "success" in resp.headers["location"]
+        assert written["dlp.max_scan_chars"] == 0
+
+    @pytest.mark.asyncio
+    async def test_max_scan_chars_explicit_zero_is_unlimited(self, routes):
+        resp, written = await _save(routes, dict(_VALID, max_scan_chars="0"))
+        assert "success" in resp.headers["location"]
+        assert written["dlp.max_scan_chars"] == 0
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("bad", ["500", "-1", "abc"])
+    async def test_max_scan_chars_rejects_tiny_negative_garbage(self, routes, bad):
+        resp, written = await _save(routes, dict(_VALID, max_scan_chars=bad))
+        assert "error" in resp.headers["location"]
+        assert written == {}
+
+    @pytest.mark.asyncio
+    async def test_max_scan_chars_positive_saved(self, routes):
+        resp, written = await _save(routes, dict(_VALID, max_scan_chars="500000"))
+        assert "success" in resp.headers["location"]
+        assert written["dlp.max_scan_chars"] == 500000
+
+    def test_worker_reads_the_global_scan_window(self):
+        assert '"dlp.max_scan_chars", MAX_SCAN_CHARS' in WORKER_SRC
+        assert 'config["max_scan_chars"]' in WORKER_SRC
+
+    def test_template_offers_no_limit(self):
+        html = (_DASHBOARD_DIR / "templates" / "admin" / "dlp.html").read_text()
+        assert 'name="max_scan_chars"' in html
+        assert 'name="max_scan_chars_unlimited"' in html
+        assert "scan the entire document" in html
+
     @pytest.mark.asyncio
     async def test_ignore_is_a_valid_rule_level(self, routes):
         resp, written = await _save(routes, dict(_VALID, severity_rules='{"email": "ignore", "person": "minor"}'))

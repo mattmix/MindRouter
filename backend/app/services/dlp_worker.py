@@ -370,6 +370,12 @@ async def _load_dlp_config(db) -> dict:
     config["gliner.threshold"] = await crud.get_config_json(db, "dlp.gliner.threshold", 0.5)
     config["gliner.categories"] = await crud.get_config_json(db, "dlp.gliner.categories", None)
     from backend.app.services.dlp_scanner import GLINER_DEFAULT_MAX_CHARS
+    # Global scan window for every scanner (0 = no limit, scan the whole
+    # document).  Read per scan so an admin change takes effect immediately.
+    from backend.app.services.dlp_scanner import MAX_SCAN_CHARS
+    config["max_scan_chars"] = await crud.get_config_json(
+        db, "dlp.max_scan_chars", MAX_SCAN_CHARS
+    )
     config["gliner.max_scan_chars"] = await crud.get_config_json(
         db, "dlp.gliner.max_scan_chars", GLINER_DEFAULT_MAX_CHARS
     )
