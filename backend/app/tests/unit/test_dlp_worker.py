@@ -819,7 +819,8 @@ class TestAlertFilters:
 
     def test_template_offers_a_clear_control(self):
         html = (_DASHBOARD_DIR / "templates" / "admin" / "dlp.html").read_text()
-        assert 'href="/admin/dlp" class="btn btn-sm btn-outline-secondary">Clear' in html
+        # Clear now lives in the enhanced filter bar (id on the anchor).
+        assert 'id="dlpClear"' in html and '>Clear</a>' in html
 
 
 class TestTemplateBlockNames:
@@ -909,7 +910,8 @@ class TestTemplateFixes:
         assert 'name="regex_rules"' in html and 'rows="8"' in html
 
     def test_masked_snippets_are_surfaced(self):
-        html = (_DASHBOARD_DIR / "templates" / "admin" / "dlp.html").read_text()
+        # The alerts table moved into the AJAX partial; assert there.
+        html = (_DASHBOARD_DIR / "templates" / "admin" / "_dlp_alerts_table.html").read_text()
         assert "<th>Matched</th>" in html
         assert "alert.entities" in html
 
@@ -1289,3 +1291,126 @@ class TestWorkerConcurrency:
             await worker.dlp_worker_loop()   # swallows the CancelledError, cancels children
             assert spawned == [0, 1, 2]      # grew to 3, then shrank to 1 (no respawn)
         asyncio.run(run())
+
+
+# ===================================================================
+# 2.9.52 — DLP alert export (zip: json/jsonl/csv) + AJAX filter partial
+# ===================================================================
+
+class TestDlpAlertExport:
+    """Filtered, zipped alert export for admins/auditors, and the pure
+    render/parse helpers behind it. dlp_routes is spec-loaded via `routes`."""
+
+    def _sample_alert(self):
+        from datetime import datetime, timezone
+        a = MagicMock()
+        a.id = 42
+        a.scanned_at = datetime(2026, 8, 20, 17, 19, tzinfo=timezone.utc)
+        a.severity = "major"
+        a.scanner = "gliner"
+        a.categories = ["social security number", "person"]
+        a.entities = [{"scanner": "regex", "category": "social security number", "text": "89*****88", "confidence": 1.0}]
+        a.confidence = 1.0
+        a.scan_latency_ms = 12
+        a.detail = "5 finding(s)"
+        a.acknowledged = False
+        a.acknowledged_at = None
+        a.user_id = 2
+        a.user = MagicMock(email="u@x.edu")
+        a.request_id = 999
+        a.request = MagicMock(request_uuid="abc-uuid")
+        return a
+
+    def test_parse_export_date_handles_bounds(self, routes):
+        from datetime import timezone
+        assert routes._parse_export_date("") is None
+        assert routes._parse_export_date("not-a-date") is None
+        start = routes._parse_export_date("2026-08-20")
+        assert start.year == 2026 and start.month == 8 and start.day == 20 and start.hour == 0
+        assert start.tzinfo is not None
+        # a date-only END bound rolls to the next midnight (inclusive whole day)
+        end = routes._parse_export_date("2026-08-20", end=True)
+        assert end.day == 21 and end.hour == 0
+        # an explicit datetime end is used as-is
+        end2 = routes._parse_export_date("2026-08-20T12:00", end=True)
+        assert end2.day == 20 and end2.hour == 12
+
+    def test_alert_to_record_is_json_safe_and_masked(self, routes):
+        rec = routes._alert_to_record(self._sample_alert())
+        assert rec["id"] == 42
+        assert rec["scanned_at"] == "2026-08-20T17:19:00+00:00"
+        assert rec["user_email"] == "u@x.edu"
+        assert rec["request_uuid"] == "abc-uuid"
+        assert rec["categories"] == ["social security number", "person"]
+        # only masked snippet text is present
+        import json as _json
+        assert "89*****88" in _json.dumps(rec) and "89-" not in _json.dumps(rec)
+
+    def test_render_json_jsonl_csv(self, routes):
+        import json as _json
+        recs = [routes._alert_to_record(self._sample_alert()),
+                routes._alert_to_record(self._sample_alert())]
+        # JSON: a single parseable array
+        arr = _json.loads(routes._render_export(recs, "json").decode())
+        assert isinstance(arr, list) and len(arr) == 2 and arr[0]["id"] == 42
+        # JSONL: one object per line
+        lines = routes._render_export(recs, "jsonl").decode().splitlines()
+        assert len(lines) == 2 and all(_json.loads(l)["severity"] == "major" for l in lines)
+        # CSV: header + N rows, nested cols JSON-encoded into one field
+        import csv, io
+        rows = list(csv.DictReader(io.StringIO(routes._render_export(recs, "csv").decode())))
+        assert len(rows) == 2
+        assert rows[0]["severity"] == "major"
+        assert _json.loads(rows[0]["categories"]) == ["social security number", "person"]
+
+    def test_render_empty_is_valid(self, routes):
+        import json as _json
+        assert _json.loads(routes._render_export([], "json").decode()) == []
+        assert routes._render_export([], "jsonl").decode() == ""
+        assert routes._render_export([], "csv").decode().strip().startswith("id,")
+
+    def test_export_constants(self, routes):
+        assert routes.EXPORT_FORMATS == ("json", "jsonl", "csv")
+        assert routes.EXPORT_MAX_ROWS >= 1000
+
+    def test_export_route_admin_read_gated_and_zips(self):
+        # source-level guarantees on the export route
+        assert '@dlp_router.get("/admin/dlp/alerts/export")' in ROUTES_SRC
+        body = ROUTES_SRC[ROUTES_SRC.index("async def export_dlp_alerts"):ROUTES_SRC.index("async def", ROUTES_SRC.index("async def export_dlp_alerts") + 1)]
+        assert "_require_admin_read(request, db)" in body
+        assert "zipfile.ZipFile" in body
+        assert 'z.writestr("manifest.json"' in body
+        assert "application/zip" in body
+        assert "start_at=start_at, end_at=end_at" in body
+
+    def test_partial_route_shares_auth_and_template(self):
+        assert '@dlp_router.get("/admin/dlp/alerts/partial"' in ROUTES_SRC
+        body = ROUTES_SRC[ROUTES_SRC.index("async def dlp_alerts_partial"):]
+        body = body[:body.index("@dlp_router.post")]
+        assert "_require_admin_read(request, db)" in body
+        assert '"admin/_dlp_alerts_table.html"' in body
+        assert "start_at=start_at, end_at=end_at" in body
+
+
+class TestDlpAlertsUX:
+    def test_partial_template_exists_and_self_contained(self):
+        partial = _DASHBOARD_DIR / "templates" / "admin" / "_dlp_alerts_table.html"
+        assert partial.exists()
+        html = partial.read_text()
+        assert "data-dlp-total" in html          # feeds the header count on swap
+        assert "page-link" in html                # pagination lives in the partial
+        assert "{% for alert in alerts %}" in html
+
+    def test_page_swaps_container_without_full_reload(self):
+        html = (_DASHBOARD_DIR / "templates" / "admin" / "dlp.html").read_text()
+        assert 'id="dlpAlertsContainer"' in html
+        assert '{% include "admin/_dlp_alerts_table.html" %}' in html
+        # the old jump-to-top behavior is gone
+        assert 'onchange="this.form.submit()"' not in html
+        # AJAX + history without reload, plus export wiring
+        assert "history.replaceState" in html
+        assert "/admin/dlp/alerts/partial" in html
+        assert "/admin/dlp/alerts/export" in html
+        assert 'id="dlpExportFmt"' in html and 'id="dlpExportBtn"' in html
+        # date-range controls present
+        assert 'name="start_date"' in html and 'name="end_date"' in html

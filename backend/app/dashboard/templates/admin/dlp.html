@@ -463,151 +463,71 @@
 
             <!-- Alerts Table -->
             <div class="card">
-                <div class="card-header d-flex justify-content-between align-items-center">
-                    <h5 class="mb-0">DLP Alerts</h5>
-                    <div class="d-flex gap-2">
-                        <form method="get" action="/admin/dlp" class="d-flex gap-2">
-                            <select name="severity" class="form-select form-select-sm" style="width: auto;" onchange="this.form.submit()">
+                <div class="card-header">
+                    <div class="d-flex justify-content-between align-items-center mb-2">
+                        <h5 class="mb-0">DLP Alerts</h5>
+                        <span class="text-muted small" id="dlpMatchCount">{{ total }} match{{ 'es' if total != 1 else '' }}</span>
+                    </div>
+                    {# Filters drive an AJAX swap of #dlpAlertsContainer (no full-page
+                       reload / scroll jump); the form still GET-submits as a no-JS
+                       fallback and to keep the URL shareable. #}
+                    <form method="get" action="/admin/dlp" id="dlpFilterForm" class="row g-2 align-items-end">
+                        <div class="col-auto">
+                            <label class="form-label small mb-0">Severity</label>
+                            <select name="severity" class="form-select form-select-sm dlp-filter" style="width:auto;">
                                 <option value="">All Severities</option>
                                 <option value="major" {% if severity_filter == 'major' %}selected{% endif %}>Major</option>
                                 <option value="moderate" {% if severity_filter == 'moderate' %}selected{% endif %}>Moderate</option>
                                 <option value="minor" {% if severity_filter == 'minor' %}selected{% endif %}>Minor</option>
                             </select>
-                            <select name="scanner" class="form-select form-select-sm" style="width: auto;" onchange="this.form.submit()">
+                        </div>
+                        <div class="col-auto">
+                            <label class="form-label small mb-0">Scanner</label>
+                            <select name="scanner" class="form-select form-select-sm dlp-filter" style="width:auto;">
                                 <option value="">All Scanners</option>
                                 <option value="regex" {% if scanner_filter == 'regex' %}selected{% endif %}>Regex</option>
                                 <option value="gliner" {% if scanner_filter == 'gliner' %}selected{% endif %}>GLiNER</option>
                                 <option value="llm" {% if scanner_filter == 'llm' %}selected{% endif %}>LLM</option>
                             </select>
-                            <input type="text" name="search" class="form-control form-control-sm" placeholder="Search..."
-                                   value="{{ search }}" style="width: 150px;">
+                        </div>
+                        <div class="col-auto">
+                            <label class="form-label small mb-0" for="dlpStart">From</label>
+                            <input type="date" id="dlpStart" name="start_date" class="form-control form-control-sm dlp-filter" value="{{ start_date }}" style="width:auto;">
+                        </div>
+                        <div class="col-auto">
+                            <label class="form-label small mb-0" for="dlpEnd">To</label>
+                            <input type="date" id="dlpEnd" name="end_date" class="form-control form-control-sm dlp-filter" value="{{ end_date }}" style="width:auto;">
+                        </div>
+                        <div class="col-auto">
+                            <label class="form-label small mb-0" for="dlpSearch">Search</label>
+                            <input type="text" id="dlpSearch" name="search" class="form-control form-control-sm" placeholder="detail, category&hellip;" value="{{ search }}" style="width:170px;">
+                        </div>
+                        <div class="col-auto">
                             <button type="submit" class="btn btn-sm btn-outline-secondary"><i class="bi bi-search"></i></button>
-                            {% if severity_filter or scanner_filter or search %}
-                            <a href="/admin/dlp" class="btn btn-sm btn-outline-secondary">Clear</a>
+                            {% if severity_filter or scanner_filter or search or start_date or end_date %}
+                            <a href="/admin/dlp" id="dlpClear" class="btn btn-sm btn-outline-secondary">Clear</a>
                             {% endif %}
-                        </form>
-                    </div>
+                        </div>
+                        <div class="col-auto ms-auto">
+                            <label class="form-label small mb-0" for="dlpExportFmt">Export</label>
+                            <div class="input-group input-group-sm" style="width:auto;">
+                                <select id="dlpExportFmt" class="form-select form-select-sm" style="width:auto;" aria-label="Export format">
+                                    <option value="csv">CSV</option>
+                                    <option value="json">JSON</option>
+                                    <option value="jsonl">JSONL</option>
+                                </select>
+                                <button type="button" id="dlpExportBtn" class="btn btn-sm btn-primary" title="Download the current filter as a zipped bundle">
+                                    <i class="bi bi-download me-1"></i>Export
+                                </button>
+                            </div>
+                        </div>
+                    </form>
                 </div>
                 <div class="card-body p-0">
-                    <div class="table-responsive">
-                        <table class="table table-hover mb-0">
-                            <thead>
-                                <tr>
-                                    <th>ID</th>
-                                    <th>Severity</th>
-                                    <th>Scanner</th>
-                                    <th>Categories</th>
-                                    <th>Matched</th>
-                                    <th>User</th>
-                                    <th>Request</th>
-                                    <th>Latency</th>
-                                    <th>Time</th>
-                                    <th>Status</th>
-                                    {% if not is_read_only %}<th>Action</th>{% endif %}
-                                </tr>
-                            </thead>
-                            <tbody>
-                                {% for alert in alerts %}
-                                <tr>
-                                    <td>{{ alert.id }}</td>
-                                    <td>
-                                        {% if alert.severity == 'major' %}
-                                        <span class="badge bg-danger">Major</span>
-                                        {% elif alert.severity == 'moderate' %}
-                                        <span class="badge bg-warning text-dark">Moderate</span>
-                                        {% else %}
-                                        <span class="badge bg-info">Minor</span>
-                                        {% endif %}
-                                    </td>
-                                    <td><span class="badge bg-secondary">{{ alert.scanner }}</span></td>
-                                    <td>
-                                        {% if alert.categories %}
-                                        {% for cat in alert.categories[:3] %}
-                                        <span class="badge bg-light text-dark">{{ cat }}</span>
-                                        {% endfor %}
-                                        {% if alert.categories | length > 3 %}
-                                        <span class="text-muted small">+{{ alert.categories | length - 3 }}</span>
-                                        {% endif %}
-                                        {% endif %}
-                                    </td>
-                                    <td>
-                                        {# Snippets are masked at scan time — an alert row never stores the
-                                           verbatim match.  Open the linked request to see full context. #}
-                                        {% if alert.entities %}
-                                        {% for ent in alert.entities[:3] %}
-                                        <div><code class="small">{{ ent.text }}</code>
-                                            <span class="text-muted small">{{ ent.category }}</span></div>
-                                        {% endfor %}
-                                        {% if alert.entities | length > 3 %}
-                                        <span class="text-muted small">+{{ alert.entities | length - 3 }} more</span>
-                                        {% endif %}
-                                        {% else %}
-                                        <span class="text-muted small">&mdash;</span>
-                                        {% endif %}
-                                    </td>
-                                    <td>{{ alert.user.email if alert.user else 'N/A' }}</td>
-                                    <td>
-                                        {% if alert.request and alert.request.request_uuid %}
-                                        <a href="/admin/audit?request_uuid={{ alert.request.request_uuid }}" class="text-decoration-none" title="View this request in the audit log">#{{ alert.request_id }}</a>
-                                        {% elif alert.request_id %}
-                                        <span class="text-muted">#{{ alert.request_id }}</span>
-                                        {% else %}
-                                        N/A
-                                        {% endif %}
-                                    </td>
-                                    <td>{{ alert.scan_latency_ms }}ms</td>
-                                    <td><small>{{ alert.scanned_at.strftime('%Y-%m-%d %H:%M') if alert.scanned_at else '' }}</small></td>
-                                    <td>
-                                        {% if alert.acknowledged %}
-                                        <span class="badge bg-success" title="Acknowledged by {{ alert.acknowledger.email if alert.acknowledger else '?' }}">Acked</span>
-                                        {% else %}
-                                        <span class="badge bg-secondary text-white">Open</span>
-                                        {% endif %}
-                                    </td>
-                                    {% if not is_read_only %}
-                                    <td>
-                                        {% if not alert.acknowledged %}
-                                        <button class="btn btn-sm btn-outline-success" onclick="ackAlert({{ alert.id }})" title="Acknowledge">
-                                            <i class="bi bi-check-lg"></i>
-                                        </button>
-                                        {% endif %}
-                                    </td>
-                                    {% endif %}
-                                </tr>
-                                {% endfor %}
-                                {% if not alerts %}
-                                <tr>
-                                    <td colspan="{{ 10 if is_read_only else 11 }}" class="text-center text-muted py-4">No DLP alerts found.</td>
-                                </tr>
-                                {% endif %}
-                            </tbody>
-                        </table>
+                    <div id="dlpAlertsContainer" aria-live="polite">
+                        {% include "admin/_dlp_alerts_table.html" %}
                     </div>
                 </div>
-
-                {% if total_pages > 1 %}
-                <div class="card-footer">
-                    <nav aria-label="DLP alerts pagination">
-                        <ul class="pagination justify-content-center mb-0">
-                            <li class="page-item {% if page <= 1 %}disabled{% endif %}">
-                                <a class="page-link" href="?page={{ page - 1 }}{% if severity_filter %}&severity={{ severity_filter }}{% endif %}{% if scanner_filter %}&scanner={{ scanner_filter }}{% endif %}{% if search %}&search={{ search }}{% endif %}">Previous</a>
-                            </li>
-                            {% for p in range(1, total_pages + 1) %}
-                            {% if p == page or (p <= 3) or (p >= total_pages - 2) or (p >= page - 1 and p <= page + 1) %}
-                            <li class="page-item {% if p == page %}active{% endif %}">
-                                <a class="page-link" href="?page={{ p }}{% if severity_filter %}&severity={{ severity_filter }}{% endif %}{% if scanner_filter %}&scanner={{ scanner_filter }}{% endif %}{% if search %}&search={{ search }}{% endif %}">{{ p }}</a>
-                            </li>
-                            {% elif p == 4 or p == total_pages - 3 %}
-                            <li class="page-item disabled"><span class="page-link">...</span></li>
-                            {% endif %}
-                            {% endfor %}
-                            <li class="page-item {% if page >= total_pages %}disabled{% endif %}">
-                                <a class="page-link" href="?page={{ page + 1 }}{% if severity_filter %}&severity={{ severity_filter }}{% endif %}{% if scanner_filter %}&scanner={{ scanner_filter }}{% endif %}{% if search %}&search={{ search }}{% endif %}">Next</a>
-                            </li>
-                        </ul>
-                    </nav>
-                </div>
-                {% endif %}
             </div>
 
         </div>
@@ -898,5 +818,96 @@ document.getElementById('dlpForm')?.addEventListener('submit', function() {
     // the route preserves the stored value instead of writing the empty default.
     document.getElementById('dlpJsonReady').value = '1';
 });
+
+// ==================== DLP alerts: AJAX filter + export ====================
+(function () {
+    const form = document.getElementById('dlpFilterForm');
+    const container = document.getElementById('dlpAlertsContainer');
+    if (!form || !container) return;
+
+    function currentParams() {
+        const p = new URLSearchParams();
+        for (const el of form.querySelectorAll('[name]')) {
+            if (el.value) p.set(el.name, el.value);
+        }
+        return p;
+    }
+
+    let reqSeq = 0;
+    async function load(params, push) {
+        const qs = params.toString();
+        const seq = ++reqSeq;
+        container.style.opacity = '0.5';
+        try {
+            const resp = await fetch('/admin/dlp/alerts/partial?' + qs, {
+                headers: { 'X-Requested-With': 'fetch' },
+            });
+            if (seq !== reqSeq) return;            // a newer request superseded this one
+            if (!resp.ok) { window.location.search = qs; return; }  // fall back to full nav
+            container.innerHTML = await resp.text();
+            const holder = container.querySelector('[data-dlp-total]');
+            const badge = document.getElementById('dlpMatchCount');
+            if (holder && badge) {
+                const n = parseInt(holder.getAttribute('data-dlp-total'), 10) || 0;
+                badge.textContent = n + ' ' + (n === 1 ? 'match' : 'matches');
+            }
+            if (push) history.replaceState(null, '', qs ? '/admin/dlp?' + qs : '/admin/dlp');
+        } catch (e) {
+            window.location.search = qs;           // network error -> full navigation
+        } finally {
+            if (seq === reqSeq) container.style.opacity = '';
+        }
+    }
+
+    // Selects and date inputs: react immediately, no page reload / scroll jump.
+    form.querySelectorAll('.dlp-filter').forEach(function (el) {
+        el.addEventListener('change', function () { load(currentParams(), true); });
+    });
+
+    // Search: debounce keystrokes.
+    const search = document.getElementById('dlpSearch');
+    if (search) {
+        let t = null;
+        search.addEventListener('input', function () {
+            clearTimeout(t);
+            t = setTimeout(function () { load(currentParams(), true); }, 350);
+        });
+    }
+
+    // Submit button / Enter: intercept so it swaps instead of reloading.
+    form.addEventListener('submit', function (e) { e.preventDefault(); load(currentParams(), true); });
+
+    // Pagination links inside the swapped container: intercept via delegation.
+    container.addEventListener('click', function (e) {
+        const a = e.target.closest('a.page-link');
+        if (!a) return;
+        const href = a.getAttribute('href') || '';
+        if (!href.startsWith('?')) return;
+        e.preventDefault();
+        load(new URLSearchParams(href.slice(1)), true);
+    });
+
+    // Clear button.
+    const clear = document.getElementById('dlpClear');
+    if (clear) {
+        clear.addEventListener('click', function (e) {
+            e.preventDefault();
+            form.reset();
+            form.querySelectorAll('[name]').forEach(function (el) { el.value = ''; });
+            load(new URLSearchParams(), true);
+        });
+    }
+
+    // Export: build the export URL from the live filters + chosen format.
+    const exportBtn = document.getElementById('dlpExportBtn');
+    if (exportBtn) {
+        exportBtn.addEventListener('click', function () {
+            const p = currentParams();
+            const fmt = (document.getElementById('dlpExportFmt') || {}).value || 'csv';
+            p.set('format', fmt);
+            window.location.href = '/admin/dlp/alerts/export?' + p.toString();
+        });
+    }
+})();
 </script>
 {% endblock %}

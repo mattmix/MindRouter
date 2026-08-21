@@ -20,7 +20,7 @@ from typing import Optional
 from urllib.parse import quote_plus
 
 from fastapi import APIRouter, Depends, Form, Request
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.db import crud
@@ -38,6 +38,10 @@ VALID_SEVERITIES = ("minor", "moderate", "major")
 # so no alert row ever carries it and the alert filter keeps VALID_SEVERITIES.
 VALID_RULE_LEVELS = VALID_SEVERITIES + ("ignore",)
 VALID_SCANNERS = ("regex", "gliner", "llm")
+# Alert export: formats and a hard row cap so one click can't stream the whole
+# table into memory. The bundle is a zip regardless of the inner format.
+EXPORT_FORMATS = ("json", "jsonl", "csv")
+EXPORT_MAX_ROWS = 100_000
 
 # Caps on admin-supplied config.  Every one of these bounds work the DLP worker
 # performs per scanned request, so an unbounded value is a self-inflicted DoS.
@@ -191,6 +195,8 @@ async def admin_dlp_page(
     severity: Optional[str] = None,
     scanner: Optional[str] = None,
     search: Optional[str] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
     page: int = 1,
     db: AsyncSession = Depends(get_async_db),
 ):
@@ -277,8 +283,11 @@ async def admin_dlp_page(
     # Load alerts with pagination
     per_page = 25
     skip = (page - 1) * per_page
+    start_at = _parse_export_date(start_date)
+    end_at = _parse_export_date(end_date, end=True)
     alerts, total = await crud.get_dlp_alerts(
         db, severity=severity, scanner=scanner, search=search,
+        start_at=start_at, end_at=end_at,
         skip=skip, limit=per_page,
     )
     total_pages = max(1, (total + per_page - 1) // per_page)
@@ -302,9 +311,227 @@ async def admin_dlp_page(
             "severity_filter": severity,
             "scanner_filter": scanner,
             "search": search or "",
+            "start_date": (start_date or "").strip(),
+            "end_date": (end_date or "").strip(),
             "success": success,
             "error": error,
             "active": "dlp",
+        },
+    )
+
+
+def _parse_export_date(raw, *, end=False):
+    """Parse a YYYY-MM-DD (or full ISO) filter bound into an aware UTC datetime.
+
+    A bare date as the END bound becomes the START of the NEXT day so the whole
+    day is included (the query uses scanned_at < end_at). Returns None on empty
+    or unparseable input (the filter is simply not applied)."""
+    from datetime import datetime, timedelta, timezone
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    dt = None
+    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%d"):
+        try:
+            dt = datetime.strptime(raw, fmt)
+            break
+        except ValueError:
+            continue
+    if dt is None:
+        return None
+    if end and len(raw) == 10:  # date-only end bound -> include the full day
+        dt = dt + timedelta(days=1)
+    return dt.replace(tzinfo=timezone.utc)
+
+
+def _alert_to_record(a) -> dict:
+    """Flatten one DlpAlert (+ joined user/request) into a JSON-safe dict.
+
+    Matched snippets are already masked at scan time, so an export carries the
+    same masked metadata the console shows — never the verbatim sensitive value.
+    """
+    return {
+        "id": a.id,
+        "scanned_at": a.scanned_at.isoformat() if a.scanned_at else None,
+        "severity": a.severity,
+        "scanner": a.scanner,
+        "categories": list(a.categories or []),
+        "entities": list(a.entities or []),
+        "confidence": a.confidence,
+        "scan_latency_ms": a.scan_latency_ms,
+        "detail": a.detail,
+        "acknowledged": bool(a.acknowledged),
+        "acknowledged_at": a.acknowledged_at.isoformat() if a.acknowledged_at else None,
+        "user_id": a.user_id,
+        "user_email": (a.user.email if a.user else None),
+        "request_id": a.request_id,
+        "request_uuid": (a.request.request_uuid if a.request else None),
+    }
+
+
+def _render_export(records, fmt: str) -> bytes:
+    """Serialize the flattened records to the requested format (bytes)."""
+    if fmt == "jsonl":
+        return ("\n".join(json.dumps(r, ensure_ascii=False) for r in records) + ("\n" if records else "")).encode("utf-8")
+    if fmt == "csv":
+        import csv
+        import io
+        buf = io.StringIO()
+        cols = ["id", "scanned_at", "severity", "scanner", "categories", "entities",
+                "confidence", "scan_latency_ms", "detail", "acknowledged",
+                "acknowledged_at", "user_id", "user_email", "request_id", "request_uuid"]
+        w = csv.DictWriter(buf, fieldnames=cols, extrasaction="ignore")
+        w.writeheader()
+        for r in records:
+            row = dict(r)
+            # JSON-encode the nested list columns so a cell stays one field.
+            row["categories"] = json.dumps(row.get("categories") or [], ensure_ascii=False)
+            row["entities"] = json.dumps(row.get("entities") or [], ensure_ascii=False)
+            w.writerow(row)
+        return buf.getvalue().encode("utf-8")
+    # default: pretty JSON array
+    return json.dumps(records, ensure_ascii=False, indent=2).encode("utf-8")
+
+
+@dlp_router.get("/admin/dlp/alerts/export")
+async def export_dlp_alerts(
+    request: Request,
+    severity: Optional[str] = None,
+    scanner: Optional[str] = None,
+    search: Optional[str] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    format: str = "json",
+    db: AsyncSession = Depends(get_async_db),
+):
+    """Export filtered DLP alerts as a zipped bundle (admins + auditors).
+
+    The zip contains the data file (dlp_alerts.<fmt>) plus a manifest.json
+    recording the filters, row count, generator, and UTC timestamp so an
+    offline analyst knows exactly what the extract represents.
+    """
+    user, redirect = await _require_admin_read(request, db)
+    if redirect:
+        return redirect
+
+    fmt = (format or "json").strip().lower()
+    if fmt not in EXPORT_FORMATS:
+        return _err(f"Unknown export format '{fmt[:20]}' — choose json, jsonl, or csv")
+
+    sev = (severity or "").strip() or None
+    scn = (scanner or "").strip() or None
+    q = (search or "").strip() or None
+    if sev not in VALID_SEVERITIES:
+        sev = None
+    if scn not in VALID_SCANNERS:
+        scn = None
+    start_at = _parse_export_date(start_date)
+    end_at = _parse_export_date(end_date, end=True)
+
+    alerts, total = await crud.get_dlp_alerts(
+        db, severity=sev, scanner=scn, search=q,
+        start_at=start_at, end_at=end_at,
+        skip=0, limit=EXPORT_MAX_ROWS,
+    )
+    records = [_alert_to_record(a) for a in alerts]
+    truncated = total > EXPORT_MAX_ROWS
+
+    data_bytes = _render_export(records, fmt)
+
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
+    stamp = now.strftime("%Y%m%d_%H%M%SZ")
+    manifest = {
+        "generated_at": now.isoformat(),
+        "generated_by": getattr(user, "email", None),
+        "source": "MindRouter DLP alert export",
+        "format": fmt,
+        "filters": {
+            "severity": sev, "scanner": scn, "search": q,
+            "start_date": start_date or None, "end_date": end_date or None,
+        },
+        "row_count": len(records),
+        "total_matched": total,
+        "truncated": truncated,
+        "max_rows": EXPORT_MAX_ROWS,
+        "note": "Matched snippets are masked at scan time; this export never contains verbatim sensitive values.",
+    }
+
+    import io
+    import zipfile
+    zbuf = io.BytesIO()
+    with zipfile.ZipFile(zbuf, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr(f"dlp_alerts.{fmt}", data_bytes)
+        z.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8"))
+    zbuf.seek(0)
+
+    logger.info(
+        "dlp_alerts_exported",
+        user_id=getattr(user, "id", None),
+        rows=len(records), total=total, format=fmt, truncated=truncated,
+    )
+    filename = f"dlp_alerts_{stamp}.zip"
+    return StreamingResponse(
+        zbuf,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@dlp_router.get("/admin/dlp/alerts/partial", response_class=HTMLResponse)
+async def dlp_alerts_partial(
+    request: Request,
+    severity: Optional[str] = None,
+    scanner: Optional[str] = None,
+    search: Optional[str] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    page: int = 1,
+    db: AsyncSession = Depends(get_async_db),
+):
+    """Render just the alerts table + pagination for the AJAX filter swap.
+
+    Same auth and filters as the full page; returns the shared partial so the
+    two never drift. Admins and auditors only."""
+    user, redirect = await _require_admin_read(request, db)
+    if redirect:
+        # A fetch() can't follow a login redirect usefully; signal with 401/403.
+        code = 401 if isinstance(redirect, RedirectResponse) and "login" in str(redirect.headers.get("location", "")) else 403
+        return HTMLResponse("", status_code=code)
+
+    severity = (severity or "").strip() or None
+    scanner = (scanner or "").strip() or None
+    search = (search or "").strip() or None
+    if severity not in VALID_SEVERITIES:
+        severity = None
+    if scanner not in VALID_SCANNERS:
+        scanner = None
+    start_at = _parse_export_date(start_date)
+    end_at = _parse_export_date(end_date, end=True)
+
+    per_page = 25
+    page = max(1, page)
+    skip = (page - 1) * per_page
+    alerts, total = await crud.get_dlp_alerts(
+        db, severity=severity, scanner=scanner, search=search,
+        start_at=start_at, end_at=end_at, skip=skip, limit=per_page,
+    )
+    total_pages = max(1, (total + per_page - 1) // per_page)
+    masq = await _admin_masquerade_context(request, user, db)
+    return templates.TemplateResponse(
+        "admin/_dlp_alerts_table.html",
+        {
+            "request": request,
+            **masq,
+            "alerts": alerts,
+            "total": total,
+            "page": page,
+            "total_pages": total_pages,
+            "severity_filter": severity,
+            "scanner_filter": scanner,
+            "search": search or "",
+            "start_date": (start_date or "").strip(),
+            "end_date": (end_date or "").strip(),
         },
     )
 

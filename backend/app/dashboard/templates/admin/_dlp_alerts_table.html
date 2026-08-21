@@ -1,0 +1,121 @@
+{# Partial: DLP alerts table + pagination. Rendered standalone by
+   GET /admin/dlp/alerts/partial for the AJAX filter swap, and included
+   by admin/dlp.html on first load. Keep it self-contained. #}
+<span data-dlp-total="{{ total | default(0) }}" hidden></span>
+                    <div class="table-responsive">
+                        <table class="table table-hover mb-0">
+                            <thead>
+                                <tr>
+                                    <th>ID</th>
+                                    <th>Severity</th>
+                                    <th>Scanner</th>
+                                    <th>Categories</th>
+                                    <th>Matched</th>
+                                    <th>User</th>
+                                    <th>Request</th>
+                                    <th>Latency</th>
+                                    <th>Time</th>
+                                    <th>Status</th>
+                                    {% if not is_read_only %}<th>Action</th>{% endif %}
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {% for alert in alerts %}
+                                <tr>
+                                    <td>{{ alert.id }}</td>
+                                    <td>
+                                        {% if alert.severity == 'major' %}
+                                        <span class="badge bg-danger">Major</span>
+                                        {% elif alert.severity == 'moderate' %}
+                                        <span class="badge bg-warning text-dark">Moderate</span>
+                                        {% else %}
+                                        <span class="badge bg-info">Minor</span>
+                                        {% endif %}
+                                    </td>
+                                    <td><span class="badge bg-secondary">{{ alert.scanner }}</span></td>
+                                    <td>
+                                        {% if alert.categories %}
+                                        {% for cat in alert.categories[:3] %}
+                                        <span class="badge bg-light text-dark">{{ cat }}</span>
+                                        {% endfor %}
+                                        {% if alert.categories | length > 3 %}
+                                        <span class="text-muted small">+{{ alert.categories | length - 3 }}</span>
+                                        {% endif %}
+                                        {% endif %}
+                                    </td>
+                                    <td>
+                                        {# Snippets are masked at scan time — an alert row never stores the
+                                           verbatim match.  Open the linked request to see full context. #}
+                                        {% if alert.entities %}
+                                        {% for ent in alert.entities[:3] %}
+                                        <div><code class="small">{{ ent.text }}</code>
+                                            <span class="text-muted small">{{ ent.category }}</span></div>
+                                        {% endfor %}
+                                        {% if alert.entities | length > 3 %}
+                                        <span class="text-muted small">+{{ alert.entities | length - 3 }} more</span>
+                                        {% endif %}
+                                        {% else %}
+                                        <span class="text-muted small">&mdash;</span>
+                                        {% endif %}
+                                    </td>
+                                    <td>{{ alert.user.email if alert.user else 'N/A' }}</td>
+                                    <td>
+                                        {% if alert.request and alert.request.request_uuid %}
+                                        <a href="/admin/audit?request_uuid={{ alert.request.request_uuid }}" class="text-decoration-none" title="View this request in the audit log">#{{ alert.request_id }}</a>
+                                        {% elif alert.request_id %}
+                                        <span class="text-muted">#{{ alert.request_id }}</span>
+                                        {% else %}
+                                        N/A
+                                        {% endif %}
+                                    </td>
+                                    <td>{{ alert.scan_latency_ms }}ms</td>
+                                    <td><small>{{ alert.scanned_at.strftime('%Y-%m-%d %H:%M') if alert.scanned_at else '' }}</small></td>
+                                    <td>
+                                        {% if alert.acknowledged %}
+                                        <span class="badge bg-success" title="Acknowledged by {{ alert.acknowledger.email if alert.acknowledger else '?' }}">Acked</span>
+                                        {% else %}
+                                        <span class="badge bg-secondary text-white">Open</span>
+                                        {% endif %}
+                                    </td>
+                                    {% if not is_read_only %}
+                                    <td>
+                                        {% if not alert.acknowledged %}
+                                        <button class="btn btn-sm btn-outline-success" onclick="ackAlert({{ alert.id }})" title="Acknowledge">
+                                            <i class="bi bi-check-lg"></i>
+                                        </button>
+                                        {% endif %}
+                                    </td>
+                                    {% endif %}
+                                </tr>
+                                {% endfor %}
+                                {% if not alerts %}
+                                <tr>
+                                    <td colspan="{{ 10 if is_read_only else 11 }}" class="text-center text-muted py-4">No DLP alerts found.</td>
+                                </tr>
+                                {% endif %}
+                            </tbody>
+                        </table>
+                    </div>
+                {% if total_pages > 1 %}
+                <div class="p-2 border-top" style="background:transparent;">
+                    <nav aria-label="DLP alerts pagination">
+                        <ul class="pagination justify-content-center mb-0">
+                            <li class="page-item {% if page <= 1 %}disabled{% endif %}">
+                                <a class="page-link" href="?page={{ page - 1 }}{% if severity_filter %}&severity={{ severity_filter }}{% endif %}{% if scanner_filter %}&scanner={{ scanner_filter }}{% endif %}{% if search %}&search={{ search }}{% endif %}{% if start_date %}&start_date={{ start_date }}{% endif %}{% if end_date %}&end_date={{ end_date }}{% endif %}">Previous</a>
+                            </li>
+                            {% for p in range(1, total_pages + 1) %}
+                            {% if p == page or (p <= 3) or (p >= total_pages - 2) or (p >= page - 1 and p <= page + 1) %}
+                            <li class="page-item {% if p == page %}active{% endif %}">
+                                <a class="page-link" href="?page={{ p }}{% if severity_filter %}&severity={{ severity_filter }}{% endif %}{% if scanner_filter %}&scanner={{ scanner_filter }}{% endif %}{% if search %}&search={{ search }}{% endif %}{% if start_date %}&start_date={{ start_date }}{% endif %}{% if end_date %}&end_date={{ end_date }}{% endif %}">{{ p }}</a>
+                            </li>
+                            {% elif p == 4 or p == total_pages - 3 %}
+                            <li class="page-item disabled"><span class="page-link">...</span></li>
+                            {% endif %}
+                            {% endfor %}
+                            <li class="page-item {% if page >= total_pages %}disabled{% endif %}">
+                                <a class="page-link" href="?page={{ page + 1 }}{% if severity_filter %}&severity={{ severity_filter }}{% endif %}{% if scanner_filter %}&scanner={{ scanner_filter }}{% endif %}{% if search %}&search={{ search }}{% endif %}{% if start_date %}&start_date={{ start_date }}{% endif %}{% if end_date %}&end_date={{ end_date }}{% endif %}">Next</a>
+                            </li>
+                        </ul>
+                    </nav>
+                </div>
+                {% endif %}

@@ -21,7 +21,7 @@ from enum import Enum as PyEnum
 import time as _time
 from typing import Any, Dict, List, Optional, Tuple
 
-from sqlalchemy import DateTime as SADateTime, and_, case, delete, exists, func, or_, select, update
+from sqlalchemy import DateTime as SADateTime, and_, case, delete, exists, func, or_, select, update, cast, String
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -4550,10 +4550,15 @@ async def get_dlp_alerts(
     user_id: Optional[int] = None,
     search: Optional[str] = None,
     acknowledged: Optional[bool] = None,
+    start_at: Optional[datetime] = None,
+    end_at: Optional[datetime] = None,
     skip: int = 0,
     limit: int = 50,
 ) -> Tuple[List[DlpAlert], int]:
-    """Query DLP alerts with filters and pagination."""
+    """Query DLP alerts with filters and pagination.
+
+    start_at/end_at bound scanned_at (inclusive lower, exclusive upper) for the
+    admin export's date-range filter."""
     query = select(DlpAlert).options(
         selectinload(DlpAlert.user),
         selectinload(DlpAlert.acknowledger),
@@ -4582,9 +4587,17 @@ async def get_dlp_alerts(
         filt = or_(
             DlpAlert.detail.ilike(like_pat),
             DlpAlert.severity.ilike(like_pat),
+            DlpAlert.scanner.ilike(like_pat),
+            cast(DlpAlert.categories, String).ilike(like_pat),
         )
         query = query.where(filt)
         count_query = count_query.where(filt)
+    if start_at is not None:
+        query = query.where(DlpAlert.scanned_at >= start_at)
+        count_query = count_query.where(DlpAlert.scanned_at >= start_at)
+    if end_at is not None:
+        query = query.where(DlpAlert.scanned_at < end_at)
+        count_query = count_query.where(DlpAlert.scanned_at < end_at)
 
     total = (await db.execute(count_query)).scalar() or 0
     result = await db.execute(
