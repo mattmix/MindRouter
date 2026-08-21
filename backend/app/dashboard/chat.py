@@ -35,6 +35,7 @@ from backend.app.core.pathsafe import PathEscapeError, resolve_under
 from backend.app.core.telemetry.registry import get_registry
 from backend.app.core.translators.openai_in import OpenAIInTranslator
 from backend.app.db import crud
+from backend.app.security.api_keys import first_live_api_key
 from backend.app.db import chat_crud
 from backend.app.db.models import ApiKey, User
 from backend.app.db.session import get_async_db, get_async_db_context
@@ -88,13 +89,14 @@ async def _get_chat_user(
         raise HTTPException(status_code=401, detail="Not authenticated")
 
     api_keys = await crud.get_user_api_keys(db, user_id, include_revoked=False)
-    if not api_keys:
+    live_key = first_live_api_key(api_keys)
+    if live_key is None:
         raise HTTPException(
             status_code=403,
-            detail="No active API key. Create one in your dashboard first.",
+            detail="No active API key. Create or renew one in your dashboard first.",
         )
 
-    return user, api_keys[0]
+    return user, live_key
 
 
 def _sharded_path(base_dir: str, attachment_id: int, suffix: str) -> str:
@@ -383,7 +385,7 @@ async def chat_page(
 
     # Check if user has an API key
     api_keys = await crud.get_user_api_keys(db, effective_id, include_revoked=False)
-    has_api_key = len(api_keys) > 0
+    has_api_key = first_live_api_key(api_keys) is not None
 
     # Voice feature flags
     voice_tts_enabled = await crud.get_config_json(db, "voice.tts_enabled", False)
@@ -755,7 +757,8 @@ async def chat_upload(
                             ocr_api_keys = await crud.get_user_api_keys(
                                 db, user_id, include_revoked=False
                             )
-                            if ocr_user and ocr_api_keys:
+                            ocr_live_key = first_live_api_key(ocr_api_keys)
+                            if ocr_user and ocr_live_key:
                                 ocr_result = await perform_ocr(
                                     file_bytes=file_bytes,
                                     content_type="application/pdf",
@@ -767,7 +770,7 @@ async def chat_upload(
                                     dpi=ocr_config["dpi"],
                                     ocr_config=ocr_config,
                                     user=ocr_user,
-                                    api_key=ocr_api_keys[0],
+                                    api_key=ocr_live_key,
                                     http_request=request,
                                 )
                                 extracted_text = ocr_result["content"]

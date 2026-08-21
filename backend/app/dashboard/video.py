@@ -26,6 +26,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from backend.app.api.video_api import submit_video_job, _job_to_dict
 from backend.app.dashboard.routes import get_masquerade_user_id, get_session_user_id
 from backend.app.db import crud
+from backend.app.security.api_keys import first_live_api_key
 import os as _os
 
 from backend.app.db.models import ApiKey, User, VideoJobStatus
@@ -58,12 +59,13 @@ async def _get_video_user(request: Request, db: AsyncSession) -> Tuple[User, Api
     if not user.video_generation_enabled:
         raise HTTPException(status_code=403, detail="Video generation not enabled for your account")
     api_keys = await crud.get_user_api_keys(db, user_id, include_revoked=False)
-    if not api_keys:
+    live_key = first_live_api_key(api_keys)
+    if live_key is None:
         raise HTTPException(
             status_code=403,
-            detail="No active API key. Create one in your dashboard first.",
+            detail="No active API key. Create or renew one in your dashboard first.",
         )
-    return user, api_keys[0]
+    return user, live_key
 
 
 @video_router.get("/video", response_class=HTMLResponse)
@@ -103,7 +105,7 @@ async def video_page(request: Request, db: AsyncSession = Depends(get_async_db))
             "default_quality": default_quality,
             "min_seconds": await crud.get_config_json(db, "vid.min_seconds", 4),
             "max_seconds": max_total_seconds,
-            "has_api_key": len(api_keys) > 0,
+            "has_api_key": first_live_api_key(api_keys) is not None,
             "storage_cap_gb": int(await crud.get_config_json(db, "vid.user_storage_cap_gb", 50)),
             "storage_used_gb": round(await crud.get_user_video_storage_bytes(db, user_id) / 1024**3, 2),
         },

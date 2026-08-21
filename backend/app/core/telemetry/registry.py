@@ -1480,7 +1480,14 @@ class BackendRegistry:
                 logger.error("telemetry_cleanup_error", error=str(e))
 
     async def _cleanup_old_telemetry(self) -> None:
-        """Delete telemetry data older than retention period and expired API keys."""
+        """Delete telemetry data older than retention period, then run API key
+        expiry maintenance.
+
+        Two sessions on purpose: the key prune used to share the telemetry
+        session and failed every hour on an FK (requests.api_key_id), which
+        rolled the telemetry deletes back with it.  A failure in either half
+        is now logged and contained to that half.
+        """
         cutoff = datetime.now(timezone.utc) - timedelta(
             days=self._settings.telemetry_retention_days
         )
@@ -1489,10 +1496,23 @@ class BackendRegistry:
             deleted_bt = await crud.delete_old_telemetry(db, older_than=cutoff)
             deleted_gdt = await crud.delete_old_gpu_telemetry(db, older_than=cutoff)
             deleted_nt = await crud.delete_old_node_telemetry(db, older_than=cutoff)
-            deleted_keys = await crud.delete_expired_api_keys(db, grace_days=15)
 
-        if deleted_keys:
-            logger.info("expired_api_keys_cleaned_up", deleted=deleted_keys)
+        try:
+            async with get_async_db_context() as db:
+                # 1. Truth first: any active key past expires_at becomes
+                #    status=expired (the owner can Renew it from the dashboard).
+                expired = await crud.expire_overdue_api_keys(db)
+                # 2. Prune expired keys past the grace period that nothing
+                #    references; keys with history are kept for the audit trail.
+                deleted_keys = await crud.delete_expired_api_keys(db, grace_days=15)
+            if expired or deleted_keys:
+                logger.info(
+                    "api_key_expiry_maintenance",
+                    marked_expired=expired,
+                    deleted_unreferenced=deleted_keys,
+                )
+        except Exception as e:
+            logger.error("api_key_expiry_maintenance_error", error=str(e))
 
         if deleted_bt or deleted_gdt:
             logger.info(

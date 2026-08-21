@@ -88,6 +88,15 @@
                     <div class="alert alert-warning" role="alert">
                         Key not found or not revocable — service keys need a revocation request instead.
                     </div>
+                    {% elif key_error == 'not_renewable' %}
+                    <div class="alert alert-warning" role="alert">
+                        That key can't be renewed — revoked keys stay revoked, and service keys never expire.
+                    </div>
+                    {% endif %}
+                    {% if key_success == 'renewed' %}
+                    <div class="alert alert-success" role="alert">
+                        <i class="bi bi-check-circle me-1"></i>Key renewed for another {{ key_expiry_days }} days. The key itself is unchanged — nothing to update in your applications.
+                    </div>
                     {% endif %}
                     {% if api_keys %}
                     <div class="table-responsive">
@@ -105,7 +114,7 @@
                             </thead>
                             <tbody>
                                 {% for key in api_keys %}
-                                {% set is_expired = key.expires_at and key.expires_at.replace(tzinfo=None) < now_utc.replace(tzinfo=None) %}
+                                {% set is_expired = key.status.value == 'expired' or (key.expires_at and key.expires_at.replace(tzinfo=None) < now_utc.replace(tzinfo=None)) %}
                                 {% set pending_svc_req = namespace(found=false) %}
                                 {% for sr in service_key_requests if sr.api_key_id == key.id and sr.status.value == 'pending' %}
                                     {% set pending_svc_req.found = true %}
@@ -160,6 +169,11 @@
                                                 </button>
                                                 {% endif %}
                                             {% else %}
+                                                <form method="POST" action="/dashboard/renew-key/{{ key.id }}" style="display: inline;">
+                                                    <button type="submit" class="btn btn-sm btn-outline-success" title="Extend this same key by {{ key_expiry_days }} days from today">
+                                                        <i class="bi bi-arrow-repeat"></i> Renew
+                                                    </button>
+                                                </form>
                                                 <form method="POST" action="/dashboard/revoke-key/{{ key.id }}" style="display: inline;">
                                                     <button type="submit" class="btn btn-sm btn-outline-danger" onclick="return confirm('Are you sure you want to revoke this key?')">
                                                         Revoke
@@ -171,6 +185,17 @@
                                                 </button>
                                                 {% endif %}
                                             {% endif %}
+                                        {% elif is_expired and key.status.value != 'revoked' and not key.is_service %}
+                                            <form method="POST" action="/dashboard/renew-key/{{ key.id }}" style="display: inline;">
+                                                <button type="submit" class="btn btn-sm btn-success" title="Reactivate this same key for {{ key_expiry_days }} days from today">
+                                                    <i class="bi bi-arrow-repeat"></i> Renew
+                                                </button>
+                                            </form>
+                                            <form method="POST" action="/dashboard/revoke-key/{{ key.id }}" style="display: inline;">
+                                                <button type="submit" class="btn btn-sm btn-outline-danger" onclick="return confirm('Revoke this expired key permanently?')">
+                                                    Revoke
+                                                </button>
+                                            </form>
                                         {% endif %}
                                     </td>
                                 </tr>

@@ -21,7 +21,7 @@ from enum import Enum as PyEnum
 import time as _time
 from typing import Any, Dict, List, Optional, Tuple
 
-from sqlalchemy import DateTime as SADateTime, and_, case, delete, func, or_, select, update
+from sqlalchemy import DateTime as SADateTime, and_, case, delete, exists, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -1104,11 +1104,86 @@ async def get_user_api_keys(
     """
     query = select(ApiKey).where(ApiKey.user_id == user_id)
     if not include_revoked:
-        query = query.where(ApiKey.status == ApiKeyStatus.ACTIVE)
+        # Not-revoked, i.e. active OR expired: an expired key must still be
+        # listed so its owner can Renew it.  Callers that need a key they can
+        # actually USE (the chat/image/video pickers) go through
+        # first_live_api_key(), never [0] of this list.
+        query = query.where(ApiKey.status.in_([ApiKeyStatus.ACTIVE, ApiKeyStatus.EXPIRED]))
     if not include_hidden:
         query = query.where(ApiKey.hidden.is_(False))
     result = await db.execute(query)
     return list(result.scalars().all())
+
+
+async def renew_api_key(
+    db: AsyncSession,
+    api_key_id: int,
+    *,
+    owner_user_id: int,
+    expiry_days: int,
+    max_active: Optional[int] = None,
+) -> Optional[ApiKey]:
+    """Renew the SAME key for another period (self-service).
+
+    max_active: when set and the key is currently ``expired``, renewing is
+        refused (ValueError("limit")) if the owner already has that many
+        active keys — otherwise expire-then-renew would sidestep the per-group
+        key cap that create enforces.
+
+    The secret is untouched — integrations keep working — only ``expires_at``
+    moves to now + expiry_days (the owner's group lifetime) and an ``expired``
+    status flips back to ``active``.  Owner-scoped (the ownership check),
+    non-service only (service keys never expire), and never a revoked key:
+    revocation is a security action and must not be undone from here.
+
+    Returns the renewed key, or None if no key matched the scope.
+    """
+    days = max(1, int(expiry_days))
+    result = await db.execute(
+        select(ApiKey).where(
+            ApiKey.id == api_key_id,
+            ApiKey.user_id == owner_user_id,
+            ApiKey.is_service.is_(False),
+            ApiKey.status.in_([ApiKeyStatus.ACTIVE, ApiKeyStatus.EXPIRED]),
+        )
+    )
+    api_key = result.scalar_one_or_none()
+    if api_key:
+        if (
+            max_active is not None
+            and api_key.status == ApiKeyStatus.EXPIRED
+            and await count_user_active_api_keys(db, owner_user_id) >= max_active
+        ):
+            raise ValueError("limit")
+        api_key.expires_at = datetime.now(timezone.utc) + timedelta(days=days)
+        api_key.status = ApiKeyStatus.ACTIVE
+        await db.flush()
+    return api_key
+
+
+async def expire_overdue_api_keys(db: AsyncSession) -> int:
+    """Flip active non-service keys whose ``expires_at`` has passed to
+    ``status = expired``.
+
+    Expiry used to be evaluated only lazily at use time, so the status column
+    lied (``active``) for every overdue key and any reader that filtered on
+    status alone — the dashboard's key pickers — kept accepting them.  Rows
+    are kept (request history references them); the user can Renew.
+    """
+    now = datetime.now(timezone.utc)
+    result = await db.execute(
+        update(ApiKey)
+        .where(
+            ApiKey.is_service.is_(False),
+            ApiKey.status == ApiKeyStatus.ACTIVE,
+            ApiKey.expires_at.isnot(None),
+            ApiKey.expires_at < now,
+        )
+        .values(status=ApiKeyStatus.EXPIRED)
+        .execution_options(synchronize_session=False)
+    )
+    await db.flush()
+    return result.rowcount or 0
 
 
 async def revoke_api_key(
@@ -2779,21 +2854,45 @@ async def delete_old_node_telemetry(
 async def delete_expired_api_keys(
     db: AsyncSession, grace_days: int = 15
 ) -> int:
-    """Delete API keys that have been expired for more than grace_days.
+    """Delete API keys that have been expired for more than grace_days AND
+    are referenced by nothing.
 
     Service keys are excluded — they never expire and are admin-managed.
+
+    Several tables (requests, video jobs/assets, telemetry, …) carry an FK to
+    api_keys.id with no ON DELETE action, so the old unconditional DELETE
+    raised MariaDB 1451 on the first key that had ever been used — every run,
+    for months — and nothing was ever pruned.  Every referencing FK is
+    discovered from the metadata and excluded with NOT EXISTS, so a key with
+    history stays (as ``expired``, see expire_overdue_api_keys) and only
+    never-used keys are removed.
     """
     cutoff = datetime.now(timezone.utc) - timedelta(days=grace_days)
-    result = await db.execute(
-        delete(ApiKey).where(
-            ApiKey.is_service.is_(False),
-            ApiKey.expires_at.isnot(None),
-            ApiKey.expires_at < cutoff,
-            ApiKey.status.in_([ApiKeyStatus.ACTIVE, ApiKeyStatus.EXPIRED]),
-        )
+    stmt = delete(ApiKey).where(
+        ApiKey.is_service.is_(False),
+        ApiKey.expires_at.isnot(None),
+        ApiKey.expires_at < cutoff,
+        ApiKey.status.in_([ApiKeyStatus.ACTIVE, ApiKeyStatus.EXPIRED]),
     )
+    for column in _columns_referencing(ApiKey.__table__):
+        stmt = stmt.where(~exists().where(column == ApiKey.id))
+    result = await db.execute(stmt.execution_options(synchronize_session=False))
     await db.flush()
-    return result.rowcount
+    return result.rowcount or 0
+
+
+def _columns_referencing(table):
+    """Every column in the schema whose FK points at ``table`` — derived from
+    the metadata so a new referencing table can't silently re-break the prune."""
+    from backend.app.db.models import Base
+
+    cols = []
+    for t in Base.metadata.tables.values():
+        for c in t.columns:
+            for fk in c.foreign_keys:
+                if fk.column.table is table:
+                    cols.append(c)
+    return cols
 
 
 async def count_user_active_api_keys(db: AsyncSession, user_id: int) -> int:

@@ -26,6 +26,7 @@ from sqlalchemy import select, func, desc
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.db import crud
+from backend.app.security.api_keys import first_live_api_key
 from backend.app.db.models import ApiKey, User, UserImage
 from backend.app.db.session import get_async_db
 from backend.app.dashboard.routes import get_session_user_id, get_effective_user_id, get_masquerade_user_id
@@ -76,13 +77,14 @@ async def _get_image_user(
         raise HTTPException(status_code=403, detail="Image generation not enabled for your account")
 
     api_keys = await crud.get_user_api_keys(db, user_id, include_revoked=False)
-    if not api_keys:
+    live_key = first_live_api_key(api_keys)
+    if live_key is None:
         raise HTTPException(
             status_code=403,
-            detail="No active API key. Create one in your dashboard first.",
+            detail="No active API key. Create or renew one in your dashboard first.",
         )
 
-    return user, api_keys[0]
+    return user, live_key
 
 
 # ---------------------------------------------------------------------------
@@ -121,7 +123,7 @@ async def images_page(
 
     # Check if user has an API key
     api_keys = await crud.get_user_api_keys(db, user_id, include_revoked=False)
-    has_api_key = len(api_keys) > 0
+    has_api_key = first_live_api_key(api_keys) is not None
 
     # Masquerade context
     masquerade_user = None

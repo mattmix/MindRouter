@@ -842,6 +842,7 @@ async def user_dashboard(
     pw_error: Optional[str] = None,
     pw_success: Optional[str] = None,
     key_error: Optional[str] = None,
+    key_success: Optional[str] = None,
     db: AsyncSession = Depends(get_async_db),
 ):
     """User dashboard."""
@@ -918,6 +919,8 @@ async def user_dashboard(
             "pw_error": pw_error,
             "pw_success": pw_success,
             "key_error": key_error,
+            "key_success": key_success,
+            "key_expiry_days": user.group.api_key_expiry_days if user.group else 45,
             "max_keys": max_keys,
             "active_key_count": active_key_count,
             "now_utc": datetime.now(timezone.utc),
@@ -1210,6 +1213,50 @@ async def revoke_key(
     await db.commit()
 
     return RedirectResponse(url="/dashboard", status_code=302)
+
+
+@dashboard_router.post("/dashboard/renew-key/{key_id}")
+async def renew_key(
+    request: Request,
+    key_id: int,
+    db: AsyncSession = Depends(get_async_db),
+):
+    """Self-service renewal of the caller's own personal API key.
+
+    Same secret, new period: expires_at becomes now + the user's group key
+    lifetime (api_key_expiry_days, 45 by default) and an expired key is
+    reactivated.  Scoped to the session user and to non-service keys (service
+    keys never expire); a revoked key cannot be renewed.
+    """
+    user_id = get_session_user_id(request)
+    if not user_id:
+        return RedirectResponse(url="/login", status_code=302)
+    user = await crud.get_user_by_id(db, user_id)
+    if not user:
+        return RedirectResponse(url="/login", status_code=302)
+
+    expiry_days = user.group.api_key_expiry_days if user.group else 45
+    max_keys = user.group.max_api_keys if user.group else 16
+    try:
+        renewed = await crud.renew_api_key(
+            db, key_id, owner_user_id=user_id, expiry_days=expiry_days,
+            max_active=max_keys,
+        )
+    except ValueError:
+        # Reactivating an expired key counts against the same cap as create.
+        return RedirectResponse(url="/dashboard?key_error=limit", status_code=302)
+    if not renewed:
+        return RedirectResponse(
+            url="/dashboard?key_error=not_renewable", status_code=302
+        )
+    await crud.log_admin_action(
+        db, user_id=user_id, action="apikey.renew",
+        entity_type="api_key", entity_id=str(key_id),
+        ip_address=get_client_ip(request),
+        detail=f"self-service prefix={renewed.key_prefix} days={expiry_days}",
+    )
+    await db.commit()
+    return RedirectResponse(url="/dashboard?key_success=renewed", status_code=302)
 
 
 def _admin_redirect_target(redirect_to: Optional[str]) -> str:

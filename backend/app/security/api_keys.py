@@ -163,6 +163,35 @@ def api_key_rejection_reason(db_key: ApiKey) -> Optional[str]:
     return None
 
 
+def api_key_is_live(db_key: ApiKey) -> bool:
+    """Status + expiry check only (no user check — for callers that already
+    hold an authenticated session user and just need a usable key of theirs).
+    Service keys never expire."""
+    if db_key.status != ApiKeyStatus.ACTIVE:
+        return False
+    if db_key.is_service:
+        return True
+    expires_at = db_key.expires_at
+    if expires_at is None:
+        return True
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    return expires_at >= datetime.now(timezone.utc)
+
+
+def first_live_api_key(keys) -> Optional[ApiKey]:
+    """First key the caller may actually use, or None.
+
+    The dashboard chat/image/video pages used to take ``keys[0]`` filtered on
+    status alone, which let an expired key keep working from the web UI for
+    weeks after the API path had started rejecting it.
+    """
+    for k in keys or ():
+        if api_key_is_live(k):
+            return k
+    return None
+
+
 async def verify_api_key(db: AsyncSession, api_key: str) -> Optional[ApiKey]:
     """
     Verify an API key and return the ApiKey record if valid.

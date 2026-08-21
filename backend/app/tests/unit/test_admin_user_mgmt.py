@@ -372,3 +372,133 @@ class TestTemplates:
     def test_user_detail_key_actions(self):
         tpl = (_TEMPLATES_DIR / "admin" / "user_detail.html").read_text()
         assert "/admin/api-keys/{{ k.id }}/revoke" in tpl
+
+
+# ===================================================================
+# 2.9.49 — API key renewal + expiry lifecycle
+# ===================================================================
+
+REGISTRY_SRC = (_APP_DIR / "core" / "telemetry" / "registry.py").read_text()
+
+
+def _extract_method(source: str, name: str) -> str:
+    """Like _extract_function but for an indented (class) method."""
+    pattern = re.compile(
+        rf"^[ \t]+(?:async )?def {name}\(.*?(?=^[ \t]+@|^[ \t]+(?:async )?def |^class |\Z)",
+        re.DOTALL | re.MULTILINE,
+    )
+    match = pattern.search(source)
+    assert match, f"method {name} not found"
+    return match.group(0)
+SECURITY_SRC = (_APP_DIR / "security" / "api_keys.py").read_text()
+USER_DASHBOARD_HTML = (_TEMPLATES_DIR / "user" / "dashboard.html").read_text()
+
+
+class TestKeyRenewal:
+    """Renew = same secret, new period.  Owner-scoped, non-service, never a
+    revoked key; an expired key is reactivated but counts against the cap."""
+
+    def test_crud_renew_is_owner_scoped_and_excludes_service_and_revoked(self):
+        fn = _extract_function(CRUD_SRC, "renew_api_key")
+        assert "ApiKey.user_id == owner_user_id" in fn
+        assert "ApiKey.is_service.is_(False)" in fn
+        assert "ApiKey.status.in_([ApiKeyStatus.ACTIVE, ApiKeyStatus.EXPIRED])" in fn
+        assert "ApiKeyStatus.REVOKED" not in fn
+        # same key: only expires_at and status change, never key_hash/sha
+        assert "key_hash" not in fn and "key_sha256" not in fn
+        assert "api_key.status = ApiKeyStatus.ACTIVE" in fn
+
+    def test_crud_renew_enforces_the_key_cap_when_reactivating(self):
+        fn = _extract_function(CRUD_SRC, "renew_api_key")
+        assert "api_key.status == ApiKeyStatus.EXPIRED" in fn
+        assert "count_user_active_api_keys(db, owner_user_id) >= max_active" in fn
+        assert 'raise ValueError("limit")' in fn
+
+    def test_dashboard_renew_route_is_scoped_and_audited(self):
+        fn = _extract_function(ROUTES_SRC, "renew_key")
+        assert "owner_user_id=user_id" in fn
+        assert "api_key_expiry_days" in fn, "period comes from the group lifetime"
+        assert "max_active=max_keys" in fn
+        assert 'action="apikey.renew"' in fn
+        assert "key_error=limit" in fn and "key_error=not_renewable" in fn
+        assert "key_success=renewed" in fn
+        assert '@dashboard_router.post("/dashboard/renew-key/{key_id}")' in ROUTES_SRC
+
+    def test_dashboard_passes_success_and_period_to_template(self):
+        fn = _extract_function(ROUTES_SRC, "user_dashboard")
+        assert "key_success: Optional[str] = None" in fn
+        assert '"key_expiry_days"' in fn
+
+    def test_template_offers_renew_for_live_and_expired_keys(self):
+        html = USER_DASHBOARD_HTML
+        assert html.count('action="/dashboard/renew-key/{{ key.id }}"') == 2, \
+            "one Renew in the active branch, one in the expired branch"
+        assert "key_success == 'renewed'" in html
+        assert "key_error == 'not_renewable'" in html
+        # status=expired (set by the sweeper) renders as expired too
+        assert "key.status.value == 'expired' or" in html
+
+
+class TestKeyExpiryLifecycle:
+    """Overdue keys become status=expired hourly; pruning never hits the FK;
+    the web UI only ever uses a LIVE key."""
+
+    def test_sweeper_flips_overdue_active_keys(self):
+        fn = _extract_function(CRUD_SRC, "expire_overdue_api_keys")
+        assert "ApiKey.is_service.is_(False)" in fn
+        assert "ApiKey.status == ApiKeyStatus.ACTIVE" in fn
+        assert "ApiKey.expires_at < now" in fn
+        assert ".values(status=ApiKeyStatus.EXPIRED)" in fn
+
+    def test_prune_excludes_every_referencing_fk(self):
+        """The old DELETE failed every run with MariaDB 1451 (requests.api_key_id)."""
+        fn = _extract_function(CRUD_SRC, "delete_expired_api_keys")
+        assert "_columns_referencing(ApiKey.__table__)" in fn
+        assert "~exists().where(column == ApiKey.id)" in fn
+        helper = _extract_function(CRUD_SRC, "_columns_referencing")
+        assert "fk.column.table is table" in helper
+        assert "Base.metadata.tables" in helper
+
+    def test_referencing_fk_discovery_matches_the_models(self, models):
+        """Every ForeignKey to api_keys.id in models.py must be one the helper
+        would find — mutation guard against a hand-maintained list."""
+        src = (_DB_DIR / "models.py").read_text()
+        declared = src.count('ForeignKey("api_keys.id")')
+        assert declared >= 5, "expected requests, video, telemetry, … to reference api_keys"
+        # The helper is metadata-driven, so it needs no edit per new table:
+        # no referencing model is named in the prune itself.
+        prune = _extract_function(CRUD_SRC, "delete_expired_api_keys")
+        for model in ("Request.", "VideoJob.", "VideoAsset.", "Telemetry."):
+            assert model not in prune, model
+
+    def test_registry_runs_key_maintenance_in_its_own_session(self):
+        fn = _extract_method(REGISTRY_SRC, "_cleanup_old_telemetry")
+        # telemetry context closes before the key context opens
+        tel = fn.index("delete_old_node_telemetry")
+        keys = fn.index("expire_overdue_api_keys")
+        assert tel < keys
+        assert fn.count("async with get_async_db_context() as db:") == 2
+        assert "delete_expired_api_keys(db, grace_days=15)" in fn
+        assert '"api_key_expiry_maintenance_error"' in fn
+
+    def test_web_pickers_use_first_live_key_not_index_zero(self):
+        for name in ("chat.py", "images.py", "video.py"):
+            src = (_DASHBOARD_DIR / name).read_text()
+            assert "api_keys[0]" not in src, name
+            assert "first_live_api_key(api_keys)" in src, name
+            assert "from backend.app.security.api_keys import first_live_api_key" in src, name
+        chat = (_DASHBOARD_DIR / "chat.py").read_text()
+        assert "ocr_api_keys[0]" not in chat and "first_live_api_key(ocr_api_keys)" in chat
+
+    def test_live_predicate_checks_status_and_expiry_and_spares_service_keys(self):
+        fn = _extract_function(SECURITY_SRC, "api_key_is_live")
+        assert "db_key.status != ApiKeyStatus.ACTIVE" in fn
+        assert "if db_key.is_service:" in fn and "return True" in fn
+        assert "expires_at >= datetime.now(timezone.utc)" in fn
+        picker = _extract_function(SECURITY_SRC, "first_live_api_key")
+        assert "api_key_is_live(k)" in picker
+
+    def test_user_key_list_keeps_expired_rows_visible(self):
+        """The dashboard must list an expired key so its owner can Renew it."""
+        fn = _extract_function(CRUD_SRC, "get_user_api_keys")
+        assert "ApiKey.status.in_([ApiKeyStatus.ACTIVE, ApiKeyStatus.EXPIRED])" in fn
