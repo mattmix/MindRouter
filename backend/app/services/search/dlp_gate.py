@@ -115,6 +115,7 @@ class QueryScreen:
     masked: List[dict] = field(default_factory=list)
     degraded: bool = False                 # a scanner failed to run
     rounds: int = 0                        # mask/rescan rounds actually used
+    widened: bool = False                  # a mask had to grow to cover a label
     original_query: str = ""               # exactly what the caller submitted
     # One entry per DLP pass, in order, each recording the text that was
     # scanned and whether it passed. This is the provenance trail: pass 1's
@@ -150,6 +151,7 @@ class QueryScreen:
             "masked": self.masked,
             "degraded": self.degraded,
             "rounds": self.rounds,
+            "widened": self.widened,
             "passes": self.passes,
             "reason": self.reason,
         }
@@ -246,16 +248,109 @@ def mask_span(text: str) -> str:
     return "".join(MASK_CHAR if not ch.isspace() else ch for ch in text or "")
 
 
-# Rounds of mask-then-rescan before giving up. The caller's contract is
+# Rounds of mask-then-rescan before giving up. Each round is one more scan, so
+# this is a latency ceiling as well as a safety one — but only for queries that
+# actually carry sensitive data; a clean query is scanned exactly once.
+# Widening (see _widen) can need two or three rounds to walk a mask outwards
+# past a label, which is what this allows room for. The caller's contract is
 # "redact, verify, and fail if it will not clear"; a bounded loop is that same
 # contract when one round of masking exposes a NEW span (the label word beside
 # the value it used to sit next to). It always terminates: a round that does
 # not change the text stops immediately, which is also what happens when the
 # scanner flags an already-masked run like "***********".
-MAX_REDACTION_ROUNDS = 3
+MAX_REDACTION_ROUNDS = 5
 
 
-def _mask_findings(text: str, findings, severity_rules) -> str:
+def _is_all_mask(value: str) -> bool:
+    """True when a reported span is already nothing but mask characters.
+
+    This is the signal that the scanner is reacting to CONTEXT rather than to
+    anything still readable: it flagged the placeholder we just wrote. Masking
+    it again would change nothing, so the mask has to grow outwards instead.
+    """
+    stripped = (value or "").strip()
+    return bool(stripped) and all(ch == MASK_CHAR or ch.isspace() for ch in stripped)
+
+
+# Function words carry no label meaning, so widening steps over them to reach
+# the word that does. Without this, "my ssn is ***********" would mask "is" —
+# burning a round and a word without removing what the scanner reacts to.
+# Deliberately tiny: this is a "skip the connective" list, not a stopword
+# corpus, and anything not on it is treated as a potential label.
+_FUNCTION_WORDS = frozenset({
+    "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "in", "is",
+    "it", "my", "of", "on", "or", "our", "the", "their", "there", "this",
+    "to", "was", "were", "with", "your",
+})
+
+# How many words to step back over while looking for the label.
+_WIDEN_LOOKBACK_WORDS = 3
+
+
+def _word_spans(text: str) -> List[Tuple[int, int]]:
+    """(start, end) of every whitespace-delimited token, in order."""
+    spans: List[Tuple[int, int]] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        while i < n and text[i].isspace():
+            i += 1
+        if i >= n:
+            break
+        j = i
+        while j < n and not text[j].isspace():
+            j += 1
+        spans.append((i, j))
+        i = j
+    return spans
+
+
+def _widen(text: str, start: int, end: int) -> Optional[Tuple[int, int]]:
+    """The span of the neighbouring LABEL word to mask as well, or None.
+
+    Returns a separate token span rather than a merged range, so the words in
+    between are left readable: "my ssn is ***********" becomes "my *** is
+    ***********", not "my *** ** ***********".
+
+    Left first — a label overwhelmingly precedes the value it names ("ssn
+    123-45-6789", "DOB: ...") — stepping over function words to reach the word
+    that actually carries the meaning. Only if nothing usable sits to the left
+    does it look right.
+    """
+    words = _word_spans(text)
+    before = [w for w in words if w[1] <= start]
+    after = [w for w in words if w[0] >= end]
+
+    for candidate in reversed(before[-_WIDEN_LOOKBACK_WORDS:]):
+        word = text[candidate[0]:candidate[1]].strip(".,:;!?").lower()
+        if not word or _is_all_mask(word):
+            continue
+        if word in _FUNCTION_WORDS:
+            continue
+        return candidate
+
+    for candidate in after[:_WIDEN_LOOKBACK_WORDS]:
+        word = text[candidate[0]:candidate[1]].strip(".,:;!?").lower()
+        if not word or _is_all_mask(word) or word in _FUNCTION_WORDS:
+            continue
+        return candidate
+    return None
+
+
+def _locate(text: str, finding) -> Optional[Tuple[int, int]]:
+    """Offsets of a finding in ``text``, trusting them only if they check out."""
+    value = getattr(finding, "text", "") or ""
+    if not value:
+        return None
+    start = getattr(finding, "start", 0) or 0
+    end = getattr(finding, "end", 0) or 0
+    if 0 <= start < end <= len(text) and text[start:end] == value:
+        return start, end
+    idx = text.find(value)
+    return (idx, idx + len(value)) if idx >= 0 else None
+
+
+def _mask_findings(text: str, findings, severity_rules, *, widen: bool = False) -> str:
     """Mask every non-ignored finding in ``text`` with asterisks.
 
     Offsets are used when they demonstrably line up with the reported text —
@@ -275,12 +370,20 @@ def _mask_findings(text: str, findings, severity_rules) -> str:
         value = getattr(f, "text", "") or ""
         if not value:
             continue
-        start = getattr(f, "start", 0) or 0
-        end = getattr(f, "end", 0) or 0
-        if 0 <= start < end <= len(text) and text[start:end] == value:
-            spans.append((start, end))
-        else:
+        located = _locate(text, f)
+        if located is None:
             values.append(value)
+            continue
+        start, end = located
+        spans.append((start, end))
+        # Widening applies only to spans the scanner reports that are ALREADY
+        # fully masked: masking those again is a no-op, so the label beside
+        # them is what has to go. A span with readable text left in it is
+        # masked exactly as reported.
+        if widen and _is_all_mask(value):
+            extra = _widen(text, start, end)
+            if extra is not None:
+                spans.append(extra)
 
     out = text
     # Right-to-left so each replacement leaves earlier offsets valid.
@@ -422,6 +525,17 @@ async def screen_query(db, query: str, *, dlp_config: Optional[dict] = None) -> 
         current_findings = findings
         for round_no in range(1, MAX_REDACTION_ROUNDS + 1):
             masked_text = _mask_findings(current, current_findings, severity_rules)
+            if masked_text == current:
+                # The scanner flagged something already masked: it is reacting
+                # to the words AROUND the mask (the label), so grow outwards
+                # rather than declaring defeat. This is what turns "my ssn is
+                # ***********" — which the scanners still read as an SSN —
+                # into "my *** is ***********", which they do not.
+                masked_text = _mask_findings(
+                    current, current_findings, severity_rules, widen=True
+                )
+                if masked_text != current:
+                    screen.widened = True
             screen.rounds = round_no
 
             if masked_text == current:

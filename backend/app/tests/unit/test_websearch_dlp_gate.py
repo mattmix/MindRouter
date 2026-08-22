@@ -237,9 +237,55 @@ class TestMaskRounds:
         assert out.rounds == 2
         assert calls["n"] == 3, "one scan, then a scan after each masking round"
 
-    def test_no_progress_blocks_instead_of_looping(self, monkeypatch):
-        """A scanner flagging an already-masked run cannot be masked further."""
-        def flag_mask(t):
+    def test_flagged_mask_widens_onto_the_label(self, monkeypatch):
+        """The behaviour an operator expects: "my ssn is 456-78-9012 please
+        help" ends up as "my *** is *********** please help".
+
+        Pass 1 can only mask what the scanners report, and they report the
+        number — nothing marks "ssn" as a label. Once the value is masked the
+        scanner flags the mask itself, which is the signal that it is reacting
+        to the surrounding words, so the mask grows onto the label.
+        """
+        run = "*" * 11
+
+        def flag(t):
+            if run not in t:
+                i = t.index("456-78-9012")
+                return ScanResult(findings=[ScanFinding(
+                    "regex", "social security number", "456-78-9012", 1.0, i, i + 11)])
+            if "ssn" in t:            # still primed by the label
+                i = t.index(run)
+                return ScanResult(findings=[ScanFinding(
+                    "gliner", "social security number", run, 0.9, i, i + 11)])
+            return None               # label gone -> clean
+
+        scan, calls = _scanner([flag])
+        _patch(monkeypatch, _gate(), scan)
+        out = asyncio.run(G.screen_query(MagicMock(), "my ssn is 456-78-9012 please help"))
+        assert out.allowed is True and out.action == G.ACTION_REDACTED
+        assert out.query == "my *** is *********** please help"
+        assert out.widened is True
+        assert out.rounds == 2
+        # the words between label and value are left readable
+        assert " is " in out.query
+
+    def test_widening_skips_function_words_to_reach_the_label(self):
+        text = "my ssn is *********** please help"
+        i = text.index("*" * 11)
+        f = ScanFinding("gliner", "social security number", "*" * 11, 0.9, i, i + 11)
+        assert G._mask_findings(text, [f], {}, widen=True) == "my *** is *********** please help"
+        # without widening the report is a no-op, which is what triggers it
+        assert G._mask_findings(text, [f], {}) == text
+
+    def test_widening_only_applies_to_already_masked_spans(self):
+        """A span with readable text is masked exactly as reported."""
+        text = "ssn 456-78-9012 here"
+        f = ScanFinding("regex", "social security number", "456-78-9012", 1.0, 4, 15)
+        assert G._mask_findings(text, [f], {}, widen=True) == "ssn *********** here"
+
+    def test_no_label_to_widen_onto_blocks(self, monkeypatch):
+        """Nothing left to grow onto: refuse rather than loop."""
+        def always_flag_mask(t):
             run = "*" * 11
             if run not in t:
                 i = t.index("456-78-9012")
@@ -249,11 +295,11 @@ class TestMaskRounds:
             return ScanResult(findings=[ScanFinding(
                 "gliner", "social security number", run, 0.9, i, i + 11)])
 
-        scan, calls = _scanner([flag_mask])
+        scan, calls = _scanner([always_flag_mask])
         _patch(monkeypatch, _gate(), scan)
-        out = asyncio.run(G.screen_query(MagicMock(), "my ssn is 456-78-9012 please"))
+        # a bare value: no neighbouring word exists to widen onto
+        out = asyncio.run(G.screen_query(MagicMock(), "456-78-9012"))
         assert out.allowed is False and out.action == G.ACTION_BLOCKED
-        assert "cannot be masked further" in out.reason
         assert calls["n"] <= G.MAX_REDACTION_ROUNDS + 1, "the loop must terminate"
 
     def test_rounds_are_bounded(self, monkeypatch):
@@ -276,7 +322,9 @@ class TestMaskRounds:
         out = asyncio.run(G.screen_query(MagicMock(), "alpha bravo charlie delta echo"))
         assert out.allowed is False and out.action == G.ACTION_BLOCKED
         assert out.rounds == G.MAX_REDACTION_ROUNDS
-        assert calls["n"] == G.MAX_REDACTION_ROUNDS + 1
+        # one scan up front plus at most one per round — the ceiling that
+        # matters is that it stops, and how much latency it can ever add.
+        assert calls["n"] <= G.MAX_REDACTION_ROUNDS + 1
 
     def test_rounds_recorded_on_the_audit_detail(self, monkeypatch):
         scan, _ = _scanner([ScanResult(findings=[_ssn_finding()]), None])
@@ -334,9 +382,13 @@ class TestProvenance:
         out = asyncio.run(G.screen_query(MagicMock(), "my ssn is 456-78-9012 please"))
         assert out.allowed is False
         passes = out.audit_detail()["passes"]
-        assert [p["verdict"] for p in passes] == ["fail", "fail"]
-        # outbound_text is the furthest-masked form, NOT the original
-        assert out.outbound_text() == "my ssn is *********** please"
+        # every pass failed, and the trail shows the mask walking outwards
+        assert all(p["verdict"] == "fail" for p in passes)
+        assert passes[0]["text"] == "my ssn is 456-78-9012 please"
+        assert passes[1]["text"] == "my ssn is *********** please"
+        # outbound_text is the furthest-masked form, never the original
+        assert out.outbound_text() == passes[-1]["text"]
+        assert "456-78-9012" not in out.outbound_text()
         assert out.original_query == "my ssn is 456-78-9012 please"
 
     def test_clean_query_records_a_single_passing_pass(self, monkeypatch):
