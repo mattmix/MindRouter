@@ -137,6 +137,7 @@ async def _do_search(
     """Shared handler for both /v1/search and /api/search."""
     from backend.app.services.search.registry import get_search_config, PROVIDERS
     from backend.app.services.search.audit import run_logged_search
+    from backend.app.services.search.dlp_gate import WebSearchBlockedError
 
     user, api_key = auth
     config = await get_search_config(db)
@@ -177,6 +178,14 @@ async def _do_search(
             user_id=user.id,
             api_key_id=getattr(api_key, "id", None),
             client_ip=get_client_ip(request),
+        )
+    except WebSearchBlockedError as e:
+        # 422, like the inline DLP block on inference: the request was
+        # understood and refused on its content, not a service failure.
+        logger.warning("search_blocked_by_dlp", user_id=user.id, reason=str(e))
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Search blocked by data-loss prevention: {e}",
         )
     except ValueError as e:
         raise HTTPException(

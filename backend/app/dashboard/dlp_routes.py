@@ -264,6 +264,10 @@ async def admin_dlp_page(
         "email_major_mode": await crud.get_config_json(db, "dlp.email.major.mode", "immediate"),
         "digest_frequency": await crud.get_config_json(db, "dlp.digest.frequency", "daily"),
         "digest_recipients": await crud.get_config_json(db, "dlp.digest.recipients", ""),
+        # Pre-send DLP screening of web-search queries (dlp.websearch.*).
+        "websearch_dlp_enabled": await crud.get_config_json(db, "dlp.websearch.enabled", False),
+        "websearch_dlp_min_severity": await crud.get_config_json(db, "dlp.websearch.min_severity", "moderate"),
+        "websearch_dlp_on_error": await crud.get_config_json(db, "dlp.websearch.on_scanner_error", "block"),
         # Per-severity Detection Action (block and/or alert) + block scope.
         "block_scope": await crud.get_config_json(db, "dlp.block.scope", "prompt"),
         "block_minor": await crud.get_config_json(db, "dlp.action.minor.block", False),
@@ -574,6 +578,21 @@ async def save_dlp_config(
             return _err(f"Invalid delivery mode for {sev} alerts")
         email_modes[sev] = m
 
+    # Web-search screening. Validated against the gate module's own tuples so
+    # the form can never store a level the gate would silently reject.
+    from backend.app.services.search.dlp_gate import (
+        VALID_MIN_SEVERITIES as WS_SEVERITIES,
+        VALID_ON_ERROR as WS_ON_ERROR,
+    )
+
+    websearch_dlp_enabled = form.get("websearch_dlp_enabled") == "on"
+    ws_min_sev = (form.get("websearch_dlp_min_severity") or "moderate").strip()
+    if ws_min_sev not in WS_SEVERITIES:
+        return _err("Web search screening severity must be minor, moderate, or major")
+    ws_on_error = (form.get("websearch_dlp_on_error") or "block").strip()
+    if ws_on_error not in WS_ON_ERROR:
+        return _err("Web search scanner-error behavior must be block or allow")
+
     # Detection Action per severity: block and/or alert, plus notify-the-user.
     block_scope = (form.get("block_scope") or "prompt").strip()
     if block_scope not in ("prompt", "response", "both"):
@@ -780,6 +799,9 @@ async def save_dlp_config(
         await crud.set_config(db, "dlp.digest.frequency", digest_frequency)
         await crud.set_config(db, "dlp.digest.recipients", digest_recipients)
         await crud.set_config(db, "dlp.block.scope", block_scope)
+        await crud.set_config(db, "dlp.websearch.enabled", websearch_dlp_enabled)
+        await crud.set_config(db, "dlp.websearch.min_severity", ws_min_sev)
+        await crud.set_config(db, "dlp.websearch.on_scanner_error", ws_on_error)
         for sev in ("minor", "moderate", "major"):
             await crud.set_config(db, f"dlp.action.{sev}.block", actions[sev]["block"])
             await crud.set_config(db, f"dlp.action.{sev}.redact", actions[sev]["redact"])

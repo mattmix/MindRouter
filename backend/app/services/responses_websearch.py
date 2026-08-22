@@ -58,6 +58,7 @@ from backend.app.core.translators.responses_in import (
 )
 from backend.app.core.translators import responses_stream as rs
 from backend.app.logging_config import get_logger
+from backend.app.services.search.dlp_gate import WebSearchBlockedError
 from backend.app.settings import get_settings
 
 logger = get_logger(__name__)
@@ -229,6 +230,15 @@ def make_search_executor(db, user, api_key) -> Callable:
                     snippet = snippet[:400] + "…"
                 lines.append(f"{i}. {r.title}\n   URL: {r.url}\n   {snippet}")
             return f"Web search results for {query!r}:\n\n" + "\n\n".join(lines)
+        except WebSearchBlockedError as e:
+            # Told plainly so the model reports a policy refusal rather than
+            # retrying, and never sees the sensitive text it was refused for.
+            logger.warning("responses_web_search_blocked_by_dlp", reason=str(e))
+            return (
+                "Web search was blocked by this server's data-loss-prevention "
+                f"policy: {e}. Do not retry; answer without web results, and "
+                "tell the user their query contained sensitive data."
+            )
         except Exception as e:
             logger.warning("responses_web_search_failed", error=str(e))
             return f"Web search failed: {e}"

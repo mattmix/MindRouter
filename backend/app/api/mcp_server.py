@@ -86,6 +86,7 @@ async def web_search(query: str, max_results: Optional[int] = 5) -> str:
     from backend.app.db.models import Modality, User, WebSearchSource
     from backend.app.services.search.registry import PROVIDERS, get_search_config
     from backend.app.services.search.audit import run_logged_search
+    from backend.app.services.search.dlp_gate import WebSearchBlockedError
     from sqlalchemy import select
     from sqlalchemy.orm import joinedload
 
@@ -128,6 +129,9 @@ async def web_search(query: str, max_results: Optional[int] = 5) -> str:
                 user_id=user.id,
                 api_key_id=auth.get("api_key_id"),
             )
+        except WebSearchBlockedError as e:
+            logger.warning("mcp_search_blocked_by_dlp", user_id=user.id, reason=str(e))
+            return f"Search blocked by data-loss prevention: {e}"
         except Exception:
             logger.exception("mcp_search_error", provider=provider_key)
             return "Error: Search provider returned an error."

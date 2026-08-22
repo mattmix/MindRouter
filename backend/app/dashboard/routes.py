@@ -2954,6 +2954,7 @@ async def admin_audit(
     provider_filter: Optional[str] = None,
     source_filter: Optional[str] = None,
     http_status_filter: Optional[str] = None,
+    dlp_action_filter: Optional[str] = None,
     search: Optional[str] = None,
     request_uuid: Optional[str] = None,
     user_id_filter: Optional[str] = None,
@@ -2990,6 +2991,7 @@ async def admin_audit(
             provider_filter=provider_filter,
             source_filter=source_filter,
             http_status_filter=http_status_filter,
+            dlp_action_filter=dlp_action_filter,
             status_filter=status_filter,
             user_id_filter=user_id_filter,
             search=search,
@@ -3131,14 +3133,14 @@ def _parse_audit_date(raw: Optional[str], *, end: bool = False):
 
 def _web_search_filters(
     *, provider_filter, source_filter, http_status_filter, status_filter,
-    user_id_filter, search, start_date, end_date,
+    user_id_filter, search, start_date, end_date, dlp_action_filter=None,
 ) -> dict:
     """Normalize raw query params into crud.search_web_search_logs kwargs.
 
     Shared by the page and the export so a CSV can never disagree with the
     table it was exported from.
     """
-    from backend.app.db.crud import WEB_SEARCH_STATUSES
+    from backend.app.db.crud import WEB_SEARCH_DLP_ACTIONS, WEB_SEARCH_STATUSES
 
     http_status = None
     if http_status_filter and str(http_status_filter).strip().isdigit():
@@ -3149,10 +3151,14 @@ def _web_search_filters(
     status = (status_filter or "").strip() or None
     if status not in WEB_SEARCH_STATUSES:
         status = None
+    dlp_action = (dlp_action_filter or "").strip() or None
+    if dlp_action not in WEB_SEARCH_DLP_ACTIONS:
+        dlp_action = None
     return {
         "provider": (provider_filter or "").strip() or None,
         "source": (source_filter or "").strip() or None,
         "http_status": http_status,
+        "dlp_action": dlp_action,
         "status": status,
         "user_id": parsed_user_id,
         "search_text": (search or "").strip() or None,
@@ -3164,7 +3170,7 @@ def _web_search_filters(
 async def _render_web_search_audit(
     request: Request, user, db: AsyncSession, *,
     provider_filter, source_filter, http_status_filter, status_filter,
-    user_id_filter, search, start_date, end_date, page,
+    user_id_filter, search, start_date, end_date, page, dlp_action_filter=None,
 ):
     """Render /admin/audit?kind=web_search — the outbound web-search log."""
     per_page = 50
@@ -3177,6 +3183,7 @@ async def _render_web_search_audit(
         http_status_filter=http_status_filter, status_filter=status_filter,
         user_id_filter=user_id_filter, search=search,
         start_date=start_date, end_date=end_date,
+        dlp_action_filter=dlp_action_filter,
     )
     logs, total = await crud.search_web_search_logs(
         db, skip=(current_page - 1) * per_page, limit=per_page, **filters
@@ -3206,6 +3213,7 @@ async def _render_web_search_audit(
             "provider_filter": provider_filter or "",
             "source_filter": source_filter or "",
             "http_status_filter": http_status_filter or "",
+            "dlp_action_filter": dlp_action_filter or "",
             "status_filter": status_filter or "",
             "user_id_filter": user_id_filter or "",
             "model_filter": "",
@@ -3268,6 +3276,8 @@ def _web_search_record(row, *, include_body: bool = False) -> dict:
         "request_uuid": (row.request.request_uuid if row.request else None),
         "client_ip": row.client_ip,
         "response_truncated": bool(row.response_truncated),
+        "dlp_action": row.dlp_action,
+        "dlp_detail": row.dlp_detail,
     }
     if include_body:
         rec["response_body"] = row.response_body
@@ -3282,7 +3292,7 @@ WEB_SEARCH_EXPORT_MAX_ROWS = 20000
 async def _export_web_search_audit(
     db: AsyncSession, *, format: str, include_content: bool,
     provider_filter, source_filter, http_status_filter, status_filter,
-    user_id_filter, search, start_date, end_date,
+    user_id_filter, search, start_date, end_date, dlp_action_filter=None,
 ):
     """CSV/JSON export of the web-search audit log under the current filters.
 
@@ -3295,6 +3305,7 @@ async def _export_web_search_audit(
         http_status_filter=http_status_filter, status_filter=status_filter,
         user_id_filter=user_id_filter, search=search,
         start_date=start_date, end_date=end_date,
+        dlp_action_filter=dlp_action_filter,
     )
     rows, total = await crud.search_web_search_logs(
         db, skip=0, limit=WEB_SEARCH_EXPORT_MAX_ROWS, **filters
@@ -3324,9 +3335,10 @@ async def _export_web_search_audit(
         "http_status", "latency_ms", "result_count", "query", "request_url",
         "user_id", "user_email", "api_key_id", "request_id", "request_uuid",
         "client_ip", "error_type", "error_message", "response_truncated",
+        "dlp_action",
     ]
     if include_content:
-        fieldnames.extend(["request_params", "results", "response_meta", "response_body"])
+        fieldnames.extend(["request_params", "results", "response_meta", "dlp_detail", "response_body"])
 
     buf = io.StringIO()
     writer = csv.DictWriter(buf, fieldnames=fieldnames, extrasaction="ignore")
@@ -3334,7 +3346,7 @@ async def _export_web_search_audit(
     for rec in records:
         row = dict(rec)
         # JSON-encode the structured columns so each stays a single CSV field.
-        for col in ("request_params", "request_headers", "results", "response_meta"):
+        for col in ("request_params", "request_headers", "results", "response_meta", "dlp_detail"):
             if col in row:
                 row[col] = json.dumps(row[col], ensure_ascii=False) if row[col] else ""
         writer.writerow(row)
@@ -3355,6 +3367,7 @@ async def admin_audit_export(
     provider_filter: Optional[str] = None,
     source_filter: Optional[str] = None,
     http_status_filter: Optional[str] = None,
+    dlp_action_filter: Optional[str] = None,
     search: Optional[str] = None,
     user_id_filter: Optional[str] = None,
     model_filter: Optional[str] = None,
@@ -3380,6 +3393,7 @@ async def admin_audit_export(
             http_status_filter=http_status_filter, status_filter=status_filter,
             user_id_filter=user_id_filter, search=search,
             start_date=start_date, end_date=end_date,
+            dlp_action_filter=dlp_action_filter,
         )
 
     from backend.app.db.models import RequestStatus

@@ -4633,7 +4633,9 @@ async def get_dlp_alerts(
 # Web search audit log
 # ---------------------------------------------------------------------------
 
-WEB_SEARCH_STATUSES = ("success", "error")
+WEB_SEARCH_STATUSES = ("success", "error", "blocked")
+# Pre-send DLP screening outcomes (None = screening was off for that call).
+WEB_SEARCH_DLP_ACTIONS = ("none", "redacted", "blocked")
 
 
 async def search_web_search_logs(
@@ -4643,6 +4645,7 @@ async def search_web_search_logs(
     status: Optional[str] = None,
     source: Optional[str] = None,
     http_status: Optional[int] = None,
+    dlp_action: Optional[str] = None,
     user_id: Optional[int] = None,
     search_text: Optional[str] = None,
     search_uuid: Optional[str] = None,
@@ -4676,6 +4679,8 @@ async def search_web_search_logs(
         conditions.append(WebSearchLog.source == source)
     if http_status is not None:
         conditions.append(WebSearchLog.http_status == http_status)
+    if dlp_action:
+        conditions.append(WebSearchLog.dlp_action == dlp_action)
     if user_id is not None:
         conditions.append(WebSearchLog.user_id == user_id)
     if search_uuid:
@@ -4788,7 +4793,17 @@ async def distinct_web_search_values(db: AsyncSession) -> dict:
             )
         ).all() if c is not None
     ]
-    return {"providers": providers, "sources": sources, "http_statuses": codes}
+    dlp_actions = [
+        a for (a,) in (
+            await db.execute(
+                select(WebSearchLog.dlp_action).distinct().order_by(WebSearchLog.dlp_action)
+            )
+        ).all() if a
+    ]
+    return {
+        "providers": providers, "sources": sources, "http_statuses": codes,
+        "dlp_actions": dlp_actions,
+    }
 
 
 async def get_dlp_alert_by_id(db: AsyncSession, alert_id: int) -> Optional[DlpAlert]:

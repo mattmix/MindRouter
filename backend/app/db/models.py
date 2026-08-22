@@ -1625,10 +1625,13 @@ class ConversationItem(Base, TimestampMixin):
 
 
 class WebSearchStatus(str, PyEnum):
-    """Outcome of one web-search provider call."""
+    """Outcome of one web-search attempt."""
 
     SUCCESS = "success"
     ERROR = "error"
+    # Withheld by pre-send DLP screening — nothing was sent to the provider,
+    # which is why request_url and http_status are NULL on such a row.
+    BLOCKED = "blocked"
 
 
 class WebSearchSource(str, PyEnum):
@@ -1705,6 +1708,16 @@ class WebSearchLog(Base):
     error_type: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
+    # --- Pre-send DLP screening (dlp.websearch.*) --------------------------
+    # NULL when screening was off for this call; otherwise none / redacted /
+    # blocked.  Indexed because "show me everything DLP stopped" is the
+    # question this feature exists to answer.
+    dlp_action: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
+    # Severities, categories, MASKED evidence, degraded flag and reason. Masked,
+    # never verbatim: an audit row is metadata about sensitive data, not a
+    # second copy of the thing the screening just refused to send.
+    dlp_detail: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+
     user: Mapped[Optional["User"]] = relationship("User", foreign_keys=[user_id])
     request: Mapped[Optional["Request"]] = relationship("Request", foreign_keys=[request_id])
 
@@ -1719,4 +1732,5 @@ class WebSearchLog(Base):
         Index("ix_web_search_logs_user_time", "user_id", "created_at"),
         Index("ix_web_search_logs_http_status", "http_status"),
         Index("ix_web_search_logs_request", "request_id"),
+        Index("ix_web_search_logs_dlp_action", "dlp_action", "created_at"),
     )

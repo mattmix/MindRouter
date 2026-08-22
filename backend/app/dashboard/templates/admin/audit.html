@@ -303,6 +303,13 @@
                         return;
                     }
                     var html = '';
+                    if (data.dlp_action) {
+                        html += wsSection(
+                            'DLP screening: ' + data.dlp_action,
+                            data.dlp_detail,
+                            data.dlp_action === 'blocked' ? 'border-danger' : ''
+                        );
+                    }
                     html += wsSection('Sent to provider', {
                         url: data.request_url,
                         params: data.request_params,

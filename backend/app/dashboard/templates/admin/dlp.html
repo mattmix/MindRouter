@@ -455,6 +455,48 @@
                     </div>
                 </div>
 
+                <!-- ==================== Web Search Screening ==================== -->
+                <div class="card mb-4">
+                    <div class="card-header d-flex justify-content-between align-items-center">
+                        <div class="form-check form-switch mb-0">
+                            <input class="form-check-input" type="checkbox" role="switch"
+                                   id="websearch_dlp_enabled" name="websearch_dlp_enabled"
+                                   {% if config.websearch_dlp_enabled %}checked{% endif %}>
+                            <label class="form-check-label fw-bold" for="websearch_dlp_enabled">Screen web search queries</label>
+                        </div>
+                        <button type="button" class="btn btn-sm btn-outline-secondary" data-bs-toggle="modal" data-bs-target="#helpWebSearchDlp" title="Help">
+                            <i class="bi bi-question-circle"></i>
+                        </button>
+                    </div>
+                    <div class="card-body">
+                        <p class="text-muted small">A web search is the one path where user text reaches a <strong>third party</strong> verbatim. With this on, the query is scanned <strong>before</strong> it is sent, using the scanners, thresholds, severity rules and Ignore list configured above &mdash; there is no second rule set to keep in sync. If the worst finding reaches the level below, the offending values are <strong>redacted</strong>, the redacted query is <strong>re-scanned to prove it is clean</strong>, and only then is it sent. If the second pass still finds something, the search <strong>fails gracefully</strong> and nothing leaves. Every outcome is recorded in <a href="/admin/audit?kind=web_search">Audit Log &rarr; Web search</a>.</p>
+                        <div class="row g-3">
+                            <div class="col-md-4">
+                                <label class="form-label fw-bold" for="websearch_dlp_min_severity">Act at severity</label>
+                                <select class="form-select form-select-sm" id="websearch_dlp_min_severity" name="websearch_dlp_min_severity">
+                                    <option value="minor" {% if config.websearch_dlp_min_severity == 'minor' %}selected{% endif %}>Minor and above</option>
+                                    <option value="moderate" {% if config.websearch_dlp_min_severity == 'moderate' %}selected{% endif %}>Moderate and above</option>
+                                    <option value="major" {% if config.websearch_dlp_min_severity == 'major' %}selected{% endif %}>Major only</option>
+                                </select>
+                                <div class="form-text">Once the bar is met, <em>every</em> non-ignored finding in the query is redacted &mdash; not only the ones at that level.</div>
+                            </div>
+                            <div class="col-md-4">
+                                <label class="form-label fw-bold" for="websearch_dlp_on_error">If scanners are unavailable</label>
+                                <select class="form-select form-select-sm" id="websearch_dlp_on_error" name="websearch_dlp_on_error">
+                                    <option value="block" {% if config.websearch_dlp_on_error == 'block' %}selected{% endif %}>Block the search (fail closed)</option>
+                                    <option value="allow" {% if config.websearch_dlp_on_error == 'allow' %}selected{% endif %}>Send it anyway (fail open)</option>
+                                </select>
+                                <div class="form-text">Unlike the inline gate on inference, this defaults to <strong>fail closed</strong>: search is optional enrichment, and unscanned text should not reach a third party.</div>
+                            </div>
+                            <div class="col-md-4">
+                                <div class="alert alert-secondary py-2 px-3 mb-0 small">
+                                    <i class="bi bi-info-circle me-1"></i>Adds a synchronous scan before each search, so it costs latency only while enabled. The post-search LLM request keeps its normal DLP treatment, unchanged.
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
                 <div class="text-end mb-4">
                     <button type="submit" class="btn btn-primary"><i class="bi bi-save"></i> Save Configuration</button>
                 </div>
@@ -535,6 +577,38 @@
 </div>
 
 <!-- ==================== Help Modals ==================== -->
+
+<!-- Web Search Screening Help -->
+<div class="modal fade" id="helpWebSearchDlp" tabindex="-1" aria-labelledby="helpWebSearchDlpLabel" aria-hidden="true">
+    <div class="modal-dialog modal-lg">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title" id="helpWebSearchDlpLabel"><i class="bi bi-question-circle"></i> Web Search Screening Help</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+            </div>
+            <div class="modal-body">
+                <h6>What it does</h6>
+                <p>Before any search query is sent to a provider (Brave, SearXNG, &hellip;), it is scanned with your current DLP configuration. The sequence is:</p>
+                <ol>
+                    <li><strong>Scan</strong> the query with the enabled scanners and your severity rules.</li>
+                    <li>If the worst finding reaches <strong>Act at severity</strong>, <strong>redact</strong> every non-ignored finding &mdash; an SSN becomes <code>[REDACTED: social security number]</code>.</li>
+                    <li><strong>Re-scan the redacted query.</strong> Redaction is value substitution, so an overlapping or normalized match can survive it; this pass is what proves the query is actually clean.</li>
+                    <li>If it <em>still</em> reaches the bar, the search is <strong>blocked</strong>. Nothing is sent, and the caller gets a clear message instead of results.</li>
+                </ol>
+
+                <h6>Which searches are covered</h6>
+                <p>All of them &mdash; the <code>/v1/search</code> API, the Responses API <code>web_search</code> tool, the MCP search tool, dashboard chat auto-search, the admin test query, and catalog enrichment. They share one code path, so none can bypass screening.</p>
+
+                <h6>What is recorded</h6>
+                <p>Every screened search gets a row in <a href="/admin/audit?kind=web_search">Audit Log &rarr; Web search</a> with the outcome (<code>none</code>, <code>redacted</code> or <code>blocked</code>), the severities from both passes, the categories, and <strong>masked</strong> evidence snippets. A redacted search stores the <em>redacted</em> query, so the audit log never becomes a second copy of the data screening just refused to send.</p>
+                <p>Screening does <strong>not</strong> raise its own DLP alert emails: the same text is already covered by the normal post-request scan, and double-alerting one event helps nobody.</p>
+
+                <h6>Blocked searches your users will notice</h6>
+                <p>A category the scanner flags as a <em>phrase</em> rather than a value (GLiNER reporting the words &ldquo;Social Security numbers&rdquo; in a policy question, for example) cannot be usefully redacted, so such a query blocks. If that is noise for your traffic, set that category to <strong>Ignore</strong> in Severity Rules and it is excluded from screening as well.</p>
+            </div>
+        </div>
+    </div>
+</div>
 
 <!-- Regex Scanner Help -->
 <div class="modal fade" id="helpRegex" tabindex="-1" aria-labelledby="helpRegexLabel" aria-hidden="true">

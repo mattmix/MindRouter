@@ -143,6 +143,13 @@ async def load_audit_config(db) -> dict:
     }
 
 
+def _row_status(error: Optional[BaseException], blocked: bool) -> str:
+    """success / error / blocked — blocked meaning nothing was ever sent."""
+    if blocked:
+        return "blocked"
+    return "error" if error is not None else "success"
+
+
 def _results_payload(results: Optional[list]) -> Optional[list]:
     """Normalized results as plain dicts, for the JSON column."""
     if not results:
@@ -172,8 +179,14 @@ async def record_search(
     request_id: Optional[int] = None,
     client_ip: Optional[str] = None,
     audit_config: Optional[dict] = None,
+    screen: Any = None,
+    blocked: bool = False,
 ) -> Optional[str]:
     """Persist one web-search audit row. Returns its search_uuid, or None.
+
+    ``screen`` is the pre-send DLP QueryScreen when screening ran; ``blocked``
+    marks a search that never reached the provider because of it — the most
+    important row in the table, so it is written exactly like the others.
 
     Never raises: a logging failure is logged and swallowed.
     """
@@ -203,30 +216,42 @@ async def record_search(
                 err_type = type(error).__name__[:100]
                 err_msg, _ = _truncate(str(error), MAX_ERROR_CHARS)
 
-            row = WebSearchLog(
-                search_uuid=str(_uuid.uuid4()),
-                source=(source or "other")[:32],
-                user_id=user_id,
-                api_key_id=api_key_id,
-                request_id=request_id,
-                client_ip=(client_ip or None),
-                provider=(provider or "unknown")[:32],
-                query=stored_query or "",
-                max_results=max_results,
-                request_url=(exchange.request_url or None),
-                request_params=redact_mapping(exchange.request_params),
-                request_headers=redact_mapping(exchange.request_headers),
-                status="error" if error is not None else "success",
-                http_status=exchange.http_status,
-                latency_ms=latency_ms,
-                result_count=len(exchange.results or []),
-                results=_results_payload(exchange.results),
-                response_body=body,
-                response_truncated=truncated,
-                response_meta=exchange.response_meta,
-                error_type=err_type,
-                error_message=err_msg,
-            )
+            # Built once, in a closure: the retry below differs only in
+            # request_id, and two hand-maintained copies of a 20-field row is
+            # how a new column ends up on one path and not the other.
+            def _build(link_request: bool):
+                return WebSearchLog(
+                    search_uuid=str(_uuid.uuid4()),
+                    source=(source or "other")[:32],
+                    user_id=user_id,
+                    api_key_id=api_key_id,
+                    request_id=request_id if link_request else None,
+                    client_ip=(client_ip or None),
+                    provider=(provider or "unknown")[:32],
+                    query=stored_query or "",
+                    max_results=max_results,
+                    request_url=(exchange.request_url or None),
+                    request_params=redact_mapping(exchange.request_params),
+                    request_headers=redact_mapping(exchange.request_headers),
+                    status=_row_status(error, blocked),
+                    http_status=exchange.http_status,
+                    latency_ms=latency_ms,
+                    result_count=len(exchange.results or []),
+                    results=_results_payload(exchange.results),
+                    response_body=body,
+                    response_truncated=truncated,
+                    response_meta=exchange.response_meta,
+                    error_type=err_type,
+                    error_message=err_msg,
+                    dlp_action=(
+                        screen.action
+                        if screen is not None and getattr(screen, "scanned", False)
+                        else None
+                    ),
+                    dlp_detail=(screen.audit_detail() if screen is not None else None),
+                )
+
+            row = _build(True)
             db.add(row)
             try:
                 await db.commit()
@@ -239,30 +264,7 @@ async def record_search(
                 if request_id is None:
                     raise
                 logger.warning("web_search_audit_fk_retry", request_id=request_id)
-                row = WebSearchLog(
-                    search_uuid=str(_uuid.uuid4()),
-                    source=(source or "other")[:32],
-                    user_id=user_id,
-                    api_key_id=api_key_id,
-                    request_id=None,
-                    client_ip=(client_ip or None),
-                    provider=(provider or "unknown")[:32],
-                    query=stored_query or "",
-                    max_results=max_results,
-                    request_url=(exchange.request_url or None),
-                    request_params=redact_mapping(exchange.request_params),
-                    request_headers=redact_mapping(exchange.request_headers),
-                    status="error" if error is not None else "success",
-                    http_status=exchange.http_status,
-                    latency_ms=latency_ms,
-                    result_count=len(exchange.results or []),
-                    results=_results_payload(exchange.results),
-                    response_body=body,
-                    response_truncated=truncated,
-                    response_meta=exchange.response_meta,
-                    error_type=err_type,
-                    error_message=err_msg,
-                )
+                row = _build(False)
                 db.add(row)
                 await db.commit()
 
@@ -272,6 +274,7 @@ async def record_search(
                 provider=row.provider,
                 source=row.source,
                 status=row.status,
+                dlp_action=row.dlp_action,
                 http_status=row.http_status,
                 latency_ms=row.latency_ms,
                 results=row.result_count,
@@ -322,6 +325,8 @@ async def run_logged_search(
 
     if provider is None:
         err = ValueError(f"Unknown search provider: {provider_key}")
+        # No screen here on purpose: this fails before any query is screened,
+        # so the row records "not scanned" rather than a misleading outcome.
         await record_search(
             query=query, source=source, provider=str(provider_key), error=err,
             latency_ms=0, max_results=max_results, user_id=user_id,
@@ -329,6 +334,36 @@ async def run_logged_search(
             audit_config=audit_config,
         )
         raise err
+
+    # --- Pre-send DLP screening -------------------------------------
+    # Runs before ANY provider is contacted, so a blocked query never leaves
+    # the building. Inert unless the operator set dlp.websearch.enabled.
+    from backend.app.services.search.dlp_gate import (
+        WebSearchBlockedError,
+        screen_query,
+    )
+
+    screen = await screen_query(db, query)
+    if not screen.allowed:
+        logger.warning(
+            "websearch_blocked_by_dlp",
+            source=source, provider=provider_key,
+            severity=screen.severity, second_severity=screen.second_severity,
+            categories=screen.categories, reason=screen.reason,
+        )
+        await record_search(
+            query=query, source=source, provider=provider_key,
+            latency_ms=0, max_results=max_results, user_id=user_id,
+            api_key_id=api_key_id, request_id=request_id, client_ip=client_ip,
+            audit_config=audit_config, screen=screen, blocked=True,
+        )
+        raise WebSearchBlockedError(
+            screen.reason or "Search blocked: the query contains sensitive data",
+            screen=screen,
+        )
+    # From here on the REDACTED query is the query: it is what gets sent and
+    # what the audit row records, so the log never holds the unredacted text.
+    query = screen.query or query
 
     started = time.monotonic()
     try:
@@ -350,6 +385,6 @@ async def run_logged_search(
         query=query, source=source, provider=provider_key, exchange=exchange,
         latency_ms=elapsed, max_results=max_results, user_id=user_id,
         api_key_id=api_key_id, request_id=request_id, client_ip=client_ip,
-        audit_config=audit_config,
+        audit_config=audit_config, screen=screen,
     )
     return exchange.results
