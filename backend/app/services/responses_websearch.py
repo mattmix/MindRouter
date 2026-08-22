@@ -198,8 +198,21 @@ def make_search_executor(db, user, api_key) -> Callable:
                 int(config.get("search.max_results", 10)),
                 settings.responses_web_search_max_results,
             )
-            results = await provider.search(
-                query, max_results=max_results, config=config
+            # Audited drop-in for provider.search(). The Responses API tool
+            # loop has no request row id in scope, so the audit row links by
+            # user/api key; the timestamps line it up with the request.
+            from backend.app.db.models import WebSearchSource
+            from backend.app.services.search.audit import run_logged_search
+
+            results = await run_logged_search(
+                db,
+                query,
+                source=WebSearchSource.RESPONSES_API.value,
+                max_results=max_results,
+                config=config,
+                provider=provider,
+                user_id=getattr(user, "id", None),
+                api_key_id=getattr(api_key, "id", None),
             )
             try:
                 await _deduct_search_tokens(db, user, api_key, config, 0)

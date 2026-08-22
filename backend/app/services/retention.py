@@ -64,6 +64,11 @@ _DEFAULTS: dict[str, Any] = {
     # a nonzero default here would mass-delete existing history on the first
     # cycle after deploy.  An admin opts in on the Retention page.
     "retention.dlp_alerts_days": 0,
+    # 0 = keep forever.  Web-search logs are an audit trail (who sent what to
+    # which third party), so the default preserves them; but they carry the
+    # verbatim provider response and grow fastest of any audit table, which is
+    # why they get their own dial rather than riding on requests.
+    "retention.web_search_logs_days": 0,
     "retention.cleanup_interval": 3600,
     "retention.batch_size": 500,
 }
@@ -418,12 +423,18 @@ async def _detach_request_references(
     app_db: AsyncSession, request_ids: list[int]
 ) -> None:
     """SET NULL the nullable audit back-references to requests about to
-    be deleted (user_images, video_jobs, stored_responses, dlp_alerts).
-    Their FKs are RESTRICT with no cascade, so deleting a referenced
-    request would otherwise raise IntegrityError."""
+    be deleted (user_images, video_jobs, stored_responses, dlp_alerts,
+    web_search_logs).  Their FKs are RESTRICT with no cascade, so deleting a
+    referenced request would otherwise raise IntegrityError."""
     if not request_ids:
         return
-    from backend.app.db.models import DlpAlert, StoredResponse, UserImage, VideoJob
+    from backend.app.db.models import (
+        DlpAlert,
+        StoredResponse,
+        UserImage,
+        VideoJob,
+        WebSearchLog,
+    )
 
     await app_db.execute(
         update(UserImage)
@@ -438,6 +449,13 @@ async def _detach_request_references(
     await app_db.execute(
         update(StoredResponse)
         .where(StoredResponse.request_id.in_(request_ids))
+        .values(request_id=None)
+    )
+    # A web-search log outlives the inference request that triggered it: the
+    # third-party call is the auditable event, not the request row.
+    await app_db.execute(
+        update(WebSearchLog)
+        .where(WebSearchLog.request_id.in_(request_ids))
         .values(request_id=None)
     )
     await app_db.execute(
@@ -1417,6 +1435,40 @@ async def delete_expired_requests_no_archive(
     return {"deleted_without_archive": total}
 
 
+async def cleanup_expired_web_search_logs(
+    app_db: AsyncSession, cutoff: datetime, batch_size: int
+) -> dict[str, int]:
+    """Delete web-search audit rows created before the cutoff.
+
+    Delete-only, like dlp_alerts: no archive table, no file artifacts, and
+    nothing references web_search_logs, so no FK ordering is needed.  Pure ORM
+    (no text() with interpolated ids) so the statement can never become an
+    injection finding.
+    """
+    from backend.app.db.models import WebSearchLog
+
+    deleted = 0
+    while True:
+        result = await app_db.execute(
+            select(WebSearchLog.id)
+            .where(WebSearchLog.created_at < cutoff)
+            .order_by(WebSearchLog.id)
+            .limit(batch_size)
+        )
+        ids = [row_id for (row_id,) in result.all()]
+        if not ids:
+            break
+
+        await app_db.execute(
+            delete(WebSearchLog).where(WebSearchLog.id.in_(ids))
+        )
+        deleted += len(ids)
+        await app_db.commit()
+        logger.info("retention_web_search_logs_batch", deleted=len(ids), total=deleted)
+
+    return {"deleted": deleted}
+
+
 # Categories an admin may purge on demand.  admin_audit_log is
 # deliberately absent: the admin audit trail is retained permanently.
 PURGE_CATEGORIES = (
@@ -1427,6 +1479,7 @@ PURGE_CATEGORIES = (
     "responses_store",
     "conversations",
     "dlp_alerts",
+    "web_search_logs",
 )
 
 
@@ -1508,6 +1561,11 @@ async def run_purge(category: str, older_than_days: int) -> dict[str, Any]:
     elif category == "dlp_alerts":
         async with get_async_db_context() as app_db:
             summary["result"] = await cleanup_expired_dlp_alerts(
+                app_db, cutoff, batch
+            )
+    elif category == "web_search_logs":
+        async with get_async_db_context() as app_db:
+            summary["result"] = await cleanup_expired_web_search_logs(
                 app_db, cutoff, batch
             )
 
@@ -1685,6 +1743,15 @@ async def run_retention_cycle() -> dict[str, Any]:
         cutoff = datetime.now(timezone.utc) - timedelta(days=dlp_days)
         async with get_async_db_context() as app_db:
             summary["dlp_alerts"] = await cleanup_expired_dlp_alerts(
+                app_db, cutoff, config.get("retention.batch_size", 5000)
+            )
+
+    # Web-search audit logs (delete-only — default 0 = never delete).
+    ws_days = config.get("retention.web_search_logs_days", 0)
+    if ws_days > 0:
+        cutoff = datetime.now(timezone.utc) - timedelta(days=ws_days)
+        async with get_async_db_context() as app_db:
+            summary["web_search_logs"] = await cleanup_expired_web_search_logs(
                 app_db, cutoff, config.get("retention.batch_size", 5000)
             )
 

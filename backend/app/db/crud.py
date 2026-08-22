@@ -74,6 +74,7 @@ from backend.app.db.models import (
     VideoJobStatus,
     VideoProject,
     VideoShot,
+    WebSearchLog,
     VideoShotStatus,
     VideoShotType,
     VideoTransition,
@@ -697,6 +698,13 @@ async def delete_user(db: AsyncSession, user_id: int) -> bool:
     await db.execute(
         update(DlpAlert).where(DlpAlert.user_id == user_id).values(user_id=None)
     )
+    # Web-search logs are audit records too: what was sent to a third party
+    # stays on the record after the account that sent it is gone.
+    await db.execute(
+        update(WebSearchLog)
+        .where(WebSearchLog.user_id == user_id)
+        .values(user_id=None)
+    )
     await db.execute(
         update(DlpAlert)
         .where(DlpAlert.acknowledged_by == user_id)
@@ -738,6 +746,11 @@ async def delete_user(db: AsyncSession, user_id: int) -> bool:
             .values(request_id=None)
         )
         await db.execute(
+            update(WebSearchLog)
+            .where(WebSearchLog.request_id.in_(request_ids))
+            .values(request_id=None)
+        )
+        await db.execute(
             delete(SchedulerDecision).where(
                 SchedulerDecision.request_id.in_(request_ids)
             )
@@ -751,6 +764,16 @@ async def delete_user(db: AsyncSession, user_id: int) -> bool:
     await db.execute(delete(Request).where(Request.user_id == user_id))
 
     # --- Keys, quotas, the user row ---
+    # The key rows go, but the searches they made stay in the audit log.
+    await db.execute(
+        update(WebSearchLog)
+        .where(
+            WebSearchLog.api_key_id.in_(
+                select(ApiKey.id).where(ApiKey.user_id == user_id)
+            )
+        )
+        .values(api_key_id=None)
+    )
     await db.execute(delete(ApiKey).where(ApiKey.user_id == user_id))
     await db.execute(delete(Quota).where(Quota.user_id == user_id))
     await db.execute(delete(QuotaRequest).where(QuotaRequest.user_id == user_id))
@@ -4604,6 +4627,168 @@ async def get_dlp_alerts(
         query.order_by(DlpAlert.scanned_at.desc()).offset(skip).limit(limit)
     )
     return list(result.scalars().all()), total
+
+
+# ---------------------------------------------------------------------------
+# Web search audit log
+# ---------------------------------------------------------------------------
+
+WEB_SEARCH_STATUSES = ("success", "error")
+
+
+async def search_web_search_logs(
+    db: AsyncSession,
+    *,
+    provider: Optional[str] = None,
+    status: Optional[str] = None,
+    source: Optional[str] = None,
+    http_status: Optional[int] = None,
+    user_id: Optional[int] = None,
+    search_text: Optional[str] = None,
+    search_uuid: Optional[str] = None,
+    start_date: Optional[datetime] = None,
+    end_date: Optional[datetime] = None,
+    skip: int = 0,
+    limit: int = 50,
+) -> Tuple[List[WebSearchLog], int]:
+    """Filtered, newest-first page of web-search audit rows, plus the total.
+
+    ``search_text`` matches the query, the request URL and the error message —
+    deliberately NOT response_body: that column is MEDIUMTEXT and a LIKE over
+    it would table-scan megabytes per row. The body is there to be read on one
+    row, not searched across all of them.
+    """
+    query = select(WebSearchLog).options(
+        selectinload(WebSearchLog.user),
+        # so the row can deep-link to the triggering request's audit entry
+        selectinload(WebSearchLog.request),
+    )
+    count_query = select(func.count(WebSearchLog.id))
+
+    conditions = []
+    # Truthiness, not `is not None`: the filter form submits "" for its "All"
+    # options and an equality test against "" matches no row.
+    if provider:
+        conditions.append(WebSearchLog.provider == provider)
+    if status:
+        conditions.append(WebSearchLog.status == status)
+    if source:
+        conditions.append(WebSearchLog.source == source)
+    if http_status is not None:
+        conditions.append(WebSearchLog.http_status == http_status)
+    if user_id is not None:
+        conditions.append(WebSearchLog.user_id == user_id)
+    if search_uuid:
+        conditions.append(WebSearchLog.search_uuid == search_uuid)
+    if start_date is not None:
+        conditions.append(WebSearchLog.created_at >= start_date)
+    if end_date is not None:
+        conditions.append(WebSearchLog.created_at < end_date)
+    if search_text:
+        like_pat = f"%{search_text}%"
+        conditions.append(
+            or_(
+                WebSearchLog.query.ilike(like_pat),
+                WebSearchLog.request_url.ilike(like_pat),
+                WebSearchLog.error_message.ilike(like_pat),
+            )
+        )
+
+    for cond in conditions:
+        query = query.where(cond)
+        count_query = count_query.where(cond)
+
+    total = (await db.execute(count_query)).scalar() or 0
+    result = await db.execute(
+        query.order_by(WebSearchLog.created_at.desc(), WebSearchLog.id.desc())
+        .offset(max(0, skip))
+        .limit(limit)
+    )
+    return list(result.scalars().all()), total
+
+
+async def get_web_search_log_by_uuid(
+    db: AsyncSession, search_uuid: str
+) -> Optional[WebSearchLog]:
+    """One web-search audit row by its public uuid (for the detail view)."""
+    result = await db.execute(
+        select(WebSearchLog)
+        .options(
+            selectinload(WebSearchLog.user),
+            selectinload(WebSearchLog.request),
+        )
+        .where(WebSearchLog.search_uuid == search_uuid)
+    )
+    return result.scalar_one_or_none()
+
+
+async def get_web_search_stats(db: AsyncSession, hours: int = 24) -> dict:
+    """Headline counts for the audit page: volume, failures, providers."""
+    since = datetime.now(timezone.utc) - timedelta(hours=hours)
+    total = (
+        await db.execute(select(func.count(WebSearchLog.id)))
+    ).scalar() or 0
+    recent = (
+        await db.execute(
+            select(func.count(WebSearchLog.id)).where(WebSearchLog.created_at >= since)
+        )
+    ).scalar() or 0
+    errors = (
+        await db.execute(
+            select(func.count(WebSearchLog.id)).where(
+                WebSearchLog.created_at >= since, WebSearchLog.status == "error"
+            )
+        )
+    ).scalar() or 0
+    by_provider_rows = (
+        await db.execute(
+            select(WebSearchLog.provider, func.count(WebSearchLog.id))
+            .where(WebSearchLog.created_at >= since)
+            .group_by(WebSearchLog.provider)
+        )
+    ).all()
+    avg_latency = (
+        await db.execute(
+            select(func.avg(WebSearchLog.latency_ms)).where(
+                WebSearchLog.created_at >= since,
+                WebSearchLog.status == "success",
+            )
+        )
+    ).scalar()
+    return {
+        "total": total,
+        "recent": recent,
+        "errors": errors,
+        "window_hours": hours,
+        "by_provider": {p: n for p, n in by_provider_rows},
+        "avg_latency_ms": int(avg_latency) if avg_latency is not None else None,
+    }
+
+
+async def distinct_web_search_values(db: AsyncSession) -> dict:
+    """Distinct providers / sources / HTTP codes present, for the filter menus.
+
+    Built from the data rather than the enum so a provider that was removed
+    from the code still appears while its history is on file.
+    """
+    providers = [
+        p for (p,) in (
+            await db.execute(select(WebSearchLog.provider).distinct().order_by(WebSearchLog.provider))
+        ).all() if p
+    ]
+    sources = [
+        v for (v,) in (
+            await db.execute(select(WebSearchLog.source).distinct().order_by(WebSearchLog.source))
+        ).all() if v
+    ]
+    codes = [
+        c for (c,) in (
+            await db.execute(
+                select(WebSearchLog.http_status).distinct().order_by(WebSearchLog.http_status)
+            )
+        ).all() if c is not None
+    ]
+    return {"providers": providers, "sources": sources, "http_statuses": codes}
 
 
 async def get_dlp_alert_by_id(db: AsyncSession, alert_id: int) -> Optional[DlpAlert]:

@@ -149,4 +149,16 @@ async def search(
     if max_results is None:
         max_results = int(config.get("search.max_results", 10))
 
-    return await provider.search(query, max_results=max_results, config=config)
+    # Audited like every other path: this wrapper is public API, and a future
+    # caller reaching it must not silently bypass the web-search audit log.
+    # Source defaults to "other" because the wrapper does not know its caller.
+    from backend.app.services.search.audit import run_logged_search
+
+    return await run_logged_search(
+        db,
+        query,
+        source="other",
+        max_results=max_results,
+        config=config,
+        provider=provider,
+    )

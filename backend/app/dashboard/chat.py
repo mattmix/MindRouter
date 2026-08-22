@@ -42,6 +42,7 @@ from backend.app.db.session import get_async_db, get_async_db_context
 from backend.app.dashboard.routes import get_effective_user_id, get_session_user_id, get_masquerade_user_id
 from backend.app.logging_config import get_logger
 from backend.app.services.inference import InferenceService
+from backend.app.core.client_ip import get_client_ip
 from backend.app.services.web_search import brave_web_search, format_search_results
 from backend.app.settings import get_settings
 
@@ -1104,8 +1105,15 @@ async def chat_completions(
     if body.get("web_search") and content:
         try:
             settings = get_settings()
+            from backend.app.db.models import WebSearchSource
+
             search_results = await brave_web_search(
-                content, num_results=settings.brave_search_max_results
+                content,
+                num_results=settings.brave_search_max_results,
+                source=WebSearchSource.CHAT_UI.value,
+                user_id=getattr(user, "id", None),
+                api_key_id=getattr(api_key, "id", None),
+                client_ip=get_client_ip(request),
             )
             search_context = format_search_results(search_results)
             if search_context:

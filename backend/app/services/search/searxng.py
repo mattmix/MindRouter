@@ -23,7 +23,13 @@ from __future__ import annotations
 import httpx
 
 from backend.app.logging_config import get_logger
-from backend.app.services.search.base import SearchProvider, SearchResult
+from backend.app.services.search.base import (
+    SearchExchange,
+    SearchProvider,
+    SearchResult,
+    attach_exchange,
+    response_meta,
+)
 
 logger = get_logger(__name__)
 
@@ -44,26 +50,44 @@ class SearXNGSearchProvider(SearchProvider):
         max_results: int = 5,
         config: dict | None = None,
     ) -> list[SearchResult]:
+        """Parsed results only — see search_exchange for the full round-trip."""
+        exchange = await self.search_exchange(
+            query, max_results=max_results, config=config
+        )
+        return exchange.results
+
+    async def search_exchange(
+        self,
+        query: str,
+        *,
+        max_results: int = 5,
+        config: dict | None = None,
+    ) -> SearchExchange:
         config = config or {}
         endpoint = config.get("search.searxng.endpoint", "")
 
-        if not endpoint:
-            raise ValueError("SearXNG endpoint URL is not configured")
-
         # SearXNG JSON API: GET /search?q=...&format=json
-        url = endpoint.rstrip("/") + "/search"
+        url = endpoint.rstrip("/") + "/search" if endpoint else ""
+        params = {"q": query, "format": "json", "pageno": 1}
+        exchange = SearchExchange(request_url=url or None, request_params=dict(params))
 
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(
-                url,
-                params={
-                    "q": query,
-                    "format": "json",
-                    "pageno": 1,
-                },
-            )
-            resp.raise_for_status()
-            data = resp.json()
+        if not endpoint:
+            err = ValueError("SearXNG endpoint URL is not configured")
+            attach_exchange(err, exchange)
+            raise err
+
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(url, params=params)
+                # Body first: a SearXNG 403/429 explains itself in the body.
+                exchange.http_status = resp.status_code
+                exchange.response_body = resp.text
+                exchange.response_meta = response_meta(resp)
+                resp.raise_for_status()
+                data = resp.json()
+        except Exception as e:
+            attach_exchange(e, exchange)
+            raise
 
         results: list[SearchResult] = []
         for item in data.get("results", [])[:max_results]:
@@ -76,7 +100,15 @@ class SearXNGSearchProvider(SearchProvider):
                     extra={"engine": item.get("engine", "")},
                 )
             )
-        return results
+        exchange.results = results
+        meta = exchange.response_meta or {}
+        # Which engines actually answered explains a thin or odd result set.
+        meta["engines"] = sorted({
+            str(i.get("engine", "")) for i in (data.get("results") or []) if i.get("engine")
+        })
+        meta["total_results_reported"] = len(data.get("results") or [])
+        exchange.response_meta = meta
+        return exchange
 
     async def health_check(self, config: dict | None = None) -> tuple[bool, str]:
         config = config or {}

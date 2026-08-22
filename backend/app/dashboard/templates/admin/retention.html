@@ -228,6 +228,12 @@
                                        value="{{ config['retention.dlp_alerts_days'] }}" min="0">
                                 <div class="form-text">Data-loss-prevention alert records, swept by scan time. 0 = never delete (default).</div>
                             </div>
+                            <div class="col-md-4">
+                                <label class="form-label">Web Search Logs (days)</label>
+                                <input type="number" class="form-control" name="retention.web_search_logs_days"
+                                       value="{{ config['retention.web_search_logs_days'] }}" min="0">
+                                <div class="form-text">Outbound web-search audit records, swept by search time. They store the verbatim provider response, so they grow fastest of any audit table. 0 = never delete (default).</div>
+                            </div>
                         </div>
                     </div>
                 </div>
@@ -457,6 +463,7 @@
                                     <option value="responses_store">Stored responses (Responses API)</option>
                                     <option value="conversations">Conversations API</option>
                                     <option value="dlp_alerts">DLP alerts</option>
+                                    <option value="web_search_logs">Web search logs</option>
                                 </select>
                             </div>
                             <div class="col-md-4">

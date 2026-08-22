@@ -1622,3 +1622,101 @@ class ConversationItem(Base, TimestampMixin):
         UniqueConstraint("conversation_pk", "item_id", name="uq_conversation_items_conv_item"),
         Index("ix_conversation_items_conv", "conversation_pk", "id"),
     )
+
+
+class WebSearchStatus(str, PyEnum):
+    """Outcome of one web-search provider call."""
+
+    SUCCESS = "success"
+    ERROR = "error"
+
+
+class WebSearchSource(str, PyEnum):
+    """Which MindRouter surface issued the search.
+
+    A first-class dimension, not free text: the audit filter offers these and
+    an unknown value would silently disappear from the dropdown.
+    """
+
+    SEARCH_API = "search_api"            # POST /v1/search, /api/search
+    RESPONSES_API = "responses_api"      # the Responses API web_search tool
+    MCP = "mcp"                          # the MCP server's search tool
+    CHAT_UI = "chat_ui"                  # dashboard chat auto-search
+    ADMIN_TEST = "admin_test"            # Admin -> Search "test query"
+    MODEL_ENRICHMENT = "model_enrichment"  # catalog enrichment lookups
+    OTHER = "other"
+
+
+class WebSearchLog(Base):
+    """One outbound web-search provider call — a first-class audit entity.
+
+    Distinct from `requests` on purpose: a search is an outbound call to a
+    THIRD PARTY, and what an auditor needs to see (which provider, what left
+    the building, what came back, which HTTP code) has no counterpart in an
+    inference request row. Attaching it to `requests` would also lose every
+    search that has no request behind it (admin test, catalog enrichment).
+
+    `request_id` links back to the inference request that triggered the search
+    when there is one, so the audit log can pivot between the two.
+    """
+
+    __tablename__ = "web_search_logs"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    # Stable public id for deep links, mirroring requests.request_uuid.
+    search_uuid: Mapped[str] = mapped_column(
+        String(36), unique=True, nullable=False, default=lambda: str(uuid.uuid4())
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    # --- Who / where from -------------------------------------------------
+    source: Mapped[str] = mapped_column(String(32), nullable=False)
+    user_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("users.id"), nullable=True)
+    api_key_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("api_keys.id"), nullable=True)
+    # The inference request that triggered this search, when there was one.
+    request_id: Mapped[Optional[int]] = mapped_column(BigInteger, ForeignKey("requests.id"), nullable=True)
+    client_ip: Mapped[Optional[str]] = mapped_column(String(45), nullable=True)
+
+    # --- What was asked ---------------------------------------------------
+    provider: Mapped[str] = mapped_column(String(32), nullable=False)
+    query: Mapped[str] = mapped_column(Text, nullable=False)
+    max_results: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    request_url: Mapped[Optional[str]] = mapped_column(String(1000), nullable=True)
+    # Exactly what was sent, with credentials redacted (see search/audit.py).
+    request_params: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    request_headers: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+
+    # --- What came back ---------------------------------------------------
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    http_status: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    latency_ms: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    result_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    # Normalized results (title/url/snippet/...) as the caller received them.
+    results: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    # The provider's verbatim response body, capped by search.audit.max_body_chars.
+    response_body: Mapped[Optional[str]] = mapped_column(MEDIUMTEXT, nullable=True)
+    response_truncated: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("0"))
+    # Response headers worth keeping (rate limits, request id) + provider meta.
+    response_meta: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+
+    # --- Failure detail ---------------------------------------------------
+    error_type: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    user: Mapped[Optional["User"]] = relationship("User", foreign_keys=[user_id])
+    request: Mapped[Optional["Request"]] = relationship("Request", foreign_keys=[request_id])
+
+    __table_args__ = (
+        # The audit list is "newest first, optionally filtered" — every index
+        # here leads with the filter column and ends on created_at so the sort
+        # is served by the index rather than a filesort.
+        Index("ix_web_search_logs_created_at", "created_at"),
+        Index("ix_web_search_logs_provider_time", "provider", "created_at"),
+        Index("ix_web_search_logs_status_time", "status", "created_at"),
+        Index("ix_web_search_logs_source_time", "source", "created_at"),
+        Index("ix_web_search_logs_user_time", "user_id", "created_at"),
+        Index("ix_web_search_logs_http_status", "http_status"),
+        Index("ix_web_search_logs_request", "request_id"),
+    )

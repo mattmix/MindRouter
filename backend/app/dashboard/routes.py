@@ -27,7 +27,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Request, Response, status
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.templating import Jinja2Templates
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -2947,6 +2947,13 @@ async def admin_energy(
 @dashboard_router.get("/admin/audit", response_class=HTMLResponse)
 async def admin_audit(
     request: Request,
+    # Which log this page is showing. "requests" (inference) is the default and
+    # the historical behaviour; "web_search" switches to the first-class
+    # outbound-search audit entity, which has its own columns and filters.
+    kind: Optional[str] = None,
+    provider_filter: Optional[str] = None,
+    source_filter: Optional[str] = None,
+    http_status_filter: Optional[str] = None,
     search: Optional[str] = None,
     request_uuid: Optional[str] = None,
     user_id_filter: Optional[str] = None,
@@ -2973,6 +2980,23 @@ async def admin_audit(
         return RedirectResponse(url="/dashboard", status_code=302)
 
     from backend.app.db.models import RequestStatus
+
+    kind = (kind or "requests").strip().lower()
+    if kind not in AUDIT_KINDS:
+        kind = "requests"
+    if kind == "web_search":
+        return await _render_web_search_audit(
+            request, user, db,
+            provider_filter=provider_filter,
+            source_filter=source_filter,
+            http_status_filter=http_status_filter,
+            status_filter=status_filter,
+            user_id_filter=user_id_filter,
+            search=search,
+            start_date=start_date,
+            end_date=end_date,
+            page=page,
+        )
 
     per_page = 50
     max_numbered_pages = 20
@@ -3070,6 +3094,255 @@ async def admin_audit(
             "status_filter": status_filter or "",
             "start_date": start_date or "",
             "end_date": end_date or "",
+            "kind": "requests",
+            "audit_kinds": AUDIT_KINDS,
+        },
+    )
+
+
+# The two logs reachable from /admin/audit. Web search is a first-class entity
+# rather than a row type on `requests`: it is an outbound call to a third
+# party, and several searches (admin test, catalog enrichment) have no
+# inference request behind them at all.
+AUDIT_KINDS = ("requests", "web_search")
+
+
+def _parse_audit_date(raw: Optional[str], *, end: bool = False):
+    """YYYY-MM-DD (or full ISO) -> aware UTC datetime; None when unusable.
+
+    A bare date used as the END bound rolls to the next midnight so the whole
+    day is included (the query uses created_at < end).
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%d"):
+        try:
+            dt = datetime.strptime(raw, fmt)
+            break
+        except ValueError:
+            continue
+    else:
+        return None
+    if end and len(raw) == 10:
+        dt = dt + timedelta(days=1)
+    return dt.replace(tzinfo=timezone.utc)
+
+
+def _web_search_filters(
+    *, provider_filter, source_filter, http_status_filter, status_filter,
+    user_id_filter, search, start_date, end_date,
+) -> dict:
+    """Normalize raw query params into crud.search_web_search_logs kwargs.
+
+    Shared by the page and the export so a CSV can never disagree with the
+    table it was exported from.
+    """
+    from backend.app.db.crud import WEB_SEARCH_STATUSES
+
+    http_status = None
+    if http_status_filter and str(http_status_filter).strip().isdigit():
+        http_status = int(str(http_status_filter).strip())
+    parsed_user_id = None
+    if user_id_filter and str(user_id_filter).strip().isdigit():
+        parsed_user_id = int(str(user_id_filter).strip())
+    status = (status_filter or "").strip() or None
+    if status not in WEB_SEARCH_STATUSES:
+        status = None
+    return {
+        "provider": (provider_filter or "").strip() or None,
+        "source": (source_filter or "").strip() or None,
+        "http_status": http_status,
+        "status": status,
+        "user_id": parsed_user_id,
+        "search_text": (search or "").strip() or None,
+        "start_date": _parse_audit_date(start_date),
+        "end_date": _parse_audit_date(end_date, end=True),
+    }
+
+
+async def _render_web_search_audit(
+    request: Request, user, db: AsyncSession, *,
+    provider_filter, source_filter, http_status_filter, status_filter,
+    user_id_filter, search, start_date, end_date, page,
+):
+    """Render /admin/audit?kind=web_search — the outbound web-search log."""
+    per_page = 50
+    current_page = 1
+    if page and str(page).isdigit():
+        current_page = max(1, int(page))
+
+    filters = _web_search_filters(
+        provider_filter=provider_filter, source_filter=source_filter,
+        http_status_filter=http_status_filter, status_filter=status_filter,
+        user_id_filter=user_id_filter, search=search,
+        start_date=start_date, end_date=end_date,
+    )
+    logs, total = await crud.search_web_search_logs(
+        db, skip=(current_page - 1) * per_page, limit=per_page, **filters
+    )
+    total_pages = max(1, (total + per_page - 1) // per_page)
+    stats = await crud.get_web_search_stats(db)
+    choices = await crud.distinct_web_search_values(db)
+    masq = await _admin_masquerade_context(request, user, db)
+    return templates.TemplateResponse(
+        "admin/audit.html",
+        {
+            "request": request,
+            "user": user,
+            **masq,
+            "kind": "web_search",
+            "audit_kinds": AUDIT_KINDS,
+            "web_search_logs": logs,
+            "web_search_stats": stats,
+            "web_search_choices": choices,
+            "total": total,
+            "page": current_page,
+            "total_pages": total_pages,
+            "show_numbered": min(total_pages, 20),
+            "using_cursor": False,
+            "next_cursor": None,
+            "search": search or "",
+            "provider_filter": provider_filter or "",
+            "source_filter": source_filter or "",
+            "http_status_filter": http_status_filter or "",
+            "status_filter": status_filter or "",
+            "user_id_filter": user_id_filter or "",
+            "model_filter": "",
+            "focus_uuid": "",
+            "start_date": start_date or "",
+            "end_date": end_date or "",
+        },
+    )
+
+
+@dashboard_router.get("/admin/audit/web-search/{search_uuid}/detail")
+async def admin_web_search_detail(
+    request: Request,
+    search_uuid: str,
+    db: AsyncSession = Depends(get_async_db),
+):
+    """Full payloads for one web-search audit row (JSON, for the expand row).
+
+    Kept out of the table itself: the verbatim provider response can be
+    hundreds of kilobytes, and rendering fifty of them per page would make the
+    audit log unusable.
+    """
+    session_user_id = get_session_user_id(request)
+    if not session_user_id:
+        return JSONResponse({"error": "Not authenticated"}, status_code=401)
+    user = await crud.get_user_by_id(db, session_user_id)
+    if not user or (not user.group or not user.group.has_admin_read):
+        return JSONResponse({"error": "Forbidden"}, status_code=403)
+
+    row = await crud.get_web_search_log_by_uuid(db, search_uuid)
+    if not row:
+        return JSONResponse({"error": "Not found"}, status_code=404)
+    return JSONResponse(_web_search_record(row, include_body=True))
+
+
+def _web_search_record(row, *, include_body: bool = False) -> dict:
+    """One audit row as a JSON-safe dict (shared by detail + export)."""
+    rec = {
+        "search_uuid": row.search_uuid,
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+        "source": row.source,
+        "provider": row.provider,
+        "query": row.query,
+        "max_results": row.max_results,
+        "status": row.status,
+        "http_status": row.http_status,
+        "latency_ms": row.latency_ms,
+        "result_count": row.result_count,
+        "request_url": row.request_url,
+        "request_params": row.request_params,
+        "request_headers": row.request_headers,
+        "response_meta": row.response_meta,
+        "results": row.results,
+        "error_type": row.error_type,
+        "error_message": row.error_message,
+        "user_id": row.user_id,
+        "user_email": (row.user.email if row.user else None),
+        "api_key_id": row.api_key_id,
+        "request_id": row.request_id,
+        "request_uuid": (row.request.request_uuid if row.request else None),
+        "client_ip": row.client_ip,
+        "response_truncated": bool(row.response_truncated),
+    }
+    if include_body:
+        rec["response_body"] = row.response_body
+    return rec
+
+
+# Cap on one web-search export. The verbatim provider body makes these rows
+# far larger than an inference audit row, so the ceiling is lower.
+WEB_SEARCH_EXPORT_MAX_ROWS = 20000
+
+
+async def _export_web_search_audit(
+    db: AsyncSession, *, format: str, include_content: bool,
+    provider_filter, source_filter, http_status_filter, status_filter,
+    user_id_filter, search, start_date, end_date,
+):
+    """CSV/JSON export of the web-search audit log under the current filters.
+
+    ``include_content`` adds the verbatim provider response body — the same
+    opt-in the inference export uses for prompts, and for the same reason: it
+    is the bulky, most sensitive column.
+    """
+    filters = _web_search_filters(
+        provider_filter=provider_filter, source_filter=source_filter,
+        http_status_filter=http_status_filter, status_filter=status_filter,
+        user_id_filter=user_id_filter, search=search,
+        start_date=start_date, end_date=end_date,
+    )
+    rows, total = await crud.search_web_search_logs(
+        db, skip=0, limit=WEB_SEARCH_EXPORT_MAX_ROWS, **filters
+    )
+    records = [_web_search_record(r, include_body=include_content) for r in rows]
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%SZ")
+
+    if (format or "csv").lower() == "json":
+        payload = {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "kind": "web_search",
+            "row_count": len(records),
+            "total_matched": total,
+            "truncated": total > WEB_SEARCH_EXPORT_MAX_ROWS,
+            "records": records,
+        }
+        return Response(
+            content=json.dumps(payload, ensure_ascii=False, indent=2),
+            media_type="application/json",
+            headers={
+                "Content-Disposition": f'attachment; filename="web_search_audit_{stamp}.json"'
+            },
+        )
+
+    fieldnames = [
+        "search_uuid", "created_at", "provider", "source", "status",
+        "http_status", "latency_ms", "result_count", "query", "request_url",
+        "user_id", "user_email", "api_key_id", "request_id", "request_uuid",
+        "client_ip", "error_type", "error_message", "response_truncated",
+    ]
+    if include_content:
+        fieldnames.extend(["request_params", "results", "response_meta", "response_body"])
+
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=fieldnames, extrasaction="ignore")
+    writer.writeheader()
+    for rec in records:
+        row = dict(rec)
+        # JSON-encode the structured columns so each stays a single CSV field.
+        for col in ("request_params", "request_headers", "results", "response_meta"):
+            if col in row:
+                row[col] = json.dumps(row[col], ensure_ascii=False) if row[col] else ""
+        writer.writerow(row)
+    return Response(
+        content=buf.getvalue(),
+        media_type="text/csv",
+        headers={
+            "Content-Disposition": f'attachment; filename="web_search_audit_{stamp}.csv"'
         },
     )
 
@@ -3078,6 +3351,10 @@ async def admin_audit(
 async def admin_audit_export(
     request: Request,
     format: str = "csv",
+    kind: Optional[str] = None,
+    provider_filter: Optional[str] = None,
+    source_filter: Optional[str] = None,
+    http_status_filter: Optional[str] = None,
     search: Optional[str] = None,
     user_id_filter: Optional[str] = None,
     model_filter: Optional[str] = None,
@@ -3095,6 +3372,15 @@ async def admin_audit_export(
     user = await crud.get_user_by_id(db, session_user_id)
     if not user or (not user.group or not user.group.has_admin_read):
         return RedirectResponse(url="/dashboard", status_code=302)
+
+    if (kind or "").strip().lower() == "web_search":
+        return await _export_web_search_audit(
+            db, format=format, include_content=include_content,
+            provider_filter=provider_filter, source_filter=source_filter,
+            http_status_filter=http_status_filter, status_filter=status_filter,
+            user_id_filter=user_id_filter, search=search,
+            start_date=start_date, end_date=end_date,
+        )
 
     from backend.app.db.models import RequestStatus
 
@@ -5880,6 +6166,7 @@ async def admin_retention_post(
             "retention.responses_store_days",
             "retention.conversations_days",
             "retention.dlp_alerts_days",
+            "retention.web_search_logs_days",
             "retention.cleanup_interval",
             "retention.batch_size",
         ]:
@@ -6366,10 +6653,20 @@ async def admin_search_config_post(
             )
 
         try:
-            results = await provider.search(
+            # Audited like every other search path: an admin test query still
+            # sends text to a third party, so it belongs in the log.
+            from backend.app.db.models import WebSearchSource
+            from backend.app.services.search.audit import run_logged_search
+
+            results = await run_logged_search(
+                db,
                 test_query,
+                source=WebSearchSource.ADMIN_TEST.value,
                 max_results=int(config.get("search.max_results", 5)),
                 config=config,
+                provider=provider,
+                user_id=user.id,
+                client_ip=get_client_ip(request),
             )
         except Exception as e:
             return RedirectResponse(

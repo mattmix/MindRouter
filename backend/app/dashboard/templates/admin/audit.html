@@ -8,10 +8,14 @@
         {% set active = "audit" %}{% include "admin/_sidebar.html" %}
 
         <div class="col-md-10 py-3">
-            <div class="d-flex justify-content-between align-items-center mb-4">
+            <div class="d-flex justify-content-between align-items-center mb-3">
                 <h1><i class="bi bi-journal-text"></i> Audit Log</h1>
                 <div class="d-flex align-items-center gap-3">
+                    {% if kind == 'web_search' %}
+                    <span class="text-muted">{{ total }} search{{ 'es' if total != 1 else '' }}</span>
+                    {% else %}
                     <span class="text-muted">{{ total }} request{{ 's' if total != 1 else '' }}</span>
+                    {% endif %}
                     {% if not is_read_only %}
                     <a href="/admin/retention?tab=purge" class="btn btn-sm btn-outline-secondary"
                        title="Retention policies and manual purge for these records">
@@ -20,6 +24,30 @@
                     {% endif %}
                 </div>
             </div>
+
+            {# Each kind is its own first-class log with its own columns and
+               filters; the tabs are the "filter the audit log to show only
+               web search" control. #}
+            <ul class="nav nav-tabs mb-4" role="tablist">
+                <li class="nav-item" role="presentation">
+                    <a class="nav-link {% if kind != 'web_search' %}active{% endif %}"
+                       href="/admin/audit" role="tab"
+                       aria-selected="{{ 'false' if kind == 'web_search' else 'true' }}">
+                        <i class="bi bi-chat-square-text"></i> Inference requests
+                    </a>
+                </li>
+                <li class="nav-item" role="presentation">
+                    <a class="nav-link {% if kind == 'web_search' %}active{% endif %}"
+                       href="/admin/audit?kind=web_search" role="tab"
+                       aria-selected="{{ 'true' if kind == 'web_search' else 'false' }}">
+                        <i class="bi bi-globe2"></i> Web search
+                    </a>
+                </li>
+            </ul>
+
+            {% if kind == 'web_search' %}
+            {% include "admin/_audit_web_search.html" %}
+            {% else %}
 
             <!-- Filters -->
             <div class="card mb-4">
@@ -176,6 +204,7 @@
                     {% endif %}
                 </div>
             </div>
+            {% endif %}
         </div>
     </div>
 </div>
@@ -247,6 +276,71 @@
             }
         });
     });
+
+    // ---- Web-search view: expand one row to its full payloads -----------
+    // Fetched on demand: the verbatim provider body can be hundreds of KB and
+    // fifty of them inline would make the page unusable.
+    document.querySelectorAll('.ws-reveal-btn').forEach(function (btn) {
+        btn.addEventListener('click', function () {
+            var uuid = btn.getAttribute('data-ws-uuid');
+            var row = document.querySelector('.ws-detail-row[data-ws-detail="' + uuid + '"]');
+            if (!row) return;
+            var content = row.querySelector('.ws-detail-content');
+            var icon = btn.querySelector('i');
+            var hidden = row.classList.contains('d-none');
+            row.classList.toggle('d-none');
+            if (icon) {
+                icon.classList.toggle('bi-chevron-down', !hidden);
+                icon.classList.toggle('bi-chevron-up', hidden);
+            }
+            if (!hidden || btn.dataset.wsLoaded === '1') return;
+            btn.dataset.wsLoaded = '1';
+            fetch('/admin/audit/web-search/' + encodeURIComponent(uuid) + '/detail')
+                .then(function (r) { return r.json(); })
+                .then(function (data) {
+                    if (data.error) {
+                        content.innerHTML = '<div class="text-danger">' + escapeHtml(data.error) + '</div>';
+                        return;
+                    }
+                    var html = '';
+                    html += wsSection('Sent to provider', {
+                        url: data.request_url,
+                        params: data.request_params,
+                        headers: data.request_headers,
+                        max_results: data.max_results
+                    });
+                    if (data.error_message) {
+                        html += wsSection('Error (' + escapeHtml(data.error_type || '') + ')', data.error_message, 'border-danger');
+                    }
+                    html += wsSection('Response metadata', {
+                        http_status: data.http_status,
+                        latency_ms: data.latency_ms,
+                        result_count: data.result_count,
+                        meta: data.response_meta
+                    });
+                    if (data.results) { html += wsSection('Parsed results', data.results); }
+                    if (data.response_body) {
+                        html += wsSection(
+                            'Raw response body' + (data.response_truncated ? ' (truncated)' : ''),
+                            data.response_body
+                        );
+                    }
+                    content.innerHTML = html || '<div class="text-muted">No detail available</div>';
+                })
+                .catch(function () {
+                    content.innerHTML = '<div class="text-danger">Failed to load details</div>';
+                });
+        });
+    });
+
+    function wsSection(title, value, extraClass) {
+        var body = typeof value === 'string' ? value : JSON.stringify(value, null, 2);
+        return '<div class="mb-2"><strong>' + escapeHtml(title) + '</strong>' +
+            '<pre class="mt-1 p-2 bg-body-tertiary border ' + (extraClass || '') +
+            ' rounded" style="max-height: 320px; overflow-y: auto; font-size: 0.85rem; ' +
+            'white-space: pre-wrap; word-wrap: break-word; overflow-wrap: break-word;">' +
+            escapeHtml(body) + '</pre></div>';
+    }
 
     function escapeHtml(text) {
         if (!text) return '';

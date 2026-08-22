@@ -183,8 +183,13 @@ async def enrich_model_description(
 
     # Step 1: Web search for model card info
     search_query = f"{base_name} LLM model card"
+    from backend.app.db.models import WebSearchSource
+
     search_results = await brave_web_search(
-        search_query, num_results=5, api_key=brave_api_key
+        search_query,
+        num_results=5,
+        api_key=brave_api_key,
+        source=WebSearchSource.MODEL_ENRICHMENT.value,
     )
     search_context = _format_search_for_enrichment(search_results)
 

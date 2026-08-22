@@ -44,6 +44,81 @@ class SearchResult:
         return d
 
 
+@dataclass
+class SearchExchange:
+    """Everything observed about ONE provider round-trip.
+
+    ``search()`` returns only the parsed results, which is all a caller needs
+    but nothing an auditor can use: no provider URL, no HTTP status, no
+    verbatim body. Providers therefore implement ``search_exchange()`` — the
+    single real implementation — and ``search()`` is the thin wrapper over it.
+
+    Every field except ``results`` is best-effort: a provider that cannot
+    report it leaves it None, and the audit row simply records less.
+    """
+
+    results: list = field(default_factory=list)
+    request_url: Optional[str] = None
+    # What was sent. Credentials are redacted by the audit layer, not here —
+    # a provider must not have to remember which of its own params are secret.
+    request_params: Optional[dict] = None
+    request_headers: Optional[dict] = None
+    http_status: Optional[int] = None
+    # The provider's verbatim response text, uncapped at this layer.
+    response_body: Optional[str] = None
+    # Response headers worth keeping (rate limits, request ids) and any
+    # provider-level metadata parsed out of the body.
+    response_meta: Optional[dict] = None
+
+
+# Response headers worth keeping on an audit row: rate-limit accounting and
+# the provider's own request id, which is what a support ticket will ask for.
+# Everything else is noise or a credential echo.
+KEEP_RESPONSE_HEADERS = (
+    "x-ratelimit-limit",
+    "x-ratelimit-remaining",
+    "x-ratelimit-reset",
+    "x-request-id",
+    "retry-after",
+    "content-type",
+)
+
+
+def response_meta(resp) -> dict:
+    """Subset of an httpx response's headers, preserved verbatim for the log."""
+    try:
+        headers = {
+            k: v for k, v in resp.headers.items()
+            if k.lower() in KEEP_RESPONSE_HEADERS
+        }
+    except Exception:
+        headers = {}
+    return {"response_headers": headers}
+
+
+_EXCHANGE_ATTR = "_mindrouter_search_exchange"
+
+
+def attach_exchange(exc: BaseException, exchange: "SearchExchange") -> None:
+    """Carry a partial round-trip out on the exception that aborted it.
+
+    The audit log needs the HTTP status and body of a FAILED call, but giving
+    providers a new exception type would ripple through every caller's except
+    clauses (httpx.HTTPStatusError, httpx.TimeoutException, ValueError are all
+    handled today). Riding along on the original exception keeps the provider
+    error contract byte-identical while still giving the log everything.
+    """
+    try:
+        setattr(exc, _EXCHANGE_ATTR, exchange)
+    except Exception:  # pragma: no cover — exception types using __slots__
+        pass
+
+
+def exchange_from_exception(exc: BaseException) -> Optional["SearchExchange"]:
+    """The partial exchange attached by attach_exchange, if any."""
+    return getattr(exc, _EXCHANGE_ATTR, None)
+
+
 class SearchProvider(abc.ABC):
     """Interface that every search provider must implement."""
 
@@ -75,6 +150,23 @@ class SearchProvider(abc.ABC):
             List of SearchResult objects.
         """
         ...
+
+    async def search_exchange(
+        self,
+        query: str,
+        *,
+        max_results: int = 5,
+        config: dict | None = None,
+    ) -> "SearchExchange":
+        """Execute a search and report the full round-trip.
+
+        Deliberately NOT abstract: a provider written before the audit log
+        existed (or a third-party one) keeps working and simply contributes an
+        audit row with no HTTP detail. The two first-party providers override
+        this with the real implementation and delegate ``search()`` to it.
+        """
+        results = await self.search(query, max_results=max_results, config=config)
+        return SearchExchange(results=results)
 
     @abc.abstractmethod
     async def health_check(self, config: dict | None = None) -> tuple[bool, str]:

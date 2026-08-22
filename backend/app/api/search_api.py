@@ -28,8 +28,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.api.auth import authenticate_request
 from backend.app.db import crud
-from backend.app.db.models import ApiKey, Modality, RequestStatus, User
+from backend.app.db.models import (
+    ApiKey,
+    Modality,
+    RequestStatus,
+    User,
+    WebSearchSource,
+)
 from backend.app.db.session import get_async_db
+from backend.app.core.client_ip import get_client_ip
 from backend.app.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -129,6 +136,7 @@ async def _do_search(
 ):
     """Shared handler for both /v1/search and /api/search."""
     from backend.app.services.search.registry import get_search_config, PROVIDERS
+    from backend.app.services.search.audit import run_logged_search
 
     user, api_key = auth
     config = await get_search_config(db)
@@ -154,11 +162,21 @@ async def _do_search(
 
     max_results = body.max_results or int(config.get("search.max_results", 10))
 
-    # Execute search
+    # Execute search. run_logged_search is a drop-in for provider.search():
+    # same return value, same exceptions — it additionally writes the
+    # first-class web-search audit row (Admin -> Audit Log -> Web search).
     t0 = time.monotonic()
     try:
-        results = await provider.search(
-            body.query, max_results=max_results, config=config
+        results = await run_logged_search(
+            db,
+            body.query,
+            source=WebSearchSource.SEARCH_API.value,
+            max_results=max_results,
+            config=config,
+            provider=provider,
+            user_id=user.id,
+            api_key_id=getattr(api_key, "id", None),
+            client_ip=get_client_ip(request),
         )
     except ValueError as e:
         raise HTTPException(

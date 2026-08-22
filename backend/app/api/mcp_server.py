@@ -83,8 +83,9 @@ async def web_search(query: str, max_results: Optional[int] = 5) -> str:
         return "Error: Not authenticated. Connect with an API key."
 
     from backend.app.db import crud
-    from backend.app.db.models import Modality, User
+    from backend.app.db.models import Modality, User, WebSearchSource
     from backend.app.services.search.registry import PROVIDERS, get_search_config
+    from backend.app.services.search.audit import run_logged_search
     from sqlalchemy import select
     from sqlalchemy.orm import joinedload
 
@@ -116,7 +117,17 @@ async def web_search(query: str, max_results: Optional[int] = 5) -> str:
         count = min(max_results or 5, 50)
         t0 = time.monotonic()
         try:
-            results = await provider.search(query, max_results=count, config=config)
+            # Audited drop-in for provider.search() — same result, same errors.
+            results = await run_logged_search(
+                db,
+                query,
+                source=WebSearchSource.MCP.value,
+                max_results=count,
+                config=config,
+                provider=provider,
+                user_id=user.id,
+                api_key_id=auth.get("api_key_id"),
+            )
         except Exception:
             logger.exception("mcp_search_error", provider=provider_key)
             return "Error: Search provider returned an error."
