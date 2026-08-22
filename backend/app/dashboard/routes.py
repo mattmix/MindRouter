@@ -3257,6 +3257,7 @@ def _web_search_record(row, *, include_body: bool = False) -> dict:
         "source": row.source,
         "provider": row.provider,
         "query": row.query,
+        "query_original": row.query_original,
         "max_results": row.max_results,
         "status": row.status,
         "http_status": row.http_status,
@@ -3332,7 +3333,7 @@ async def _export_web_search_audit(
 
     fieldnames = [
         "search_uuid", "created_at", "provider", "source", "status",
-        "http_status", "latency_ms", "result_count", "query", "request_url",
+        "http_status", "latency_ms", "result_count", "query", "query_original", "request_url",
         "user_id", "user_email", "api_key_id", "request_id", "request_uuid",
         "client_ip", "error_type", "error_message", "response_truncated",
         "dlp_action",

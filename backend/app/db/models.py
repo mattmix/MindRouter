@@ -1684,7 +1684,14 @@ class WebSearchLog(Base):
 
     # --- What was asked ---------------------------------------------------
     provider: Mapped[str] = mapped_column(String(32), nullable=False)
+    # The OUTBOUND query: exactly what was sent to the provider. When DLP
+    # screening redacted it, this is the masked form — so the log records what
+    # actually left the building, not what the caller typed.
     query: Mapped[str] = mapped_column(Text, nullable=False)
+    # What the caller submitted, before screening. Populated only when it
+    # differs from `query` (i.e. screening changed or refused it) and only when
+    # search.audit.store_original_query is on.
+    query_original: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     max_results: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     request_url: Mapped[Optional[str]] = mapped_column(String(1000), nullable=True)
     # Exactly what was sent, with credentials redacted (see search/audit.py).

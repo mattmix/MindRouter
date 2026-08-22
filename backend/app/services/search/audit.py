@@ -210,6 +210,15 @@ async def record_search(
             body, truncated = _truncate(body, int(cfg.get("max_body_chars", DEFAULT_MAX_BODY_CHARS)))
 
             stored_query, _ = _truncate(query or "", MAX_QUERY_CHARS)
+            # The caller's pre-screening text, kept only when screening
+            # actually changed or refused the query — an unmodified query would
+            # just duplicate `query`, and the operator can switch it off.
+            original_raw = None
+            if screen is not None and getattr(screen, "scanned", False):
+                candidate = getattr(screen, "original_query", "") or ""
+                first = (screen.passes[0] if getattr(screen, "passes", None) else {}) or {}
+                if candidate and candidate != (query or "") and first.get("text_stored", True):
+                    original_raw, _ = _truncate(candidate, MAX_QUERY_CHARS)
             err_msg = None
             err_type = None
             if error is not None:
@@ -229,6 +238,7 @@ async def record_search(
                     client_ip=(client_ip or None),
                     provider=(provider or "unknown")[:32],
                     query=stored_query or "",
+                    query_original=original_raw,
                     max_results=max_results,
                     request_url=(exchange.request_url or None),
                     request_params=redact_mapping(exchange.request_params),
@@ -351,8 +361,11 @@ async def run_logged_search(
             severity=screen.severity, second_severity=screen.second_severity,
             categories=screen.categories, reason=screen.reason,
         )
+        # `query` records the furthest-masked form (how far screening got);
+        # `query_original` records what the caller typed. status=blocked and a
+        # NULL request_url are what say nothing was actually sent.
         await record_search(
-            query=query, source=source, provider=provider_key,
+            query=screen.outbound_text(), source=source, provider=provider_key,
             latency_ms=0, max_results=max_results, user_id=user_id,
             api_key_id=api_key_id, request_id=request_id, client_ip=client_ip,
             audit_config=audit_config, screen=screen, blocked=True,

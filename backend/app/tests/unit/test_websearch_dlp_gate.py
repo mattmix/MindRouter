@@ -112,40 +112,76 @@ class TestRedaction:
         out = asyncio.run(G.screen_query(MagicMock(), "my ssn is 123-45-6789 refund?"))
         assert out.allowed and out.action == G.ACTION_REDACTED
         assert "123-45-6789" not in out.query
-        assert G.REDACTION_PLACEHOLDER in out.query
+        assert "***********" in out.query, "the value is masked with asterisks"
         assert calls["n"] == 2, "the redaction must be re-verified, not assumed"
         assert "123-45-6789" not in calls["texts"][1], "pass 2 scans the REDACTED text"
         assert out.severity == "major" and out.second_severity is None
 
-    def test_placeholder_is_neutral_so_it_cannot_retrigger_the_scanner(self, monkeypatch):
-        """The labelled inference placeholder would re-trip GLiNER on pass 2.
+    def test_mask_is_asterisks_not_a_word_shaped_placeholder(self, monkeypatch):
+        """A placeholder TOKEN re-primes the scanner; asterisks cannot.
 
-        Verified against the production scanners: "[REDACTED: social security
-        number]" is itself flagged as a social security number, so a labelled
-        placeholder makes every redaction block on the second pass.
+        Measured against the production scanners: "[REDACTED: social security
+        number]" is itself flagged as a social security number, and even a bare
+        "[REDACTED]" leaves a word for GLiNER to bind the user's label word to.
+        Asterisks carry no semantics, so nothing survives to re-flag.
         """
         scan, calls = _scanner([ScanResult(findings=[_ssn_finding()]), None])
         _patch(monkeypatch, _gate(), scan)
         out = asyncio.run(G.screen_query(MagicMock(), "ssn 123-45-6789 financial aid"))
-        assert G.REDACTION_PLACEHOLDER == "[REDACTED]"
-        assert "social security number" not in out.query, \
-            "the category name must not survive into the query that gets re-scanned"
-        assert "social security number" not in calls["texts"][1]
+        assert "REDACTED" not in out.query
+        assert "social security number" not in out.query
+        # and the text handed to the verifying pass is the masked one
+        assert "REDACTED" not in calls["texts"][1]
+        assert "123-45-6789" not in calls["texts"][1]
 
-    def test_has_content_understands_both_placeholder_forms(self):
-        assert G._has_content("[REDACTED]") is False
-        assert G._has_content("[REDACTED: social security number]") is False
-        assert G._has_content("refund [REDACTED] status") is True
+    def test_mask_span_preserves_whitespace_shape(self):
+        assert G.mask_span("ssn 456-78-9012") == "*** ***********"
+        assert G.mask_span("") == ""
 
-    def test_masked_evidence_never_holds_the_raw_value(self, monkeypatch):
+    def test_has_content_ignores_masks(self):
+        assert G._has_content("*** ***") is False
+        assert G._has_content("*** *** for records") is True
+
+    def test_mask_uses_offsets_for_multi_word_spans(self):
+        """Masking a span like "ssn 456-78-9012" needs offsets, not a value swap."""
+        text = "contact 208-885-6111 or ssn 456-78-9012 for records"
+        start = text.index("ssn 456-78-9012")
+        f = ScanFinding("gliner", "social security number", "ssn 456-78-9012",
+                        0.9, start, start + len("ssn 456-78-9012"))
+        assert G._mask_findings(text, [f], {}) == (
+            "contact 208-885-6111 or *** *********** for records"
+        )
+
+    def test_mask_falls_back_to_value_when_offsets_are_unusable(self):
+        """The LLM scanner reports no offsets; the finding must still be masked."""
+        text = "ssn 456-78-9012 here"
+        f = ScanFinding("llm", "social security number", "456-78-9012", 0.9, 0, 0)
+        assert G._mask_findings(text, [f], {}) == "ssn *********** here"
+
+    def test_evidence_is_masked_even_though_the_trail_keeps_the_original(self, monkeypatch):
+        """Two different things, deliberately.
+
+        The provenance trail keeps the caller's ORIGINAL query (that is the
+        point of the before/after audit, and it is governed by
+        search.audit.store_original_query). The EVIDENCE — the per-finding
+        snippets — is always masked, so a reader scanning the findings never
+        sees a raw value they did not ask to see.
+        """
         scan, _ = _scanner([ScanResult(findings=[_ssn_finding()]), None])
         _patch(monkeypatch, _gate(), scan)
-        out = asyncio.run(G.screen_query(MagicMock(), "ssn 123-45-6789"))
+        out = asyncio.run(G.screen_query(MagicMock(), "ssn 123-45-6789 aid"))
         detail = out.audit_detail()
         assert detail["action"] == "redacted"
-        blob = str(detail)
-        assert "123-45-6789" not in blob, "the audit row must not copy what it refused"
+
+        # evidence: masked
+        assert "123-45-6789" not in str(detail["masked"])
         assert detail["masked"][0]["text"].startswith("12") and "*" in detail["masked"][0]["text"]
+        assert "123-45-6789" not in str([p["findings"] for p in detail["passes"]])
+
+        # provenance: the original is kept, by design, in pass 1's text only
+        assert detail["passes"][0]["text"] == "ssn 123-45-6789 aid"
+        assert "123-45-6789" not in (detail["passes"][1]["text"] or "")
+        assert "123-45-6789" not in out.query, "the outbound query is masked"
 
     def test_every_non_ignored_finding_goes_once_triggered(self, monkeypatch):
         """A minor email rides along when a major SSN trips the threshold."""
@@ -171,6 +207,201 @@ class TestRedaction:
         _patch(monkeypatch, _gate(), scan)
         out = asyncio.run(G.screen_query(MagicMock(), "x a@b.edu.long-secret y"))
         assert "long-secret" not in out.query
+
+
+class TestMaskRounds:
+    """Masking a value can expose the user's own label word as a NEW span, so
+    the gate re-masks and re-verifies within a bounded number of rounds."""
+
+    def test_second_round_clears_a_newly_exposed_span(self, monkeypatch):
+        text = "contact 208-885-6111 or ssn 456-78-9012 for records"
+        ssn_at = text.index("456-78-9012")
+
+        def pass1(t):
+            return ScanResult(findings=[ScanFinding(
+                "regex", "social security number", "456-78-9012", 1.0,
+                ssn_at, ssn_at + 11)])
+
+        def pass2(t):
+            # GLiNER now binds the label word to the mask beside it.
+            span = "ssn " + "*" * 11
+            i = t.index(span)
+            return ScanResult(findings=[ScanFinding(
+                "gliner", "social security number", span, 0.9, i, i + len(span))])
+
+        scan, calls = _scanner([pass1, pass2, None])
+        _patch(monkeypatch, _gate(), scan)
+        out = asyncio.run(G.screen_query(MagicMock(), text))
+        assert out.allowed and out.action == G.ACTION_REDACTED
+        assert out.query == "contact 208-885-6111 or *** *********** for records"
+        assert out.rounds == 2
+        assert calls["n"] == 3, "one scan, then a scan after each masking round"
+
+    def test_no_progress_blocks_instead_of_looping(self, monkeypatch):
+        """A scanner flagging an already-masked run cannot be masked further."""
+        def flag_mask(t):
+            run = "*" * 11
+            if run not in t:
+                i = t.index("456-78-9012")
+                return ScanResult(findings=[ScanFinding(
+                    "regex", "social security number", "456-78-9012", 1.0, i, i + 11)])
+            i = t.index(run)
+            return ScanResult(findings=[ScanFinding(
+                "gliner", "social security number", run, 0.9, i, i + 11)])
+
+        scan, calls = _scanner([flag_mask])
+        _patch(monkeypatch, _gate(), scan)
+        out = asyncio.run(G.screen_query(MagicMock(), "my ssn is 456-78-9012 please"))
+        assert out.allowed is False and out.action == G.ACTION_BLOCKED
+        assert "cannot be masked further" in out.reason
+        assert calls["n"] <= G.MAX_REDACTION_ROUNDS + 1, "the loop must terminate"
+
+    def test_rounds_are_bounded(self, monkeypatch):
+        """A scanner that flags something new every round still terminates."""
+        state = {"i": 0}
+
+        def always_new(t):
+            state["i"] += 1
+            # Flag a different real word each round so masking always progresses.
+            words = ["alpha", "bravo", "charlie", "delta", "echo"]
+            w = words[min(state["i"] - 1, len(words) - 1)]
+            if w not in t:
+                return ScanResult(findings=[])
+            i = t.index(w)
+            return ScanResult(findings=[ScanFinding(
+                "gliner", "social security number", w, 0.9, i, i + len(w))])
+
+        scan, calls = _scanner([always_new])
+        _patch(monkeypatch, _gate(), scan)
+        out = asyncio.run(G.screen_query(MagicMock(), "alpha bravo charlie delta echo"))
+        assert out.allowed is False and out.action == G.ACTION_BLOCKED
+        assert out.rounds == G.MAX_REDACTION_ROUNDS
+        assert calls["n"] == G.MAX_REDACTION_ROUNDS + 1
+
+    def test_rounds_recorded_on_the_audit_detail(self, monkeypatch):
+        scan, _ = _scanner([ScanResult(findings=[_ssn_finding()]), None])
+        _patch(monkeypatch, _gate(), scan)
+        detail = asyncio.run(G.screen_query(MagicMock(), "ssn 123-45-6789 aid")).audit_detail()
+        assert detail["rounds"] == 1
+
+
+class TestProvenance:
+    """The audit trail must answer: what was submitted, what was sent, and
+    what every DLP pass decided."""
+
+    def test_each_pass_is_recorded_with_its_text_and_verdict(self, monkeypatch):
+        text = "contact 208-885-6111 or ssn 456-78-9012 for records"
+        ssn_at = text.index("456-78-9012")
+
+        def p1(t):
+            return ScanResult(findings=[ScanFinding(
+                "regex", "social security number", "456-78-9012", 1.0, ssn_at, ssn_at + 11)])
+
+        def p2(t):
+            span = "ssn " + "*" * 11
+            i = t.index(span)
+            return ScanResult(findings=[ScanFinding(
+                "gliner", "social security number", span, 0.9, i, i + len(span))])
+
+        scan, _ = _scanner([p1, p2, None])
+        _patch(monkeypatch, _gate(), scan)
+        out = asyncio.run(G.screen_query(MagicMock(), text))
+
+        passes = out.audit_detail()["passes"]
+        assert [p["pass"] for p in passes] == [1, 2, 3]
+        assert [p["verdict"] for p in passes] == ["fail", "fail", "pass"]
+        assert passes[0]["text"] == text, "pass 1 records the caller's own query"
+        assert passes[1]["text"] == "contact 208-885-6111 or ssn *********** for records"
+        assert passes[2]["text"] == out.query, "the last pass records what was sent"
+        assert passes[0]["severity"] == "major" and passes[2]["severity"] is None
+        # findings are masked evidence, never the raw value
+        assert "456-78-9012" not in str(passes[0]["findings"])
+        assert out.original_query == text
+
+    def test_blocked_trail_shows_how_far_masking_got(self, monkeypatch):
+        def flag(t):
+            run = "*" * 11
+            if run in t:
+                i = t.index(run)
+                return ScanResult(findings=[ScanFinding(
+                    "gliner", "social security number", run, 0.9, i, i + 11)])
+            i = t.index("456-78-9012")
+            return ScanResult(findings=[ScanFinding(
+                "regex", "social security number", "456-78-9012", 1.0, i, i + 11)])
+
+        scan, _ = _scanner([flag])
+        _patch(monkeypatch, _gate(), scan)
+        out = asyncio.run(G.screen_query(MagicMock(), "my ssn is 456-78-9012 please"))
+        assert out.allowed is False
+        passes = out.audit_detail()["passes"]
+        assert [p["verdict"] for p in passes] == ["fail", "fail"]
+        # outbound_text is the furthest-masked form, NOT the original
+        assert out.outbound_text() == "my ssn is *********** please"
+        assert out.original_query == "my ssn is 456-78-9012 please"
+
+    def test_clean_query_records_a_single_passing_pass(self, monkeypatch):
+        scan, _ = _scanner([None])
+        _patch(monkeypatch, _gate(), scan)
+        out = asyncio.run(G.screen_query(MagicMock(), "library hours"))
+        passes = out.audit_detail()["passes"]
+        assert len(passes) == 1 and passes[0]["verdict"] == "pass"
+        assert passes[0]["text"] == "library hours"
+
+    def test_original_can_be_withheld_by_policy(self, monkeypatch):
+        """store_original off keeps the verdicts but not the caller's text."""
+        async def _load(db):
+            return {"enabled": True, "min_severity": "moderate",
+                    "on_scanner_error": "block", "store_original": False}
+
+        scan, _ = _scanner([ScanResult(findings=[_ssn_finding()]), None])
+        _patch(monkeypatch, _load, scan)
+        out = asyncio.run(G.screen_query(MagicMock(), "ssn 123-45-6789 aid"))
+        passes = out.audit_detail()["passes"]
+        assert passes[0]["text"] is None and passes[0]["text_stored"] is False
+        assert passes[0]["text_chars"] == len("ssn 123-45-6789 aid")
+        assert passes[0]["verdict"] == "fail", "the verdict is still recorded"
+        # later passes scan masked text, so they are always kept
+        assert passes[1]["text_stored"] is True
+
+    def test_degraded_pass_is_flagged_in_the_trail(self, monkeypatch):
+        degraded = ScanResult(findings=[], scanner_errors=["gliner: down"])
+        scan, _ = _scanner([degraded])
+        _patch(monkeypatch, _gate(on_error="allow"), scan)
+        out = asyncio.run(G.screen_query(MagicMock(), "q"))
+        p = out.audit_detail()["passes"][0]
+        assert p["degraded"] is True and p["scanner_errors"] == ["gliner: down"]
+
+    def test_audit_row_carries_both_texts(self):
+        """record_search stores the original only when screening changed it."""
+        assert "query_original=original_raw" in AUDIT_SRC
+        assert 'candidate != (query or "")' in AUDIT_SRC, "no pointless duplicate"
+        assert 'first.get("text_stored", True)' in AUDIT_SRC, "honours the policy"
+        # a blocked row records the furthest-masked form, not the original
+        assert "query=screen.outbound_text()" in AUDIT_SRC
+
+    def test_viewer_shows_before_after_and_the_pass_table(self):
+        audit = (_APP_DIR / "dashboard" / "templates" / "admin" / "audit.html").read_text()
+        assert "wsDlpProvenance" in audit
+        assert "Query submitted by caller" in audit
+        assert "Query sent to provider" in audit
+        assert "Furthest-masked form (not sent)" in audit
+        assert "nothing was sent to the provider" in audit.lower()
+        for col in ("Pass", "Verdict", "Severity", "Categories", "Text scanned"):
+            assert f"<th>{col}</th>" in audit, col
+        table = (_APP_DIR / "dashboard" / "templates" / "admin" / "_audit_web_search.html").read_text()
+        assert "log.query_original" in table, "the row hints at the before-text"
+
+    def test_export_includes_both_texts(self):
+        routes = (_APP_DIR / "dashboard" / "routes.py").read_text()
+        assert '"query_original": row.query_original' in routes
+        assert '"query", "query_original"' in routes
+
+    def test_migration_083(self):
+        mig = (MIGRATIONS / "20260822_000002_083_websearch_query_provenance.py").read_text()
+        assert 'revision = "083"' in mig and 'down_revision = "082"' in mig
+        assert "query_original" in mig
+        assert "search.audit.store_original_query" in mig
+        assert "op.drop_column" in mig
 
 
 class TestBlocking:
@@ -342,7 +573,7 @@ class TestWiringAndSurfaces:
         assert "shield-x" in WS_HTML and "shield-check" in WS_HTML
         assert "value=\"blocked\"" in WS_HTML
         audit = (_APP_DIR / "dashboard" / "templates" / "admin" / "audit.html").read_text()
-        assert "DLP screening: " in audit, "the expand view must show the screening detail"
+        assert "wsDlpProvenance(data)" in audit, "the expand view must show the screening detail"
 
     def test_migration_082(self):
         mig = (MIGRATIONS / "20260822_000001_082_websearch_dlp_screening.py").read_text()

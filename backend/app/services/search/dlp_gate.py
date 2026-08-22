@@ -62,10 +62,17 @@ logger = get_logger(__name__)
 ENABLED_KEY = "dlp.websearch.enabled"
 MIN_SEVERITY_KEY = "dlp.websearch.min_severity"
 ON_ERROR_KEY = "dlp.websearch.on_scanner_error"
+# Whether the audit trail keeps the caller's ORIGINAL (pre-redaction) query.
+# On by default: an auditor investigating a block needs to see what was
+# actually typed. Turn it off for a stricter posture — the row then keeps the
+# masked evidence, the per-pass verdicts, and the outbound text, but not the
+# original. Lives in search.audit.* with the other audit-storage switches.
+STORE_ORIGINAL_KEY = "search.audit.store_original_query"
 
 DEFAULT_ENABLED = False
 DEFAULT_MIN_SEVERITY = "moderate"
 DEFAULT_ON_ERROR = "block"
+DEFAULT_STORE_ORIGINAL = True
 
 VALID_MIN_SEVERITIES = ("minor", "moderate", "major")
 VALID_ON_ERROR = ("block", "allow")
@@ -107,7 +114,29 @@ class QueryScreen:
     categories: List[str] = field(default_factory=list)
     masked: List[dict] = field(default_factory=list)
     degraded: bool = False                 # a scanner failed to run
+    rounds: int = 0                        # mask/rescan rounds actually used
+    original_query: str = ""               # exactly what the caller submitted
+    # One entry per DLP pass, in order, each recording the text that was
+    # scanned and whether it passed. This is the provenance trail: pass 1's
+    # text is the original, the last entry's text is what went out (or the
+    # furthest-masked form, when the search was refused).
+    passes: List[dict] = field(default_factory=list)
     reason: Optional[str] = None
+
+    def outbound_text(self) -> str:
+        """The furthest-processed form of the query.
+
+        When allowed, this is exactly what was sent. When blocked, it is the
+        most-masked form reached before the gate gave up — useful to see how
+        far masking got, and unambiguous because the row's status and NULL
+        request_url record that nothing actually went out.
+        """
+        if self.allowed:
+            return self.query or self.original_query
+        for entry in reversed(self.passes):
+            if entry.get("text_stored") and entry.get("text") is not None:
+                return entry["text"]
+        return self.original_query
 
     def audit_detail(self) -> Optional[dict]:
         """The JSON blob stored on the web-search audit row."""
@@ -120,6 +149,8 @@ class QueryScreen:
             "categories": self.categories,
             "masked": self.masked,
             "degraded": self.degraded,
+            "rounds": self.rounds,
+            "passes": self.passes,
             "reason": self.reason,
         }
 
@@ -132,19 +163,24 @@ async def load_gate_config(db) -> dict:
         enabled = bool(await crud.get_config_json(db, ENABLED_KEY, DEFAULT_ENABLED))
         min_sev = await crud.get_config_json(db, MIN_SEVERITY_KEY, DEFAULT_MIN_SEVERITY)
         on_error = await crud.get_config_json(db, ON_ERROR_KEY, DEFAULT_ON_ERROR)
+        store_original = bool(
+            await crud.get_config_json(db, STORE_ORIGINAL_KEY, DEFAULT_STORE_ORIGINAL)
+        )
     except Exception:
         # A config read failure must not silently disable screening; but with
         # no readable config we also cannot know it was ever enabled. Off is
         # the honest answer, and it is logged loudly.
         logger.error("websearch_dlp_config_unreadable", exc_info=True)
         return {"enabled": False, "min_severity": DEFAULT_MIN_SEVERITY,
-                "on_scanner_error": DEFAULT_ON_ERROR}
+                "on_scanner_error": DEFAULT_ON_ERROR,
+                "store_original": DEFAULT_STORE_ORIGINAL}
 
     if min_sev not in VALID_MIN_SEVERITIES:
         min_sev = DEFAULT_MIN_SEVERITY
     if on_error not in VALID_ON_ERROR:
         on_error = DEFAULT_ON_ERROR
-    return {"enabled": enabled, "min_severity": min_sev, "on_scanner_error": on_error}
+    return {"enabled": enabled, "min_severity": min_sev, "on_scanner_error": on_error,
+            "store_original": store_original}
 
 
 def _meets_threshold(severity: Optional[str], threshold: str) -> bool:
@@ -166,29 +202,6 @@ def _worst_severity(findings, severity_rules) -> Optional[str]:
     return classify_severity(kept, severity_rules)
 
 
-def _redactions(findings, severity_rules) -> List[Tuple[str, str]]:
-    """(value, category) pairs for every non-ignored finding, deduplicated.
-
-    Longest value first: redacting a short value that is a substring of a
-    longer one would corrupt the longer match before it is replaced.
-    """
-    from backend.app.services.dlp_scanner import is_ignored_category
-
-    seen = set()
-    out: List[Tuple[str, str]] = []
-    for f in findings or []:
-        value = (getattr(f, "text", "") or "").strip()
-        category = getattr(f, "category", "") or "sensitive"
-        if not value or value in seen:
-            continue
-        if is_ignored_category(category, severity_rules):
-            continue
-        seen.add(value)
-        out.append((value, category))
-    out.sort(key=lambda pair: len(pair[0]), reverse=True)
-    return out
-
-
 def _masked_evidence(findings, severity_rules) -> List[dict]:
     """Masked snippets for the audit row — never the verbatim value."""
     from backend.app.services.dlp_scanner import is_ignored_category, mask_snippet
@@ -208,46 +221,147 @@ def _masked_evidence(findings, severity_rules) -> List[dict]:
     return out
 
 
-# The placeholder substituted for a redacted value.
+# Redaction masks the flagged text with ASTERISKS rather than substituting a
+# placeholder token, and it masks the WHOLE span the scanner reported — the
+# label word included, not just the value.
 #
-# NEUTRAL ON PURPOSE — no category name. The inference-side redaction
-# (dlp_enforcement.redact_text) writes "[REDACTED: social security number]",
-# which is right there: the model benefits from knowing what was removed, and
-# that text is never re-scanned. Here it is actively harmful, because step 3
-# re-scans the redacted query and GLiNER flags the words "social security
-# number" INSIDE the placeholder as a social security number. Verified against
-# the production scanners:
+# Both choices are forced by step 3, which re-scans the redacted query. Measured
+# against the production scanners:
 #
-#   "ssn [REDACTED: social security number] what documents..." -> major
-#   "ssn [REDACTED] what documents..."                         -> clean
+#   "...or ssn [REDACTED] for records"     -> flagged (span "ssn [REDACTED]")
+#   "...or ssn *********** for records"    -> flagged (span "ssn ***********")
+#   "...or *** *********** for records"    -> CLEAN
 #
-# A labelled placeholder therefore makes redaction self-defeating: every
-# redacted query would block on the second pass. The category is preserved in
-# the audit row's dlp_detail, so nothing is lost to the auditor.
-REDACTION_PLACEHOLDER = "[REDACTED]"
+# A word-shaped placeholder re-primes GLiNER, and so does the user's own label
+# word left standing next to a masked value. Only masking the entire reported
+# span removes the thing the scanner is reacting to.
+#
+# Whitespace is preserved so the query keeps its shape: "ssn 456-78-9012"
+# becomes "*** ***********", not one undifferentiated run.
+MASK_CHAR = "*"
 
-# Matches both this module's neutral placeholder and the labelled inference-side
-# form, so the "is anything searchable left?" test is correct either way.
-_PLACEHOLDER_RE = re.compile(r"\[REDACTED(?::[^\]]*)?\]")
+
+def mask_span(text: str) -> str:
+    """Asterisk every non-space character, preserving the whitespace layout."""
+    return "".join(MASK_CHAR if not ch.isspace() else ch for ch in text or "")
 
 
-def _apply_redactions(text: str, redactions: List[Tuple[str, str]]) -> str:
-    """Replace each offending value with the neutral placeholder.
+# Rounds of mask-then-rescan before giving up. The caller's contract is
+# "redact, verify, and fail if it will not clear"; a bounded loop is that same
+# contract when one round of masking exposes a NEW span (the label word beside
+# the value it used to sit next to). It always terminates: a round that does
+# not change the text stops immediately, which is also what happens when the
+# scanner flags an already-masked run like "***********".
+MAX_REDACTION_ROUNDS = 3
 
-    Value-based substitution, longest value first (the caller sorts), so a
-    short match that is a substring of a longer one cannot corrupt it.
+
+def _mask_findings(text: str, findings, severity_rules) -> str:
+    """Mask every non-ignored finding in ``text`` with asterisks.
+
+    Offsets are used when they demonstrably line up with the reported text —
+    that is the precise way to remove a multi-word span like "ssn 456-78-9012".
+    A finding whose offsets do not check out (the LLM scanner reports none, and
+    a truncated scan can shift them) falls back to value substitution, so a
+    finding is never skipped merely because its offsets were unusable.
     """
-    out = text or ""
-    for value, _category in redactions:
-        if value:
-            out = out.replace(value, REDACTION_PLACEHOLDER)
+    from backend.app.services.dlp_scanner import is_ignored_category
+
+    spans: List[Tuple[int, int]] = []
+    values: List[str] = []
+    for f in findings or []:
+        category = getattr(f, "category", "") or "sensitive"
+        if is_ignored_category(category, severity_rules):
+            continue
+        value = getattr(f, "text", "") or ""
+        if not value:
+            continue
+        start = getattr(f, "start", 0) or 0
+        end = getattr(f, "end", 0) or 0
+        if 0 <= start < end <= len(text) and text[start:end] == value:
+            spans.append((start, end))
+        else:
+            values.append(value)
+
+    out = text
+    # Right-to-left so each replacement leaves earlier offsets valid.
+    for start, end in sorted(spans, reverse=True):
+        out = out[:start] + mask_span(out[start:end]) + out[end:]
+    # Longest first: a short value that is a substring of a longer one would
+    # otherwise corrupt the longer match before it is replaced.
+    for value in sorted(set(values), key=len, reverse=True):
+        out = out.replace(value, mask_span(value))
     return out
 
 
+def _record_pass(
+    screen: "QueryScreen", *, number: int, text: str, result, severity_rules,
+    threshold: str, store_text: bool,
+) -> None:
+    """Append one DLP pass to the provenance trail.
+
+    ``store_text`` is False for pass 1 when the operator has turned off
+    storage of the original query: every later pass is already masked, so
+    only the first one can carry sensitive text.
+    """
+    from backend.app.services.dlp_scanner import is_ignored_category, mask_snippet
+
+    findings = list(result.findings) if result is not None else []
+    kept = [
+        f for f in findings
+        if not is_ignored_category(getattr(f, "category", "") or "", severity_rules)
+    ]
+    severity = _worst_severity(findings, severity_rules)
+    entry = {
+        "pass": number,
+        "text": text if store_text else None,
+        "text_stored": bool(store_text),
+        "text_chars": len(text or ""),
+        "severity": severity,
+        # The verdict an auditor reads: did THIS text clear the configured bar?
+        "verdict": "fail" if _meets_threshold(severity, threshold) else "pass",
+        "categories": sorted({
+            getattr(f, "category", "") for f in kept if getattr(f, "category", "")
+        }),
+        "findings": [
+            {
+                "scanner": getattr(f, "scanner", "?"),
+                "category": getattr(f, "category", "") or "sensitive",
+                "masked": mask_snippet(getattr(f, "text", "") or ""),
+            }
+            for f in kept[:MAX_MASKED_SNIPPETS]
+        ],
+        "degraded": bool(result is not None and getattr(result, "scanner_errors", None)),
+        "scanner_errors": [e[:160] for e in (getattr(result, "scanner_errors", None) or [])],
+    }
+    screen.passes.append(entry)
+
+
+def _degraded_block(screen: "QueryScreen", result, gate: dict, reason: str) -> bool:
+    """Record a degraded scan; True when the policy says to refuse the search."""
+    if result is None or not getattr(result, "scanner_errors", None):
+        return False
+    screen.degraded = True
+    logger.error(
+        "websearch_dlp_scan_degraded",
+        errors=[e[:120] for e in result.scanner_errors],
+        policy=gate.get("on_scanner_error"),
+    )
+    if gate.get("on_scanner_error") != "block":
+        return False
+    screen.allowed = False
+    screen.action = ACTION_BLOCKED
+    screen.reason = reason
+    return True
+
+
 def _has_content(text: str) -> bool:
-    """Whether anything searchable survived redaction."""
-    stripped = _PLACEHOLDER_RE.sub(" ", text or "")
-    return any(ch.isalnum() for ch in stripped)
+    """Whether anything searchable survived redaction.
+
+    Masks are pure punctuation, so this reduces to "is there an alphanumeric
+    character left" — a query that is nothing but asterisks is not a search
+    worth sending, and is refused rather than sent as noise.
+    """
+    return any(ch.isalnum() for ch in text or "")
 
 
 async def screen_query(db, query: str, *, dlp_config: Optional[dict] = None) -> QueryScreen:
@@ -257,7 +371,7 @@ async def screen_query(db, query: str, *, dlp_config: Optional[dict] = None) -> 
     when allowed, ``query`` is what should be sent (redacted or not); when not,
     the search must be abandoned.
     """
-    screen = QueryScreen(allowed=True, query=query or "")
+    screen = QueryScreen(allowed=True, query=query or "", original_query=query or "")
 
     try:
         gate = await load_gate_config(db)
@@ -273,20 +387,16 @@ async def screen_query(db, query: str, *, dlp_config: Optional[dict] = None) -> 
         threshold = gate["min_severity"]
         screen.scanned = True
 
+        store_original = gate.get("store_original", DEFAULT_STORE_ORIGINAL)
+
         # --- Pass 1 ---------------------------------------------------
         result = await run_dlp_scan(query, dlp_config)
-        if result is not None and result.scanner_errors:
-            screen.degraded = True
-            logger.error(
-                "websearch_dlp_scan_degraded",
-                errors=[e[:120] for e in result.scanner_errors],
-                policy=gate["on_scanner_error"],
-            )
-            if gate["on_scanner_error"] == "block":
-                screen.allowed = False
-                screen.action = ACTION_BLOCKED
-                screen.reason = "DLP scanners are unavailable and the policy is to block"
-                return screen
+        _record_pass(screen, number=1, text=query, result=result,
+                     severity_rules=severity_rules, threshold=threshold,
+                     store_text=store_original)
+        if _degraded_block(screen, result, gate,
+                           "DLP scanners are unavailable and the policy is to block"):
+            return screen
 
         findings = list(result.findings) if result is not None else []
         screen.severity = _worst_severity(findings, severity_rules)
@@ -300,44 +410,63 @@ async def screen_query(db, query: str, *, dlp_config: Optional[dict] = None) -> 
 
         screen.masked = _masked_evidence(findings, severity_rules)
 
-        # --- Redact ---------------------------------------------------
-        redactions = _redactions(findings, severity_rules)
-        redacted = _apply_redactions(query, redactions)
-        if not redactions or redacted == query:
-            # Nothing actionable to remove (e.g. GLiNER flagged the phrase
-            # rather than a value): there is no safe query to send.
-            screen.allowed = False
-            screen.action = ACTION_BLOCKED
-            screen.reason = "Sensitive content could not be redacted from the query"
-            return screen
+        # --- Mask, verify, repeat -------------------------------------
+        # Each round masks what the last scan flagged and re-scans the result.
+        # A second round is often what clears a query: masking the value can
+        # expose the user's own label word ("ssn ***********") as a new span,
+        # and only masking that too satisfies the scanner. The loop stops the
+        # moment a round changes nothing, which is also what happens when the
+        # scanner flags an already-masked run — there is no progress to be had,
+        # so the search is refused rather than retried forever.
+        current = query
+        current_findings = findings
+        for round_no in range(1, MAX_REDACTION_ROUNDS + 1):
+            masked_text = _mask_findings(current, current_findings, severity_rules)
+            screen.rounds = round_no
 
-        if not _has_content(redacted):
-            screen.allowed = False
-            screen.action = ACTION_BLOCKED
-            screen.reason = "Nothing searchable remained after redaction"
-            return screen
+            if masked_text == current:
+                screen.allowed = False
+                screen.action = ACTION_BLOCKED
+                screen.reason = (
+                    "Sensitive content could not be redacted from the query"
+                    if round_no == 1
+                    else "Redacted query still contains sensitive data that cannot be masked further"
+                )
+                return screen
 
-        # --- Pass 2: prove the redaction actually worked ---------------
-        second = await run_dlp_scan(redacted, dlp_config)
-        if second is not None and second.scanner_errors and gate["on_scanner_error"] == "block":
-            screen.degraded = True
-            screen.allowed = False
-            screen.action = ACTION_BLOCKED
-            screen.reason = "DLP scanners became unavailable while verifying the redaction"
-            return screen
+            if not _has_content(masked_text):
+                screen.allowed = False
+                screen.action = ACTION_BLOCKED
+                screen.reason = "Nothing searchable remained after redaction"
+                return screen
 
-        second_findings = list(second.findings) if second is not None else []
-        screen.second_severity = _worst_severity(second_findings, severity_rules)
-        if _meets_threshold(screen.second_severity, threshold):
-            screen.allowed = False
-            screen.action = ACTION_BLOCKED
-            screen.reason = "Redacted query still contains sensitive data"
-            return screen
+            current = masked_text
+            verify = await run_dlp_scan(current, dlp_config)
+            # Every later pass scans already-masked text, so it is always safe
+            # to store — this is the "after" half of the before/after trail.
+            _record_pass(screen, number=round_no + 1, text=current, result=verify,
+                         severity_rules=severity_rules, threshold=threshold,
+                         store_text=True)
+            if _degraded_block(screen, verify, gate,
+                               "DLP scanners became unavailable while verifying the redaction"):
+                return screen
 
-        screen.allowed = True
-        screen.action = ACTION_REDACTED
-        screen.query = redacted
-        screen.reason = "Sensitive content redacted before sending"
+            current_findings = list(verify.findings) if verify is not None else []
+            screen.second_severity = _worst_severity(current_findings, severity_rules)
+            if not _meets_threshold(screen.second_severity, threshold):
+                screen.allowed = True
+                screen.action = ACTION_REDACTED
+                screen.query = current
+                screen.reason = (
+                    f"Sensitive content masked before sending "
+                    f"({round_no} round{'s' if round_no != 1 else ''})"
+                )
+                return screen
+
+        # Still flagged after the last permitted round.
+        screen.allowed = False
+        screen.action = ACTION_BLOCKED
+        screen.reason = "Redacted query still contains sensitive data"
         return screen
 
     except Exception:

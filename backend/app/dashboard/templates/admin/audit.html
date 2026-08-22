@@ -303,13 +303,7 @@
                         return;
                     }
                     var html = '';
-                    if (data.dlp_action) {
-                        html += wsSection(
-                            'DLP screening: ' + data.dlp_action,
-                            data.dlp_detail,
-                            data.dlp_action === 'blocked' ? 'border-danger' : ''
-                        );
-                    }
+                    if (data.dlp_action) { html += wsDlpProvenance(data); }
                     html += wsSection('Sent to provider', {
                         url: data.request_url,
                         params: data.request_params,
@@ -339,6 +333,74 @@
                 });
         });
     });
+
+    // The DLP provenance block: what the caller submitted, what actually went
+    // out, and the verdict of every screening pass in between.
+    function wsDlpProvenance(data) {
+        var d = data.dlp_detail || {};
+        var action = data.dlp_action;
+        var tone = action === 'blocked' ? 'danger' : (action === 'redacted' ? 'warning' : 'success');
+        var verdictLabel = action === 'blocked'
+            ? 'BLOCKED — nothing was sent to the provider'
+            : (action === 'redacted' ? 'REDACTED — the masked query was sent' : 'PASSED — sent unchanged');
+
+        var html = '<div class="mb-3 border rounded p-2 border-' + tone + '">';
+        html += '<div class="mb-2"><span class="badge bg-' + tone + '">DLP ' + escapeHtml(action) + '</span> ' +
+                '<strong>' + escapeHtml(verdictLabel) + '</strong>';
+        if (d.reason) { html += ' <span class="text-muted small">' + escapeHtml(d.reason) + '</span>'; }
+        html += '</div>';
+
+        // Before / after, side by side and explicitly labelled.
+        html += '<div class="mb-2"><strong>Query submitted by caller</strong>';
+        if (data.query_original) {
+            html += '<pre class="mt-1 p-2 bg-body-tertiary border rounded" style="white-space:pre-wrap;font-size:.85rem;">' +
+                    escapeHtml(data.query_original) + '</pre>';
+        } else {
+            html += '<pre class="mt-1 p-2 bg-body-tertiary border rounded" style="white-space:pre-wrap;font-size:.85rem;">' +
+                    escapeHtml(data.query) + '</pre>' +
+                    '<div class="form-text">Unchanged by screening' +
+                    (d.action && d.action !== 'none' ? ', or storage of the original is disabled' : '') + '.</div>';
+        }
+        html += '</div>';
+
+        html += '<div class="mb-2"><strong>' +
+                (action === 'blocked' ? 'Furthest-masked form (not sent)' : 'Query sent to provider') +
+                '</strong><pre class="mt-1 p-2 bg-body-tertiary border rounded" style="white-space:pre-wrap;font-size:.85rem;">' +
+                escapeHtml(data.query) + '</pre></div>';
+
+        // Pass-by-pass table.
+        var passes = d.passes || [];
+        if (passes.length) {
+            html += '<div class="table-responsive"><table class="table table-sm table-bordered mb-1">' +
+                    '<thead><tr><th>Pass</th><th>Verdict</th><th>Severity</th><th>Categories</th>' +
+                    '<th>Findings (masked)</th><th>Text scanned</th></tr></thead><tbody>';
+            passes.forEach(function (p) {
+                var ok = p.verdict === 'pass';
+                html += '<tr>' +
+                    '<td>' + escapeHtml(p.pass) + '</td>' +
+                    '<td><span class="badge bg-' + (ok ? 'success' : 'danger') + '">' +
+                        escapeHtml(p.verdict) + '</span>' +
+                        (p.degraded ? ' <span class="badge bg-warning text-dark" title="' +
+                            escapeHtml((p.scanner_errors || []).join('; ')) + '">degraded</span>' : '') +
+                    '</td>' +
+                    '<td>' + escapeHtml(p.severity || '—') + '</td>' +
+                    '<td>' + escapeHtml((p.categories || []).join(', ') || '—') + '</td>' +
+                    '<td>' + escapeHtml((p.findings || []).map(function (f) {
+                        return f.category + ': ' + f.masked + ' (' + f.scanner + ')';
+                    }).join('; ') || '—') + '</td>' +
+                    '<td><code style="font-size:.78rem;">' +
+                        (p.text_stored && p.text !== null && p.text !== undefined
+                            ? escapeHtml(p.text)
+                            : '<span class="text-muted">not stored (' + escapeHtml(p.text_chars) + ' chars)</span>') +
+                    '</code></td>' +
+                '</tr>';
+            });
+            html += '</tbody></table></div>';
+            html += '<div class="form-text">Pass 1 scans the caller\'s query; each later pass scans the result of the previous masking round.</div>';
+        }
+        html += '</div>';
+        return html;
+    }
 
     function wsSection(title, value, extraClass) {
         var body = typeof value === 'string' ? value : JSON.stringify(value, null, 2);

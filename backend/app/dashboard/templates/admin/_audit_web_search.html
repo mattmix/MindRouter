@@ -152,8 +152,16 @@
                             <a href="/admin/users/{{ log.user_id }}" title="{{ log.user.email if log.user else '' }}">{{ log.user_id }}</a>
                             {% else %}<span class="text-muted">&mdash;</span>{% endif %}
                         </td>
-                        <td style="max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;"
-                            title="{{ log.query }}">{{ log.query }}</td>
+                        <td style="max-width: 320px;">
+                            <div style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;"
+                                 title="{{ log.query }}">{{ log.query }}</div>
+                            {% if log.query_original %}
+                            <div class="small text-muted" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;"
+                                 title="Submitted by the caller before DLP screening: {{ log.query_original }}">
+                                <i class="bi bi-arrow-return-right"></i> was: {{ log.query_original }}
+                            </div>
+                            {% endif %}
+                        </td>
                         <td>
                             {% if log.dlp_action == 'blocked' %}
                             <span class="badge bg-danger" title="{{ log.dlp_detail.reason if log.dlp_detail else '' }}"><i class="bi bi-shield-x"></i> blocked</span>
