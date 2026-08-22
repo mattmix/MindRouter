@@ -208,10 +208,40 @@ def _masked_evidence(findings, severity_rules) -> List[dict]:
     return out
 
 
-# A redaction placeholder, whole: "[REDACTED: social security number]". The
-# CATEGORY NAME inside it is alphanumeric, so stripping only the brackets would
-# make a fully-redacted query look like it still had searchable words.
-_PLACEHOLDER_RE = re.compile(r"\[REDACTED:[^\]]*\]")
+# The placeholder substituted for a redacted value.
+#
+# NEUTRAL ON PURPOSE — no category name. The inference-side redaction
+# (dlp_enforcement.redact_text) writes "[REDACTED: social security number]",
+# which is right there: the model benefits from knowing what was removed, and
+# that text is never re-scanned. Here it is actively harmful, because step 3
+# re-scans the redacted query and GLiNER flags the words "social security
+# number" INSIDE the placeholder as a social security number. Verified against
+# the production scanners:
+#
+#   "ssn [REDACTED: social security number] what documents..." -> major
+#   "ssn [REDACTED] what documents..."                         -> clean
+#
+# A labelled placeholder therefore makes redaction self-defeating: every
+# redacted query would block on the second pass. The category is preserved in
+# the audit row's dlp_detail, so nothing is lost to the auditor.
+REDACTION_PLACEHOLDER = "[REDACTED]"
+
+# Matches both this module's neutral placeholder and the labelled inference-side
+# form, so the "is anything searchable left?" test is correct either way.
+_PLACEHOLDER_RE = re.compile(r"\[REDACTED(?::[^\]]*)?\]")
+
+
+def _apply_redactions(text: str, redactions: List[Tuple[str, str]]) -> str:
+    """Replace each offending value with the neutral placeholder.
+
+    Value-based substitution, longest value first (the caller sorts), so a
+    short match that is a substring of a longer one cannot corrupt it.
+    """
+    out = text or ""
+    for value, _category in redactions:
+        if value:
+            out = out.replace(value, REDACTION_PLACEHOLDER)
+    return out
 
 
 def _has_content(text: str) -> bool:
@@ -271,10 +301,8 @@ async def screen_query(db, query: str, *, dlp_config: Optional[dict] = None) -> 
         screen.masked = _masked_evidence(findings, severity_rules)
 
         # --- Redact ---------------------------------------------------
-        from backend.app.services.dlp_enforcement import redact_text
-
         redactions = _redactions(findings, severity_rules)
-        redacted = redact_text(query, redactions) or ""
+        redacted = _apply_redactions(query, redactions)
         if not redactions or redacted == query:
             # Nothing actionable to remove (e.g. GLiNER flagged the phrase
             # rather than a value): there is no safe query to send.

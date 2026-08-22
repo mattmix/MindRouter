@@ -112,10 +112,30 @@ class TestRedaction:
         out = asyncio.run(G.screen_query(MagicMock(), "my ssn is 123-45-6789 refund?"))
         assert out.allowed and out.action == G.ACTION_REDACTED
         assert "123-45-6789" not in out.query
-        assert "[REDACTED: social security number]" in out.query
+        assert G.REDACTION_PLACEHOLDER in out.query
         assert calls["n"] == 2, "the redaction must be re-verified, not assumed"
         assert "123-45-6789" not in calls["texts"][1], "pass 2 scans the REDACTED text"
         assert out.severity == "major" and out.second_severity is None
+
+    def test_placeholder_is_neutral_so_it_cannot_retrigger_the_scanner(self, monkeypatch):
+        """The labelled inference placeholder would re-trip GLiNER on pass 2.
+
+        Verified against the production scanners: "[REDACTED: social security
+        number]" is itself flagged as a social security number, so a labelled
+        placeholder makes every redaction block on the second pass.
+        """
+        scan, calls = _scanner([ScanResult(findings=[_ssn_finding()]), None])
+        _patch(monkeypatch, _gate(), scan)
+        out = asyncio.run(G.screen_query(MagicMock(), "ssn 123-45-6789 financial aid"))
+        assert G.REDACTION_PLACEHOLDER == "[REDACTED]"
+        assert "social security number" not in out.query, \
+            "the category name must not survive into the query that gets re-scanned"
+        assert "social security number" not in calls["texts"][1]
+
+    def test_has_content_understands_both_placeholder_forms(self):
+        assert G._has_content("[REDACTED]") is False
+        assert G._has_content("[REDACTED: social security number]") is False
+        assert G._has_content("refund [REDACTED] status") is True
 
     def test_masked_evidence_never_holds_the_raw_value(self, monkeypatch):
         scan, _ = _scanner([ScanResult(findings=[_ssn_finding()]), None])
