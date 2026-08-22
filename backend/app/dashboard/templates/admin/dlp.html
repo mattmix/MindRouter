@@ -489,8 +489,18 @@
                                 <div class="form-text">Unlike the inline gate on inference, this defaults to <strong>fail closed</strong>: search is optional enrichment, and unscanned text should not reach a third party.</div>
                             </div>
                             <div class="col-md-4">
+                                <label class="form-label fw-bold">Audit trail</label>
+                                <div class="form-check">
+                                    <input class="form-check-input" type="checkbox" id="websearch_store_original"
+                                           name="websearch_store_original"
+                                           {% if config.websearch_store_original %}checked{% endif %}>
+                                    <label class="form-check-label" for="websearch_store_original">Keep the caller's original query</label>
+                                </div>
+                                <div class="form-text">Records the query <em>before</em> redaction alongside the one actually sent, so <a href="/admin/audit?kind=web_search">Audit Log &rarr; Web search</a> shows both. Turn off for a stricter posture: the pass-by-pass verdicts and masked evidence are still kept, only the caller's text is withheld.</div>
+                            </div>
+                            <div class="col-12">
                                 <div class="alert alert-secondary py-2 px-3 mb-0 small">
-                                    <i class="bi bi-info-circle me-1"></i>Adds a synchronous scan before each search, so it costs latency only while enabled. The post-search LLM request keeps its normal DLP treatment, unchanged.
+                                    <i class="bi bi-info-circle me-1"></i>Adds a synchronous scan before each search, so it costs latency only while enabled. Redaction masks the whole flagged span with asterisks (<code>ssn 456-78-9012</code> &rarr; <code>*** ***********</code>) and re-scans until it clears or gives up. The post-search LLM request keeps its normal DLP treatment, unchanged.
                                 </div>
                             </div>
                         </div>
@@ -598,6 +608,9 @@
 
                 <h6>Which searches are covered</h6>
                 <p>All of them &mdash; the <code>/v1/search</code> API, the Responses API <code>web_search</code> tool, the MCP search tool, dashboard chat auto-search, the admin test query, and catalog enrichment. They share one code path, so none can bypass screening.</p>
+
+                <h6>Audit trail</h6>
+                <p>Each screened search records <strong>the query submitted by the caller</strong>, <strong>the query actually sent</strong>, and a <strong>pass-by-pass table</strong> — every DLP pass with the exact text it scanned and whether it passed or failed. A blocked search records how far masking got and that nothing was sent. Redaction masks the whole flagged span with asterisks, so <code>ssn 456-78-9012</code> becomes <code>*** ***********</code>; masking a value often exposes the label word beside it, which is why a second round is common.</p>
 
                 <h6>What is recorded</h6>
                 <p>Every screened search gets a row in <a href="/admin/audit?kind=web_search">Audit Log &rarr; Web search</a> with the outcome (<code>none</code>, <code>redacted</code> or <code>blocked</code>), the severities from both passes, the categories, and <strong>masked</strong> evidence snippets. A redacted search stores the <em>redacted</em> query, so the audit log never becomes a second copy of the data screening just refused to send.</p>

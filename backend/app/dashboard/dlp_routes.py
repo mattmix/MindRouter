@@ -268,6 +268,7 @@ async def admin_dlp_page(
         "websearch_dlp_enabled": await crud.get_config_json(db, "dlp.websearch.enabled", False),
         "websearch_dlp_min_severity": await crud.get_config_json(db, "dlp.websearch.min_severity", "moderate"),
         "websearch_dlp_on_error": await crud.get_config_json(db, "dlp.websearch.on_scanner_error", "block"),
+        "websearch_store_original": await crud.get_config_json(db, "search.audit.store_original_query", True),
         # Per-severity Detection Action (block and/or alert) + block scope.
         "block_scope": await crud.get_config_json(db, "dlp.block.scope", "prompt"),
         "block_minor": await crud.get_config_json(db, "dlp.action.minor.block", False),
@@ -592,6 +593,7 @@ async def save_dlp_config(
     ws_on_error = (form.get("websearch_dlp_on_error") or "block").strip()
     if ws_on_error not in WS_ON_ERROR:
         return _err("Web search scanner-error behavior must be block or allow")
+    ws_store_original = form.get("websearch_store_original") == "on"
 
     # Detection Action per severity: block and/or alert, plus notify-the-user.
     block_scope = (form.get("block_scope") or "prompt").strip()
@@ -802,6 +804,7 @@ async def save_dlp_config(
         await crud.set_config(db, "dlp.websearch.enabled", websearch_dlp_enabled)
         await crud.set_config(db, "dlp.websearch.min_severity", ws_min_sev)
         await crud.set_config(db, "dlp.websearch.on_scanner_error", ws_on_error)
+        await crud.set_config(db, "search.audit.store_original_query", ws_store_original)
         for sev in ("minor", "moderate", "major"):
             await crud.set_config(db, f"dlp.action.{sev}.block", actions[sev]["block"])
             await crud.set_config(db, f"dlp.action.{sev}.redact", actions[sev]["redact"])

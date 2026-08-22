@@ -567,6 +567,9 @@ class TestWiringAndSurfaces:
         assert 'set_config(db, "dlp.websearch.on_scanner_error"' in DLP_ROUTES_SRC
         # validated against the gate's own tuples, so the two cannot drift
         assert "VALID_MIN_SEVERITIES as WS_SEVERITIES" in DLP_ROUTES_SRC
+        # the documented audit toggle must be settable from the page, not just SQL
+        assert 'name="websearch_store_original"' in DLP_HTML
+        assert 'set_config(db, "search.audit.store_original_query", ws_store_original)' in DLP_ROUTES_SRC
 
     def test_audit_viewer_surfaces_the_outcome(self):
         assert 'name="dlp_action_filter"' in WS_HTML
