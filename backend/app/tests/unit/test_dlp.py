@@ -260,6 +260,56 @@ class TestIgnoreSeverity:
         assert called == [] and result is None
 
 
+class TestCreditCardDecimalGuard:
+    """A decimal number is not a credit card.
+
+    `.` is not a word character, so a bare \\b let the card pattern start
+    immediately after a decimal point and swallow the fractional digits.
+    Game telemetry like `"dist":2.808820224788294` produced the 15-digit run
+    808820224788294, which passes Luhn by chance (~1 random run in 10 does)
+    and raised a MAJOR alert. Six fired in production before it was caught.
+    """
+
+    # Verbatim from the production payload that triggered the alerts.
+    REAL_FALSE_POSITIVES = [
+        '{"x":20,"y":9,"z":21,"face":[0,1,0],"dist":2.808820224788294}',
+        '{"x":33,"y":12,"z":33,"face":[0,-1,0],"dist":0.181321289864317}',
+        'S2 target: {"x":29,"y":10,"z":30,"dist":5.213401882041463}',
+        'S3 target: {"x":30,"y":10,"z":30,"dist":4.8068097965929635}',
+    ]
+
+    @pytest.mark.parametrize("text", REAL_FALSE_POSITIVES)
+    def test_decimal_fractions_are_not_cards(self, text):
+        assert [f for f in scan_regex(text) if f.category == "credit card number"] == []
+
+    def test_the_specific_luhn_passing_run_is_rejected(self):
+        """808820224788294 really does pass Luhn — the guard, not the
+        validator, is what has to reject it."""
+        assert _scanner_mod._luhn_ok("808820224788294") is True
+        assert [f for f in scan_regex('"dist":2.808820224788294')
+                if f.category == "credit card number"] == []
+        # the same digits standing alone are still a candidate
+        assert [f.text for f in scan_regex("card 808820224788294 here")
+                if f.category == "credit card number"] == ["808820224788294"]
+
+    @pytest.mark.parametrize("text,expected", [
+        ("card 4111 1111 1111 1111 ok", "4111 1111 1111 1111"),
+        ("4111-1111-1111-1111", "4111-1111-1111-1111"),
+        ("pan=4111111111111111.", "4111111111111111"),      # trailing period
+        ("my card is 5500005555555559", "5500005555555559"),
+        ("(4111111111111111)", "4111111111111111"),
+    ])
+    def test_real_cards_still_match(self, text, expected):
+        hits = [f.text for f in scan_regex(text) if f.category == "credit card number"]
+        assert hits == [expected], f"regression: {text!r} no longer detected"
+
+    def test_guard_does_not_let_a_run_restart_mid_number(self):
+        """Every later start inside the run is preceded by a digit, so the
+        whole fractional part stays immune rather than matching one char in."""
+        text = '"dist":2.8088202247882948888'
+        assert [f for f in scan_regex(text) if f.category == "credit card number"] == []
+
+
 class TestScanLimit:
     """dlp.max_scan_chars (2.9.48): admin-tunable global scan window; 0 means
     no limit so a long prompt cannot push sensitive text past the window."""

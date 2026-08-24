@@ -144,7 +144,15 @@ _VALIDATORS = {"luhn": _luhn_ok}
 
 _BUILTIN_PATTERNS = [
     {"name": "SSN", "pattern": r"\b\d{3}-\d{2}-\d{4}\b", "category": "social security number", "severity": "major"},
-    {"name": "Credit Card", "pattern": r"\b(?:\d[ -]*?){13,19}\b", "category": "credit card number", "severity": "major", "validator": "luhn"},
+    # The leading guards keep the run from starting inside a DECIMAL NUMBER.
+    # `.` is not a word character, so a bare \b happily begins a match right
+    # after the decimal point and swallows the fractional digits: a debug line
+    # like `"dist":2.808820224788294` yielded the 15-digit run 808820224788294,
+    # which passed Luhn by chance (~1 run in 10 does) and raised a MAJOR alert.
+    # `(?<!\d)` blocks starting mid-run and `(?<!\d\.)` blocks starting just
+    # after a decimal point; a real card is preceded by a space, punctuation or
+    # start-of-text, so none of them are affected.
+    {"name": "Credit Card", "pattern": r"(?<!\d)(?<!\d\.)\b(?:\d[ -]*?){13,19}\b", "category": "credit card number", "severity": "major", "validator": "luhn"},
     {"name": "Email Address", "pattern": r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b", "category": "email", "severity": "minor"},
     {"name": "Phone (US)", "pattern": r"\b(?:\+1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b", "category": "phone number", "severity": "minor"},
     {"name": "Date of Birth", "pattern": r"\b(?:DOB|date of birth|born on)[:\s]+\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b", "category": "date of birth", "severity": "moderate"},
